@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "challenge_deploy"
+version = "0.1.0"
+description = "ROS-free Piper deployment utilities for challenge_ws."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+challenge-deploy-openpi-client = "run_openpi_clients:main"
+
+[tool.setuptools]
+py-modules = ["run_openpi_clients"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["challenge_deploy*"]

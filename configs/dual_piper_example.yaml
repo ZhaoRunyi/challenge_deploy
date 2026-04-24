@@ -1,0 +1,42 @@
+robot:
+  left:
+    can_name: can0
+  right:
+    can_name: can1
+  master_left:
+    can_name: can_left_mas
+  master_right:
+    can_name: can_right_mas
+
+cameras:
+  enabled: true
+  width: 640
+  height: 480
+  fps: 30
+  warmup_frames: 30
+  serials:
+    cam_high: "323422071854"
+    cam_right_wrist: "335522070790"
+    cam_left_wrist: "344322073012"
+
+policy:
+  host: 127.0.0.1
+  port: 8000
+  prompt: fold the cloth
+  inference_rate: 3.0
+  chunk_size: 50
+  latency_k: 8
+  min_smooth_steps: 8
+  buffer_max_chunks: 10
+
+runtime:
+  publish_rate: 30
+  max_publish_step: 10000
+  arm_steps_length: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.2]
+  right_gripper_offset: 0.003
+
+dataset:
+  dataset_dir: ./data
+  dataset_name: aloha_mobile_dummy
+  export_video: true
+  video_fps: 30
