@@ -9,6 +9,7 @@ from openpi.policies import slai_piper_policy
 from openpi.training import config as openpi_config
 from openpi_client import websocket_client_policy
 
+from .constants import KAI0_GRIPPER_UNIT_SCALE, LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE
 from .schemas import PiperArmState, RobotSnapshot
 
 try:
@@ -127,18 +128,35 @@ def rotation_to_rpy(values: np.ndarray, rotation_format: str) -> np.ndarray:
     return rotation_cls.from_matrix(matrix).as_euler("xyz", degrees=False)
 
 
+def _hardware_gripper_to_legacy_raw(value: float) -> float:
+    return float(value) * (KAI0_GRIPPER_UNIT_SCALE / LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE)
+
+
+def _legacy_raw_gripper_to_hardware(value: float) -> float:
+    return max(0.0, float(value) * (LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE / KAI0_GRIPPER_UNIT_SCALE))
+
+
 def _state_gripper_for_openpi(value: float, gripper_cfg: Any) -> float:
     value = float(value)
     if gripper_cfg is not None and gripper_cfg.type == "01":
         return value / gripper_cfg.full_width if gripper_cfg.full_width > 0 else value
-    return value
+    # "raw" Piper datasets in this workspace use the historical 70k gripper
+    # convention from PiperController, not the later deploy-side 1e6 scale.
+    return _hardware_gripper_to_legacy_raw(value)
 
 
 def _action_gripper_for_piper(value: float, gripper_cfg: Any) -> float:
     value = float(value)
     if gripper_cfg is not None and gripper_cfg.type == "01":
         return gripper_cfg.full_width if value >= 0.5 else 0.0
-    return value
+    return _legacy_raw_gripper_to_hardware(value)
+
+
+def _thresholded_gripper_for_piper(value: float, threshold: float | None) -> float:
+    value = float(value)
+    if threshold is None:
+        return value
+    return value if value >= threshold else 0.0
 
 
 def _arm_full_state(arm: PiperArmState, *, ee_rotation: str, gripper_cfg: Any) -> np.ndarray:
@@ -239,11 +257,15 @@ class OpenPiPiperClient:
         api_key: str | None = None,
         joint_speed_percent: int = 50,
         ee_speed_percent: int = 50,
+        gripper_threshold: float | None = None,
     ) -> None:
         self.spec = load_piper_policy_spec(train_config_name)
         self.control_mode = control_mode
         self.joint_speed_percent = joint_speed_percent
         self.ee_speed_percent = ee_speed_percent
+        self.gripper_threshold = gripper_threshold
+        if self.gripper_threshold is not None and self.gripper_threshold < 0.0:
+            raise ValueError("gripper_threshold must be non-negative")
         self._validate_control_mode()
         self._client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
 
@@ -298,9 +320,12 @@ class OpenPiPiperClient:
         fields = set(slai_piper_policy._fields_from_action_config(self.spec.action_space))
         decoded: dict[str, DecodedArmAction] = {}
         for arm in action_space["arms"]:
-            gripper = _action_gripper_for_piper(
-                float(action[slices[f"{arm}_gripper"]][0]),
-                self.spec.action_space.gripper,
+            gripper = _thresholded_gripper_for_piper(
+                _action_gripper_for_piper(
+                    float(action[slices[f"{arm}_gripper"]][0]),
+                    self.spec.action_space.gripper,
+                ),
+                self.gripper_threshold,
             )
             joint = None
             ee_pose = None

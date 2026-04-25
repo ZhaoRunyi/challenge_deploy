@@ -9,6 +9,7 @@ import numpy as np
 
 from .buffer import StreamActionBuffer
 from .openpi_client import OpenPiPiperClient, PiperPolicySpec, build_configured_piper_state
+from .schemas import RobotSnapshot
 
 
 ExecutionMode = Literal["streaming", "chunk_sync"]
@@ -103,6 +104,11 @@ def sleep_until_next_action(action_start_s: float, fps: float) -> None:
         time.sleep(remaining_s)
 
 
+def _configured_state_after_command(robot: Any, spec: PiperPolicySpec) -> np.ndarray:
+    snapshot = RobotSnapshot(timestamp_s=time.time(), state=robot.read_state(), images={})
+    return build_configured_piper_state(snapshot, spec)
+
+
 def run_chunk_sync_rollout(
     *,
     client: OpenPiPiperClient,
@@ -115,14 +121,17 @@ def run_chunk_sync_rollout(
     fps: float,
     recorder: Any | None = None,
     log_chunk: ChunkLogger | None = None,
+    initial_snapshot: Any | None = None,
 ) -> RolloutMetrics:
     metrics = RolloutMetrics(execution_mode="chunk_sync")
     chunk_index = 0
     last_command_start_s: float | None = None
+    next_snapshot = initial_snapshot
 
     while rollout_steps == 0 or metrics.executed_steps < rollout_steps:
         inference_start_s = time.monotonic()
-        chunk_snapshot = source.capture_snapshot()
+        chunk_snapshot = next_snapshot if next_snapshot is not None else source.capture_snapshot()
+        next_snapshot = None
         actions = trim_chunk(client.infer_actions(chunk_snapshot, prompt=prompt), chunk_size)
         metrics.record_inference(time.monotonic() - inference_start_s)
 
@@ -140,15 +149,15 @@ def run_chunk_sync_rollout(
             period_seconds = None if last_command_start_s is None else action_start_s - last_command_start_s
             last_command_start_s = action_start_s
             frame_snapshot = chunk_snapshot if action_index == 0 else source.capture_snapshot()
+            command_start_s = time.monotonic()
+            client.command_action(robot, action)
             if recorder is not None:
                 recorder.record(
                     images=frame_snapshot.images,
                     action=action,
-                    state=build_configured_piper_state(frame_snapshot, spec),
-                    timestamp_s=frame_snapshot.timestamp_s,
+                    state=_configured_state_after_command(robot, spec),
+                    timestamp_s=time.time(),
                 )
-            command_start_s = time.monotonic()
-            client.command_action(robot, action)
             metrics.record_command(
                 period_seconds=period_seconds,
                 command_seconds=time.monotonic() - command_start_s,
@@ -178,6 +187,7 @@ def run_temporal_smoothing_rollout(
     recorder: Any | None = None,
     log_chunk: ChunkLogger | None = None,
     first_action_timeout_s: float = 15.0,
+    initial_snapshot: Any | None = None,
 ) -> RolloutMetrics:
     metrics = RolloutMetrics(execution_mode="streaming")
     buffer = StreamActionBuffer(
@@ -192,29 +202,42 @@ def run_temporal_smoothing_rollout(
         with capture_lock:
             return source.capture_snapshot()
 
-    def inference_loop() -> None:
-        chunk_index = 0
+    def infer_from_snapshot(snapshot: Any, chunk_index: int) -> int:
+        inference_start_s = time.monotonic()
+        actions = trim_chunk(client.infer_actions(snapshot, prompt=prompt), chunk_size)
+        if len(actions) > 0:
+            buffer.integrate_new_chunk(actions, max_k=latency_k, min_m=min_smooth_steps)
+            metrics.record_inference(time.monotonic() - inference_start_s)
+            if log_chunk is not None:
+                log_chunk(chunk_index, len(actions), metrics.executed_steps, actions[0])
+            return chunk_index + 1
+        return chunk_index
+
+    initial_chunk_index = 0
+    if initial_snapshot is not None:
+        try:
+            initial_chunk_index = infer_from_snapshot(initial_snapshot, initial_chunk_index)
+        except Exception as exc:
+            metrics.record_inference_error(exc)
+
+    def inference_loop(chunk_index_start: int) -> None:
+        chunk_index = chunk_index_start
         period_s = 1.0 / inference_rate if inference_rate > 0.0 else 0.0
         while not stop_event.is_set():
-            inference_start_s = time.monotonic()
             try:
                 snapshot = capture_snapshot()
-                actions = trim_chunk(client.infer_actions(snapshot, prompt=prompt), chunk_size)
-                if len(actions) > 0:
-                    buffer.integrate_new_chunk(actions, max_k=latency_k, min_m=min_smooth_steps)
-                    metrics.record_inference(time.monotonic() - inference_start_s)
-                    if log_chunk is not None:
-                        log_chunk(chunk_index, len(actions), metrics.executed_steps, actions[0])
-                    chunk_index += 1
+                loop_start_s = time.monotonic()
+                chunk_index = infer_from_snapshot(snapshot, chunk_index)
             except Exception as exc:
                 metrics.record_inference_error(exc)
+                loop_start_s = time.monotonic()
 
-            elapsed_s = time.monotonic() - inference_start_s
+            elapsed_s = time.monotonic() - loop_start_s
             sleep_s = max(0.0, period_s - elapsed_s)
             if sleep_s > 0.0:
                 stop_event.wait(sleep_s)
 
-    inference_thread = threading.Thread(target=inference_loop, daemon=True)
+    inference_thread = threading.Thread(target=inference_loop, args=(initial_chunk_index,), daemon=True)
     inference_thread.start()
     wait_start_s = time.monotonic()
     last_command_start_s: float | None = None
@@ -240,15 +263,15 @@ def run_temporal_smoothing_rollout(
             period_seconds = None if last_command_start_s is None else action_start_s - last_command_start_s
             last_command_start_s = action_start_s
             frame_snapshot = capture_snapshot()
+            command_start_s = time.monotonic()
+            client.command_action(robot, action)
             if recorder is not None:
                 recorder.record(
                     images=frame_snapshot.images,
                     action=action,
-                    state=build_configured_piper_state(frame_snapshot, spec),
-                    timestamp_s=frame_snapshot.timestamp_s,
+                    state=_configured_state_after_command(robot, spec),
+                    timestamp_s=time.time(),
                 )
-            command_start_s = time.monotonic()
-            client.command_action(robot, action)
             metrics.record_command(
                 period_seconds=period_seconds,
                 command_seconds=time.monotonic() - command_start_s,

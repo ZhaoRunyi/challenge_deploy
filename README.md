@@ -776,6 +776,27 @@ raw collector 的特点：
 --execution-mode streaming
 ```
 
+`--prompt` 现在可以省略。省略时会按下面顺序解析：
+
+1. `deploy/artifacts/trainconfig_prompts.json` 里缓存过的 `train_config -> prompt`
+2. `HF_LEROBOT_HOME`，若未设置则默认 `/home/edemlab/challenge_ws/data` 下、由 train config 的 `repo_id` 对应到的本地 LeRobot dataset
+
+如果两者都没有，而且也没传 `--prompt`，入口会直接报错退出。
+
+当打开 `--record` 时，脚本还会尝试为这个 train config 对应的数据集生成并缓存：
+
+- `deploy/artifacts/train_distributions/<repo_id>_cam_high_first_frame_overlay.png`
+  含义：整个训练集所有 episode 的第一帧 `cam_high` 透明度叠加后的分布图
+- `deploy/artifacts/trainconfig_prompts.json`
+  含义：`train_config -> prompt` 的缓存
+
+record 输出现在是一个目录，而不是单个 mp4：
+
+- `deploy/artifacts/openpi_records/<record_name>/<record_name>_videos.mp4`
+- `deploy/artifacts/openpi_records/<record_name>/<record_name>_frame1.png`
+
+其中 `_frame1.png` 是“训练分布图在上 + 初始位姿后第一帧 obs 的 `cam_high` 在下”的对比图。`Ctrl+C` 分支也会走同一套保存逻辑。
+
 如果要做 deploy benchmark，可以保存 controller timing：
 
 ```bash
@@ -785,6 +806,13 @@ raw collector 的特点：
 更完整的 kai0 deploy 改进映射和 benchmark 方案见：
 
 - `deploy/docs/kai0_deploy_improvements.md`
+
+如果想提前把本地 `data/` 下的有效 LeRobot dataset 全部做一遍同样的缓存，可运行：
+
+```bash
+/home/edemlab/challenge_ws/baselines/openpi/.venv/bin/python \
+  /home/edemlab/challenge_ws/deploy/tools/cache_lerobot_train_assets.py
+```
 
 ### 9.11 DAgger collect
 

@@ -131,6 +131,9 @@ class SinglePiperArm:
         self._require_motion_allowed("enable the arm")
         for _ in range(retries):
             self.interface.EnableArm(7)
+            # Match the legacy ROS deployment path: after reconnect or power-cycle,
+            # the gripper often needs a reset-style pulse before normal enable.
+            self.interface.GripperCtrl(0, 1000, 0x02, 0)
             self.interface.GripperCtrl(0, 1000, 0x01, 0)
             time.sleep(sleep_s)
             if self.is_enabled():

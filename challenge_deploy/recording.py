@@ -54,8 +54,11 @@ class OpenPiRolloutRecorder:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         safe_prefix = _safe_filename_part(name_prefix) or "openpi_record"
-        self.output_path = self.output_dir / f"{safe_prefix}_{timestamp}.mp4"
-        self.frames_dir = self.output_dir / f".{safe_prefix}_{timestamp}_frames"
+        self.record_stem = f"{safe_prefix}_{timestamp}"
+        self.run_dir = self.output_dir / self.record_stem
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.output_path = self.run_dir / f"{self.record_stem}_videos.mp4"
+        self.frames_dir = self.run_dir / ".frames"
         self.frames_dir.mkdir(parents=True, exist_ok=True)
 
         self.schema = schema
@@ -69,6 +72,17 @@ class OpenPiRolloutRecorder:
         self.camera_height: int | None = None
         self.camera_width: int | None = None
         self._finalized = False
+
+    def extra_image_path(self, suffix: str, extension: str = ".png") -> Path:
+        clean_suffix = _safe_filename_part(suffix)
+        return self.run_dir / f"{self.record_stem}_{clean_suffix}{extension}"
+
+    def save_extra_image(self, image: np.ndarray, *, suffix: str, extension: str = ".png") -> Path:
+        path = self.extra_image_path(suffix, extension=extension)
+        image = _to_bgr_uint8(image)
+        if not cv2.imwrite(str(path), image):
+            raise RuntimeError(f"Failed to write extra recording image: {path}")
+        return path
 
     def record(
         self,
@@ -205,6 +219,23 @@ def _resize_to_height(image: np.ndarray, height: int) -> np.ndarray:
         return image
     width = max(1, int(round(image.shape[1] * height / image.shape[0])))
     return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+
+
+def resize_to_width(image: np.ndarray, width: int) -> np.ndarray:
+    image = _to_bgr_uint8(image)
+    if image.shape[1] == width:
+        return image
+    height = max(1, int(round(image.shape[0] * width / image.shape[1])))
+    return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+
+
+def stack_vertical(top: np.ndarray, bottom: np.ndarray) -> np.ndarray:
+    top_bgr = _to_bgr_uint8(top)
+    bottom_bgr = _to_bgr_uint8(bottom)
+    target_width = max(top_bgr.shape[1], bottom_bgr.shape[1])
+    top_resized = resize_to_width(top_bgr, target_width)
+    bottom_resized = resize_to_width(bottom_bgr, target_width)
+    return np.concatenate((top_resized, bottom_resized), axis=0)
 
 
 def _plot_rects(*, width: int, height: int, count: int, cols: int) -> list[tuple[int, int, int, int]]:

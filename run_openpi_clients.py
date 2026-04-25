@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import cv2
 import json
 from pathlib import Path
 import signal
@@ -10,6 +11,11 @@ import numpy as np
 from openpi.policies import slai_piper_policy
 
 from challenge_deploy.config import load_config, set_by_dotted_path
+from challenge_deploy.lerobot_assets import (
+    dataset_asset_info,
+    prepare_train_assets,
+    resolve_prompt,
+)
 from challenge_deploy.openpi_client import (
     ControlMode,
     OpenPiPiperClient,
@@ -21,7 +27,7 @@ from challenge_deploy.openpi_client import (
 )
 from challenge_deploy.piper import DualPiperSystem
 from challenge_deploy.realsense import RealSenseRig
-from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema
+from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema, stack_vertical
 from challenge_deploy.runtime import DualPiperObservationSource
 from challenge_deploy.openpi_rollout import (
     action_sequence,
@@ -120,11 +126,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ckpt-dir", default=None, help="Checkpoint directory used only for record video filenames.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--prompt", default="click the bell")
+    parser.add_argument("--prompt", default=None)
     parser.add_argument("--control-mode", choices=["joints", "ee_pose"], default="joints")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--joint-speed-percent", type=int, default=50)
     parser.add_argument("--ee-speed-percent", type=int, default=50)
+    parser.add_argument(
+        "--gripper_threshold",
+        type=float,
+        default=None,
+        help="Optional executable-scale gripper threshold. Final gripper values below this are clipped to 0.",
+    )
     parser.add_argument(
         "--rollout-steps",
         type=int,
@@ -204,6 +216,26 @@ def _make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[An
     return robot, cameras, DualPiperObservationSource(robot=robot, cameras=cameras)
 
 
+def _normalized_prompt(value: str | None) -> str | None:
+    if value is None:
+        return None
+    prompt = value.strip()
+    return prompt or None
+
+
+def _save_frame1_comparison(
+    *,
+    recorder: OpenPiRolloutRecorder,
+    distribution_image_path: Path,
+    frame1_image: np.ndarray,
+) -> Path:
+    distribution_image = cv2.imread(str(distribution_image_path), cv2.IMREAD_COLOR)
+    if distribution_image is None:
+        raise RuntimeError(f"Failed to read train distribution image: {distribution_image_path}")
+    comparison = stack_vertical(distribution_image, frame1_image)
+    return recorder.save_extra_image(comparison, suffix="frame1")
+
+
 def _print_rollout_chunk_summary(
     *,
     client: OpenPiPiperClient,
@@ -235,12 +267,38 @@ def run_once(args: argparse.Namespace) -> None:
     print(json.dumps(spec_summary(spec), indent=2))
     if args.spec_only:
         return
+    cli_prompt = _normalized_prompt(args.prompt)
     if args.rollout_steps < 0:
         raise ValueError("--rollout-steps must be non-negative")
     if args.fps < 0.0:
         raise ValueError("--fps must be non-negative")
+    if args.gripper_threshold is not None and args.gripper_threshold < 0.0:
+        raise ValueError("--gripper_threshold must be non-negative")
     if args.inference_rate is not None and args.inference_rate < 0.0:
         raise ValueError("--inference-rate must be non-negative")
+
+    record_assets = None
+    if args.record:
+        record_assets = prepare_train_assets(
+            train_config_name=args.train_config,
+            cli_prompt=cli_prompt,
+        )
+        resolved_prompt = record_assets.prompt
+        prompt_source = record_assets.prompt_source
+    else:
+        asset_info = dataset_asset_info(args.train_config)
+        resolved_prompt, prompt_source = resolve_prompt(
+            train_config_name=args.train_config,
+            cli_prompt=cli_prompt,
+            dataset_dir=asset_info.dataset_dir,
+        )
+
+    if resolved_prompt is None:
+        raise RuntimeError(
+            "No prompt available. Provide --prompt, or ensure the train config's LeRobot dataset exists "
+            "and has a cached/discoverable task prompt."
+        )
+    print(json.dumps({"prompt": {"value": resolved_prompt, "source": prompt_source}}, indent=2), flush=True)
 
     client = OpenPiPiperClient(
         args.train_config,
@@ -250,6 +308,7 @@ def run_once(args: argparse.Namespace) -> None:
         api_key=args.api_key,
         joint_speed_percent=args.joint_speed_percent,
         ee_speed_percent=args.ee_speed_percent,
+        gripper_threshold=args.gripper_threshold,
     )
     runtime_config = _apply_runtime_overrides(load_config(args.config), args)
     robot, cameras, source = _make_runtime(runtime_config, commands_enabled=not args.dry_run)
@@ -266,6 +325,8 @@ def run_once(args: argparse.Namespace) -> None:
     if recorder is not None:
         _install_record_signal_handlers()
 
+    first_obs_snapshot = None
+    frame1_compare_path: Path | None = None
     robot.connect(read_only=args.dry_run)
     try:
         if cameras is not None:
@@ -275,16 +336,21 @@ def run_once(args: argparse.Namespace) -> None:
 
         if args.dry_run:
             snapshot = source.capture_snapshot()
-            actions = action_sequence(client.infer_actions(snapshot, prompt=args.prompt))
+            first_obs_snapshot = snapshot
+            actions = action_sequence(client.infer_actions(snapshot, prompt=resolved_prompt))
             if recorder is not None:
                 recorder.record(
                     images=snapshot.images,
                     action=actions[0],
                     state=build_configured_piper_state(snapshot, spec),
                     timestamp_s=snapshot.timestamp_s,
-                )
+            )
             print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2))
             return
+
+        print('{"hardware_init": "enable_dual_piper"}', flush=True)
+        if not robot.enable():
+            print("Warning: Piper arm enable check did not report success; continuing anyway.", flush=True)
 
         chunk_size = resolve_chunk_size(spec, args.chunk_size)
         inference_rate = (
@@ -309,6 +375,7 @@ def run_once(args: argparse.Namespace) -> None:
         )
         print(json.dumps({"initial_pose": {"qpos": INIT_JOINTS.tolist()}}, indent=2), flush=True)
         robot.move_to_joint_positions(INIT_JOINTS, speed_percent=args.joint_speed_percent)
+        first_obs_snapshot = source.capture_snapshot()
 
         print(
             json.dumps(
@@ -324,6 +391,7 @@ def run_once(args: argparse.Namespace) -> None:
                         "buffer_max_chunks": buffer_max_chunks if args.execution_mode == "streaming" else None,
                         "joint_speed_percent": args.joint_speed_percent,
                         "ee_speed_percent": args.ee_speed_percent,
+                        "gripper_threshold": args.gripper_threshold,
                     }
                 },
                 indent=2,
@@ -347,7 +415,7 @@ def run_once(args: argparse.Namespace) -> None:
                 source=source,
                 robot=robot,
                 spec=spec,
-                prompt=args.prompt,
+                prompt=resolved_prompt,
                 rollout_steps=args.rollout_steps,
                 chunk_size=chunk_size,
                 fps=args.fps,
@@ -357,6 +425,7 @@ def run_once(args: argparse.Namespace) -> None:
                 buffer_max_chunks=buffer_max_chunks,
                 recorder=recorder,
                 log_chunk=log_chunk,
+                initial_snapshot=first_obs_snapshot,
             )
         else:
             metrics = run_chunk_sync_rollout(
@@ -364,12 +433,13 @@ def run_once(args: argparse.Namespace) -> None:
                 source=source,
                 robot=robot,
                 spec=spec,
-                prompt=args.prompt,
+                prompt=resolved_prompt,
                 rollout_steps=args.rollout_steps,
                 chunk_size=chunk_size,
                 fps=args.fps,
                 recorder=recorder,
                 log_chunk=log_chunk,
+                initial_snapshot=first_obs_snapshot,
             )
         metrics_summary = metrics.summary()
         print(json.dumps({"rollout_metrics": metrics_summary}, indent=2), flush=True)
@@ -392,12 +462,31 @@ def run_once(args: argparse.Namespace) -> None:
         except Exception as exc:
             print(f"Failed to disconnect robot cleanly: {exc}", flush=True)
         if recorder is not None:
+            output_path = None
             try:
                 output_path = recorder.finalize()
-                if output_path is not None:
-                    print(f"Recording saved to {output_path}", flush=True)
             except Exception as exc:
                 print(f"Failed to finalize recording: {exc}", flush=True)
+            if output_path is not None:
+                print(f"Recording saved to {output_path}", flush=True)
+                try:
+                    if (
+                        first_obs_snapshot is not None
+                        and record_assets is not None
+                        and record_assets.distribution_ready
+                        and record_assets.distribution_image_path is not None
+                        and "cam_high" in first_obs_snapshot.images
+                    ):
+                        frame1_compare_path = _save_frame1_comparison(
+                            recorder=recorder,
+                            distribution_image_path=record_assets.distribution_image_path,
+                            frame1_image=first_obs_snapshot.images["cam_high"],
+                        )
+                        print(f"Frame1 comparison saved to {frame1_compare_path}", flush=True)
+                    elif record_assets is not None and record_assets.skip_reason is not None:
+                        print(f"Skipped train-distribution frame1 image: {record_assets.skip_reason}", flush=True)
+                except Exception as exc:
+                    print(f"Failed to save frame1 comparison image: {exc}", flush=True)
 
 
 def main() -> None:
