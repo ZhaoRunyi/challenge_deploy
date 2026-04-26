@@ -17,11 +17,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Precompute train-distribution overlays and prompt cache for local LeRobot datasets."
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate train-distribution overlays even if the target png already exists.",
+    )
     return parser
 
 
 def main() -> None:
-    build_parser().parse_args()
+    args = build_parser().parse_args()
     repo_to_train_configs: dict[str, list[str]] = {}
     for train_config_name in train_config_names():
         repo_id = get_train_config_repo_id(train_config_name)
@@ -37,7 +42,7 @@ def main() -> None:
             "train_configs": repo_to_train_configs.get(repo_id, []),
         }
         try:
-            distribution_image_path = ensure_distribution_image(dataset_dir, repo_id)
+            distribution_image_path = ensure_distribution_image(dataset_dir, repo_id, force=args.force)
             item["distribution_image_path"] = str(distribution_image_path)
         except Exception as exc:
             item["distribution_error"] = repr(exc)

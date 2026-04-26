@@ -10,11 +10,13 @@ import numpy as np
 import pandas as pd
 from openpi.training import config as openpi_config
 
+from .task_segmentation import select_relevant_task_masks
 
 DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LEROBOT_HOME = Path("/home/edemlab/challenge_ws/data")
 ARTIFACTS_ROOT = DEPLOY_ROOT / "artifacts"
 TRAIN_DISTRIBUTION_DIR = ARTIFACTS_ROOT / "train_distributions"
+BACKGROUND_DIR = ARTIFACTS_ROOT / "backgrounds"
 PROMPT_CACHE_PATH = ARTIFACTS_ROOT / "trainconfig_prompts.json"
 
 
@@ -70,6 +72,10 @@ def dataset_dir_for_repo_id(repo_id: str | None, *, root: Path | None = None) ->
 def repo_id_distribution_image_path(repo_id: str, *, artifacts_root: Path = ARTIFACTS_ROOT) -> Path:
     safe_repo_id = _safe_filename_part(repo_id.replace("/", "__"))
     return artifacts_root / "train_distributions" / f"{safe_repo_id}_cam_high_first_frame_overlay.png"
+
+
+def default_cam_high_background_path(*, artifacts_root: Path = ARTIFACTS_ROOT) -> Path:
+    return artifacts_root / "backgrounds" / "cam_high_clean.png"
 
 
 def dataset_asset_info(train_config_name: str, *, artifacts_root: Path = ARTIFACTS_ROOT) -> DatasetAssetInfo:
@@ -222,13 +228,27 @@ def _decode_image_value(value: Any, *, dataset_dir: Path) -> np.ndarray:
     return image
 
 
-def build_cam_high_first_frame_overlay(dataset_dir: Path) -> np.ndarray:
+def load_cam_high_background_image(*, artifacts_root: Path = ARTIFACTS_ROOT) -> np.ndarray | None:
+    background_path = default_cam_high_background_path(artifacts_root=artifacts_root)
+    if not background_path.exists():
+        return None
+    image = cv2.imread(str(background_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"Failed to read clean cam_high background image: {background_path}")
+    return image
+
+
+def build_cam_high_first_frame_overlay(dataset_dir: Path, *, repo_id: str | None = None) -> np.ndarray:
     info = _info_json(dataset_dir)
     episode_indices = _episode_indices(dataset_dir)
     if not episode_indices:
         raise RuntimeError(f"No episodes found in {dataset_dir}")
+    resolved_repo_id = repo_id or dataset_dir.relative_to(lerobot_home()).as_posix()
 
-    accum: np.ndarray | None = None
+    background_image = load_cam_high_background_image()
+    background_resized: np.ndarray | None = None
+    foreground_accum: np.ndarray | None = None
+    foreground_weight: np.ndarray | None = None
     count = 0
     target_shape: tuple[int, int] | None = None
 
@@ -241,23 +261,52 @@ def build_cam_high_first_frame_overlay(dataset_dir: Path) -> np.ndarray:
         image = _decode_image_value(value, dataset_dir=dataset_dir)
         if target_shape is None:
             target_shape = (int(image.shape[1]), int(image.shape[0]))
-            accum = np.zeros((image.shape[0], image.shape[1], 3), dtype=np.float64)
+            if background_image is None:
+                background_resized = image.copy()
+            elif (background_image.shape[1], background_image.shape[0]) != target_shape:
+                background_resized = cv2.resize(background_image, target_shape, interpolation=cv2.INTER_AREA)
+            else:
+                background_resized = background_image.copy()
+            foreground_accum = np.zeros((image.shape[0], image.shape[1], 3), dtype=np.float64)
+            foreground_weight = np.zeros((image.shape[0], image.shape[1]), dtype=np.float64)
         elif (image.shape[1], image.shape[0]) != target_shape:
             image = cv2.resize(image, target_shape, interpolation=cv2.INTER_AREA)
-        accum += image.astype(np.float64)
+        if background_resized is None or foreground_accum is None or foreground_weight is None:
+            raise RuntimeError("Internal error: missing train distribution background image")
+        selected_masks = select_relevant_task_masks(image, resolved_repo_id, background_image=background_resized)
+        mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.float64)
+        for selected in selected_masks:
+            mask = np.maximum(mask, selected.mask.astype(np.float64))
+        foreground_accum += image.astype(np.float64) * mask[..., None]
+        foreground_weight += mask
         count += 1
 
-    if accum is None or count == 0:
+    if background_resized is None or foreground_accum is None or foreground_weight is None or count == 0:
         raise RuntimeError(f"No valid cam_high first frames found in {dataset_dir}")
-    return np.clip(accum / count, 0.0, 255.0).astype(np.uint8)
+    safe_weight = np.maximum(foreground_weight[..., None], 1.0)
+    fused_foreground = foreground_accum / safe_weight
+    occupancy = np.clip(foreground_weight / count, 0.0, 1.0)
+    alpha = np.where(
+        foreground_weight > 0.0,
+        np.clip(0.60 + 0.35 * np.sqrt(occupancy), 0.0, 0.95),
+        0.0,
+    )[..., None]
+    base = background_resized.astype(np.float64)
+    return np.clip(base * (1.0 - alpha) + fused_foreground * alpha, 0.0, 255.0).astype(np.uint8)
 
 
-def ensure_distribution_image(dataset_dir: Path, repo_id: str, *, artifacts_root: Path = ARTIFACTS_ROOT) -> Path:
+def ensure_distribution_image(
+    dataset_dir: Path,
+    repo_id: str,
+    *,
+    artifacts_root: Path = ARTIFACTS_ROOT,
+    force: bool = False,
+) -> Path:
     output_path = repo_id_distribution_image_path(repo_id, artifacts_root=artifacts_root)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists():
+    if output_path.exists() and not force:
         return output_path
-    image = build_cam_high_first_frame_overlay(dataset_dir)
+    image = build_cam_high_first_frame_overlay(dataset_dir, repo_id=repo_id)
     if not cv2.imwrite(str(output_path), image):
         raise RuntimeError(f"Failed to write train distribution image: {output_path}")
     return output_path
