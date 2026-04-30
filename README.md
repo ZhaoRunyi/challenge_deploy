@@ -13,9 +13,18 @@
 重要约定：
 
 - `deploy/challenge_deploy/` 是共享包名。
+- `deploy/third_party/sam3/` 是 deploy 仓库中的 git submodule，说明见 `docs/sam3_submodule.md`。
 - inference 和 DAgger 入口按部署入口处理，默认就是可以下发真实控制命令。
 - 只想验证通信、拍照或读状态时，使用明确的只读工具入口，例如 `tools/probe_dual_piper.py`、`tools/capture_snapshot.py`、`inference/... --probe-only`、`dagger/collect_data.py`。
 - 本次验证过程中没有执行任何会让机械臂运动的命令；这只是测试边界，不是代码默认行为。
+
+训练分布图相关约定：
+
+- 干净背景图固定保存在 `deploy/artifacts/train_distributions/cam_high_background.png`。
+- 重新拍背景并重建所有训练分布图，统一使用：
+  `tools/cache_lerobot_train_assets.py --capture-background --force`
+- 如果只想在当前背景图上重建训练分布图，使用：
+  `tools/cache_lerobot_train_assets.py --force`
 
 ---
 

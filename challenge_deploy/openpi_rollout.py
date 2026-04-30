@@ -8,12 +8,17 @@ from typing import Any, Callable, Literal
 import numpy as np
 
 from .buffer import StreamActionBuffer
-from .openpi_client import OpenPiPiperClient, PiperPolicySpec, build_configured_piper_state
+from .openpi_client import (
+    OpenPiPiperClient,
+    PiperPolicySpec,
+    build_configured_piper_state as default_build_configured_piper_state,
+)
 from .schemas import RobotSnapshot
 
 
 ExecutionMode = Literal["streaming", "chunk_sync"]
 ChunkLogger = Callable[[int, int, int, np.ndarray], None]
+ConfiguredStateBuilder = Callable[[RobotSnapshot, Any], np.ndarray]
 
 
 @dataclass
@@ -104,9 +109,13 @@ def sleep_until_next_action(action_start_s: float, fps: float) -> None:
         time.sleep(remaining_s)
 
 
-def _configured_state_after_command(robot: Any, spec: PiperPolicySpec) -> np.ndarray:
+def _configured_state_after_command(
+    robot: Any,
+    spec: PiperPolicySpec,
+    state_builder: ConfiguredStateBuilder,
+) -> np.ndarray:
     snapshot = RobotSnapshot(timestamp_s=time.time(), state=robot.read_state(), images={})
-    return build_configured_piper_state(snapshot, spec)
+    return state_builder(snapshot, spec)
 
 
 def run_chunk_sync_rollout(
@@ -122,6 +131,7 @@ def run_chunk_sync_rollout(
     recorder: Any | None = None,
     log_chunk: ChunkLogger | None = None,
     initial_snapshot: Any | None = None,
+    state_builder: ConfiguredStateBuilder = default_build_configured_piper_state,
 ) -> RolloutMetrics:
     metrics = RolloutMetrics(execution_mode="chunk_sync")
     chunk_index = 0
@@ -155,7 +165,7 @@ def run_chunk_sync_rollout(
                 recorder.record(
                     images=frame_snapshot.images,
                     action=action,
-                    state=_configured_state_after_command(robot, spec),
+                    state=_configured_state_after_command(robot, spec, state_builder),
                     timestamp_s=time.time(),
                 )
             metrics.record_command(
@@ -188,6 +198,7 @@ def run_temporal_smoothing_rollout(
     log_chunk: ChunkLogger | None = None,
     first_action_timeout_s: float = 15.0,
     initial_snapshot: Any | None = None,
+    state_builder: ConfiguredStateBuilder = default_build_configured_piper_state,
 ) -> RolloutMetrics:
     metrics = RolloutMetrics(execution_mode="streaming")
     buffer = StreamActionBuffer(
@@ -269,7 +280,7 @@ def run_temporal_smoothing_rollout(
                 recorder.record(
                     images=frame_snapshot.images,
                     action=action,
-                    state=_configured_state_after_command(robot, spec),
+                    state=_configured_state_after_command(robot, spec, state_builder),
                     timestamp_s=time.time(),
                 )
             metrics.record_command(

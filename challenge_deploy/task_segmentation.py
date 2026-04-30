@@ -16,7 +16,7 @@ import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SAM31_MULTIPLEX_WEIGHTS = REPO_ROOT / "modelscope_cache" / "facebook" / "sam3___1" / "sam3.1_multiplex.pt"
+SAM31_MULTIPLEX_WEIGHTS = Path(__file__).resolve().parents[1] / "artifacts" / "sam3.1_multiplex.pt"
 
 
 @dataclass(frozen=True)
@@ -264,6 +264,9 @@ TASK_OBJECT_SPECS: dict[str, tuple[TaskObjectSpec, ...]] = {
         TaskObjectSpec("spoon", ("metal spoon", "spoon"), boxes=((0.43, 0.55, 0.70, 1.00),), max_area_ratio=0.08, score_threshold=0.14, negative_phrases=("fork",), foreground_weight=1.0),
     ),
 }
+
+TASK_OBJECT_SPECS["ZhaoRunyi/Piper_carry_basket_0426"] = TASK_OBJECT_SPECS["ZhaoRunyi/Piper_carry_basket_0421"]
+TASK_OBJECT_SPECS["ZhaoRunyi/Piper_pour_dual_0427"] = TASK_OBJECT_SPECS["ZhaoRunyi/Piper_pour_dual_0421"]
 
 
 def _mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int]:

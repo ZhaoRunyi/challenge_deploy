@@ -16,7 +16,6 @@ DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LEROBOT_HOME = Path("/home/edemlab/challenge_ws/data")
 ARTIFACTS_ROOT = DEPLOY_ROOT / "artifacts"
 TRAIN_DISTRIBUTION_DIR = ARTIFACTS_ROOT / "train_distributions"
-BACKGROUND_DIR = ARTIFACTS_ROOT / "backgrounds"
 PROMPT_CACHE_PATH = ARTIFACTS_ROOT / "trainconfig_prompts.json"
 
 
@@ -75,7 +74,7 @@ def repo_id_distribution_image_path(repo_id: str, *, artifacts_root: Path = ARTI
 
 
 def default_cam_high_background_path(*, artifacts_root: Path = ARTIFACTS_ROOT) -> Path:
-    return artifacts_root / "backgrounds" / "cam_high_clean.png"
+    return artifacts_root / "train_distributions" / "cam_high_background.png"
 
 
 def dataset_asset_info(train_config_name: str, *, artifacts_root: Path = ARTIFACTS_ROOT) -> DatasetAssetInfo:
@@ -195,6 +194,31 @@ def _parquet_path_for_episode(dataset_dir: Path, info: dict[str, Any], episode_i
     return candidates[0]
 
 
+def _video_path_for_episode(dataset_dir: Path, info: dict[str, Any], episode_index: int, video_key: str) -> Path:
+    video_path = info.get("video_path")
+    if not isinstance(video_path, str) or not video_path:
+        raise FileNotFoundError(f"video_path is not configured in meta/info.json for {dataset_dir}")
+    chunks_size = int(info.get("chunks_size", 1000))
+    chunk_index = episode_index // chunks_size
+    resolved = dataset_dir / video_path.format(
+        episode_chunk=chunk_index,
+        video_key=video_key,
+        episode_index=episode_index,
+    )
+    if resolved.exists():
+        return resolved
+    candidates = [
+        candidate
+        for candidate in sorted(dataset_dir.rglob(f"episode_{episode_index:06d}.*"))
+        if video_key in candidate.as_posix()
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"Video-backed frame source for {video_key!r} episode_{episode_index:06d} not found under {dataset_dir}"
+        )
+    return candidates[0]
+
+
 def _decode_image_value(value: Any, *, dataset_dir: Path) -> np.ndarray:
     if isinstance(value, np.ndarray):
         image = value
@@ -228,6 +252,64 @@ def _decode_image_value(value: Any, *, dataset_dir: Path) -> np.ndarray:
     return image
 
 
+def _load_lerobot_decode_video_frames():
+    try:
+        from lerobot.common.datasets.video_utils import decode_video_frames
+    except Exception:
+        from lerobot.datasets.video_utils import decode_video_frames  # type: ignore
+    return decode_video_frames
+
+
+def _decode_video_frame_at_timestamp(
+    dataset_dir: Path,
+    info: dict[str, Any],
+    episode_index: int,
+    *,
+    video_key: str,
+    timestamp_s: float,
+) -> np.ndarray:
+    decode_video_frames = _load_lerobot_decode_video_frames()
+    video_path = _video_path_for_episode(dataset_dir, info, episode_index, video_key)
+    frames = decode_video_frames(video_path, [float(timestamp_s)], tolerance_s=1e-4, backend=None)
+    if len(frames) == 0:
+        raise RuntimeError(f"No frames decoded from {video_path} at timestamp {timestamp_s}")
+    frame = frames[0]
+    if hasattr(frame, "detach"):
+        frame = frame.detach().cpu().numpy()
+    else:
+        frame = np.asarray(frame)
+    if frame.ndim == 3 and frame.shape[0] == 3 and frame.shape[-1] != 3:
+        frame = np.transpose(frame, (1, 2, 0))
+    if frame.ndim != 3 or frame.shape[-1] != 3:
+        raise ValueError(f"Expected decoded RGB frame, got shape {frame.shape}")
+    if frame.dtype != np.uint8:
+        scale = 255.0 if np.issubdtype(frame.dtype, np.floating) and float(frame.max()) <= 1.0 + 1e-6 else 1.0
+        frame = np.clip(frame * scale, 0.0, 255.0).astype(np.uint8)
+    return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+
+def _load_cam_high_first_frame(
+    dataset_dir: Path,
+    info: dict[str, Any],
+    episode_index: int,
+    df: pd.DataFrame,
+) -> np.ndarray:
+    image_key = "observation.images.cam_high"
+    if image_key in df.columns:
+        return _decode_image_value(df.iloc[0][image_key], dataset_dir=dataset_dir)
+    feature = info.get("features", {}).get(image_key)
+    if not isinstance(feature, dict) or feature.get("dtype") != "video":
+        raise KeyError(image_key)
+    timestamp_s = float(df.iloc[0].get("timestamp", 0.0))
+    return _decode_video_frame_at_timestamp(
+        dataset_dir,
+        info,
+        episode_index,
+        video_key=image_key,
+        timestamp_s=timestamp_s,
+    )
+
+
 def load_cam_high_background_image(*, artifacts_root: Path = ARTIFACTS_ROOT) -> np.ndarray | None:
     background_path = default_cam_high_background_path(artifacts_root=artifacts_root)
     if not background_path.exists():
@@ -257,8 +339,12 @@ def build_cam_high_first_frame_overlay(dataset_dir: Path, *, repo_id: str | None
         df = pd.read_parquet(parquet_path)
         if len(df) == 0:
             continue
-        value = df.iloc[0]["observation.images.cam_high"]
-        image = _decode_image_value(value, dataset_dir=dataset_dir)
+        image = _load_cam_high_first_frame(
+            dataset_dir,
+            info,
+            episode_index,
+            df,
+        )
         if target_shape is None:
             target_shape = (int(image.shape[1]), int(image.shape[0]))
             if background_image is None:
