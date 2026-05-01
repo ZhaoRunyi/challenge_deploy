@@ -32,6 +32,7 @@ class RolloutMetrics:
     inference_seconds: list[float] = field(default_factory=list)
     command_period_seconds: list[float] = field(default_factory=list)
     command_seconds: list[float] = field(default_factory=list)
+    rollout_started_at_s: float = field(default_factory=time.monotonic)
 
     def record_inference(self, seconds: float) -> None:
         self.inferred_chunks += 1
@@ -67,6 +68,7 @@ class RolloutMetrics:
             "empty_action_polls": self.empty_action_polls,
             "inference_errors": self.inference_errors,
             "last_inference_error": self.last_inference_error,
+            "rollout_wall_seconds": float(time.monotonic() - self.rollout_started_at_s),
             "inference_seconds": self._stats(self.inference_seconds),
             "command_period_seconds": self._stats(self.command_period_seconds),
             "command_seconds": self._stats(self.command_seconds),

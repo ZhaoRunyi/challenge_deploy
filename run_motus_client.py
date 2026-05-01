@@ -489,6 +489,8 @@ def run_once(args: argparse.Namespace) -> None:
             metrics_path = Path(args.metrics_json)
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
             metrics_path.write_text(json.dumps(metrics_summary, indent=2), encoding="utf-8")
+        if recorder is not None:
+            (recorder.run_dir / f"{recorder.record_stem}_rollout_metrics.json").write_text(json.dumps(metrics_summary, indent=2), encoding="utf-8")
     except KeyboardInterrupt:
         print("Interrupted by user; stopping rollout.", flush=True)
     finally:
