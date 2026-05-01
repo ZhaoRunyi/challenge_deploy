@@ -175,6 +175,39 @@ TASK_OBJECT_SPECS: dict[str, tuple[TaskObjectSpec, ...]] = {
             foreground_weight=1.0,
         ),
     ),
+    "ZhaoRunyi/Piper_insert_test_tube_0426": (
+        TaskObjectSpec(
+            "tube_rack",
+            (
+                "white plastic test tube rack",
+                "laboratory tube rack",
+                "plastic centrifuge tube rack",
+                "white sample rack",
+                "test tube rack",
+            ),
+            boxes=((0.28, 0.08, 0.72, 0.42),),
+            max_area_ratio=0.28,
+            score_threshold=0.14,
+            negative_phrases=("test tube",),
+            foreground_weight=0.10,
+        ),
+        TaskObjectSpec(
+            "test_tube",
+            (
+                "clear glass test tube",
+                "transparent test tube",
+                "glass sample tube",
+                "laboratory test tube",
+                "test tube",
+            ),
+            boxes=((0.76, 0.14, 0.89, 0.58),),
+            max_area_ratio=0.08,
+            score_threshold=0.13,
+            negative_phrases=("tube rack",),
+            foreground_weight=0.0,
+            box_fallback=True,
+        ),
+    ),
     "ZhaoRunyi/Piper_open_drawer_0421": (
         TaskObjectSpec(
             "drawer",
@@ -266,6 +299,7 @@ TASK_OBJECT_SPECS: dict[str, tuple[TaskObjectSpec, ...]] = {
 }
 
 TASK_OBJECT_SPECS["ZhaoRunyi/Piper_carry_basket_0426"] = TASK_OBJECT_SPECS["ZhaoRunyi/Piper_carry_basket_0421"]
+TASK_OBJECT_SPECS["ZhaoRunyi/Piper_insert_test_tube_0430"] = TASK_OBJECT_SPECS["ZhaoRunyi/Piper_insert_test_tube_0426"]
 TASK_OBJECT_SPECS["ZhaoRunyi/Piper_pour_dual_0427"] = TASK_OBJECT_SPECS["ZhaoRunyi/Piper_pour_dual_0421"]
 
 
