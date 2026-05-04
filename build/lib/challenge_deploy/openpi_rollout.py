@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 import threading
 import time
 from typing import Any, Callable, Literal
@@ -14,7 +13,6 @@ from .openpi_client import (
     PiperPolicySpec,
     build_configured_piper_state as default_build_configured_piper_state,
 )
-from .rollout_metrics import save_rollout_metrics_summary
 from .schemas import RobotSnapshot
 
 
@@ -35,8 +33,6 @@ class RolloutMetrics:
     command_period_seconds: list[float] = field(default_factory=list)
     command_seconds: list[float] = field(default_factory=list)
     rollout_started_at_s: float = field(default_factory=time.monotonic)
-    interrupted: bool = False
-    stop_reason: str | None = None
 
     def record_inference(self, seconds: float) -> None:
         self.inferred_chunks += 1
@@ -51,10 +47,6 @@ class RolloutMetrics:
         if period_seconds is not None:
             self.command_period_seconds.append(float(period_seconds))
         self.command_seconds.append(float(command_seconds))
-
-    def mark_interrupted(self, reason: str | None = None) -> None:
-        self.interrupted = True
-        self.stop_reason = reason or "KeyboardInterrupt"
 
     @staticmethod
     def _stats(values: list[float]) -> dict[str, float | None]:
@@ -80,26 +72,7 @@ class RolloutMetrics:
             "inference_seconds": self._stats(self.inference_seconds),
             "command_period_seconds": self._stats(self.command_period_seconds),
             "command_seconds": self._stats(self.command_seconds),
-            "interrupted": self.interrupted,
-            "stop_reason": self.stop_reason,
         }
-
-
-def save_rollout_metrics(
-    metrics: RolloutMetrics,
-    *,
-    metrics_json_path: str | Path | None = None,
-    run_dir: Path | None = None,
-    record_stem: str | None = None,
-) -> tuple[dict[str, Any], list[Path]]:
-    metrics_summary = metrics.summary()
-    written_paths = save_rollout_metrics_summary(
-        metrics_summary,
-        metrics_json_path=metrics_json_path,
-        run_dir=run_dir,
-        record_stem=record_stem,
-    )
-    return metrics_summary, written_paths
 
 
 def action_sequence(actions: np.ndarray) -> np.ndarray:
@@ -167,47 +140,44 @@ def run_chunk_sync_rollout(
     last_command_start_s: float | None = None
     next_snapshot = initial_snapshot
 
-    try:
-        while rollout_steps == 0 or metrics.executed_steps < rollout_steps:
-            inference_start_s = time.monotonic()
-            chunk_snapshot = next_snapshot if next_snapshot is not None else source.capture_snapshot()
-            next_snapshot = None
-            actions = trim_chunk(client.infer_actions(chunk_snapshot, prompt=prompt), chunk_size)
-            metrics.record_inference(time.monotonic() - inference_start_s)
+    while rollout_steps == 0 or metrics.executed_steps < rollout_steps:
+        inference_start_s = time.monotonic()
+        chunk_snapshot = next_snapshot if next_snapshot is not None else source.capture_snapshot()
+        next_snapshot = None
+        actions = trim_chunk(client.infer_actions(chunk_snapshot, prompt=prompt), chunk_size)
+        metrics.record_inference(time.monotonic() - inference_start_s)
 
-            requested_actions = len(actions)
-            if rollout_steps > 0:
-                requested_actions = min(requested_actions, rollout_steps - metrics.executed_steps)
-            if requested_actions <= 0:
-                break
+        requested_actions = len(actions)
+        if rollout_steps > 0:
+            requested_actions = min(requested_actions, rollout_steps - metrics.executed_steps)
+        if requested_actions <= 0:
+            break
 
-            if log_chunk is not None:
-                log_chunk(chunk_index, requested_actions, metrics.executed_steps, actions[0])
+        if log_chunk is not None:
+            log_chunk(chunk_index, requested_actions, metrics.executed_steps, actions[0])
 
-            for action_index, action in enumerate(actions[:requested_actions]):
-                action_start_s = time.monotonic()
-                period_seconds = None if last_command_start_s is None else action_start_s - last_command_start_s
-                last_command_start_s = action_start_s
-                frame_snapshot = chunk_snapshot if action_index == 0 else source.capture_snapshot()
-                command_start_s = time.monotonic()
-                client.command_action(robot, action)
-                if recorder is not None:
-                    recorder.record(
-                        images=frame_snapshot.images,
-                        action=action,
-                        state=_configured_state_after_command(robot, spec, state_builder),
-                        timestamp_s=time.time(),
-                    )
-                metrics.record_command(
-                    period_seconds=period_seconds,
-                    command_seconds=time.monotonic() - command_start_s,
+        for action_index, action in enumerate(actions[:requested_actions]):
+            action_start_s = time.monotonic()
+            period_seconds = None if last_command_start_s is None else action_start_s - last_command_start_s
+            last_command_start_s = action_start_s
+            frame_snapshot = chunk_snapshot if action_index == 0 else source.capture_snapshot()
+            command_start_s = time.monotonic()
+            client.command_action(robot, action)
+            if recorder is not None:
+                recorder.record(
+                    images=frame_snapshot.images,
+                    action=action,
+                    state=_configured_state_after_command(robot, spec, state_builder),
+                    timestamp_s=time.time(),
                 )
-                if rollout_steps > 0 and metrics.executed_steps >= rollout_steps:
-                    break
-                sleep_until_next_action(action_start_s, fps)
-            chunk_index += 1
-    except KeyboardInterrupt as exc:
-        metrics.mark_interrupted(repr(exc))
+            metrics.record_command(
+                period_seconds=period_seconds,
+                command_seconds=time.monotonic() - command_start_s,
+            )
+            if rollout_steps > 0 and metrics.executed_steps >= rollout_steps:
+                break
+            sleep_until_next_action(action_start_s, fps)
+        chunk_index += 1
 
     return metrics
 
@@ -322,8 +292,6 @@ def run_temporal_smoothing_rollout(
             if rollout_steps > 0 and metrics.executed_steps >= rollout_steps:
                 break
             sleep_until_next_action(action_start_s, fps)
-    except KeyboardInterrupt as exc:
-        metrics.mark_interrupted(repr(exc))
     finally:
         stop_event.set()
         inference_thread.join(timeout=1.0)

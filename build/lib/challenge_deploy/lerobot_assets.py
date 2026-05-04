@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 from openpi.training import config as openpi_config
 
+from .task_segmentation import select_relevant_task_masks
+
 DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LEROBOT_HOME = Path("/home/edemlab/challenge_ws/data")
 ARTIFACTS_ROOT = DEPLOY_ROOT / "artifacts"
@@ -56,15 +58,11 @@ def lerobot_home() -> Path:
 
 def get_train_config_repo_id(train_config_name: str) -> str | None:
     cfg = openpi_config.get_config(train_config_name)
-    repo_id = getattr(cfg.data, "repo_id", None)
-    if not isinstance(repo_id, str):
-        return None
-    repo_id = repo_id.strip()
-    return repo_id or None
+    return getattr(cfg.data, "repo_id", None)
 
 
 def dataset_dir_for_repo_id(repo_id: str | None, *, root: Path | None = None) -> Path | None:
-    if not isinstance(repo_id, str) or not repo_id:
+    if not repo_id:
         return None
     dataset_dir = (root or lerobot_home()) / repo_id
     return dataset_dir if dataset_dir.exists() else None
@@ -323,8 +321,6 @@ def load_cam_high_background_image(*, artifacts_root: Path = ARTIFACTS_ROOT) -> 
 
 
 def build_cam_high_first_frame_overlay(dataset_dir: Path, *, repo_id: str | None = None) -> np.ndarray:
-    from .task_segmentation import select_relevant_task_masks
-
     info = _info_json(dataset_dir)
     episode_indices = _episode_indices(dataset_dir)
     if not episode_indices:

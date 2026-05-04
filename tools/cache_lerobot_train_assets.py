@@ -3,6 +3,12 @@ from __future__ import annotations
 import argparse
 import cv2
 import json
+from pathlib import Path
+import sys
+
+DEPLOY_ROOT = Path(__file__).resolve().parents[1]
+if str(DEPLOY_ROOT) not in sys.path:
+    sys.path.insert(0, str(DEPLOY_ROOT))
 
 from challenge_deploy.config import load_config, set_by_dotted_path
 from challenge_deploy.lerobot_assets import (
@@ -11,7 +17,8 @@ from challenge_deploy.lerobot_assets import (
     ensure_distribution_image,
     get_train_config_repo_id,
     iter_valid_lerobot_datasets,
-    set_cached_prompt,
+    load_prompt_cache,
+    save_prompt_cache,
     train_config_names,
 )
 from challenge_deploy.realsense import RealSenseRig
@@ -69,6 +76,41 @@ def _capture_background_image(*, config_path: str, camera_front_serial: str | No
     return str(output_path)
 
 
+def _normalized_prompt(value: str | None) -> str | None:
+    if value is None:
+        return None
+    prompt = value.strip()
+    return prompt or None
+
+
+def _repo_prompt_from_cache(
+    repo_id: str,
+    *,
+    repo_to_train_configs: dict[str, list[str]],
+    prompt_cache: dict[str, str],
+) -> tuple[str | None, str | None]:
+    for train_config_name in repo_to_train_configs.get(repo_id, []):
+        prompt = _normalized_prompt(prompt_cache.get(train_config_name))
+        if prompt:
+            return prompt, train_config_name
+    return None, None
+
+
+def _record_prompt_update(
+    prompt_cache: dict[str, str],
+    *,
+    train_config_name: str,
+    prompt: str,
+) -> bool:
+    normalized_prompt = _normalized_prompt(prompt)
+    if not normalized_prompt:
+        return False
+    if prompt_cache.get(train_config_name) == normalized_prompt:
+        return False
+    prompt_cache[train_config_name] = normalized_prompt
+    return True
+
+
 def main() -> None:
     args = build_parser().parse_args()
     effective_force = bool(args.force or args.capture_background)
@@ -82,10 +124,13 @@ def main() -> None:
     repo_to_train_configs: dict[str, list[str]] = {}
     for train_config_name in train_config_names():
         repo_id = get_train_config_repo_id(train_config_name)
-        if repo_id is None:
+        if not isinstance(repo_id, str) or not repo_id.strip():
             continue
         repo_to_train_configs.setdefault(repo_id, []).append(train_config_name)
 
+    prompt_cache = load_prompt_cache()
+    updated_prompt_cache = dict(prompt_cache)
+    copied_prompt_updates: list[dict[str, str]] = []
     results: list[dict[str, object]] = []
     if captured_background_path is not None:
         results.append(
@@ -110,10 +155,50 @@ def main() -> None:
             item["prompt"] = prompt
             if prompt:
                 for train_config_name in repo_to_train_configs.get(repo_id, []):
-                    set_cached_prompt(train_config_name, prompt)
+                    if _record_prompt_update(
+                        updated_prompt_cache,
+                        train_config_name=train_config_name,
+                        prompt=prompt,
+                    ):
+                        copied_prompt_updates.append(
+                            {
+                                "train_config": train_config_name,
+                                "repo_id": repo_id,
+                                "source": str(Path(dataset_dir) / "meta"),
+                            }
+                        )
         except Exception as exc:
             item["prompt_error"] = repr(exc)
         results.append(item)
+
+    for repo_id, train_configs in sorted(repo_to_train_configs.items()):
+        shared_prompt, source_train_config = _repo_prompt_from_cache(
+            repo_id,
+            repo_to_train_configs=repo_to_train_configs,
+            prompt_cache=updated_prompt_cache,
+        )
+        if not shared_prompt or not source_train_config:
+            continue
+        for train_config_name in train_configs:
+            if train_config_name == source_train_config:
+                continue
+            if _record_prompt_update(
+                updated_prompt_cache,
+                train_config_name=train_config_name,
+                prompt=shared_prompt,
+            ):
+                copied_prompt_updates.append(
+                    {
+                        "train_config": train_config_name,
+                        "repo_id": repo_id,
+                        "source": f"cached:{source_train_config}",
+                    }
+                )
+
+    if updated_prompt_cache != prompt_cache:
+        save_prompt_cache(updated_prompt_cache)
+    if copied_prompt_updates:
+        results.append({"prompt_cache_updates": copied_prompt_updates})
 
     print(json.dumps(results, ensure_ascii=False, indent=2))
 

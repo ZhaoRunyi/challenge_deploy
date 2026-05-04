@@ -293,13 +293,11 @@ def _action_gripper_for_piper(value: float, gripper_cfg: Any) -> float:
     return _legacy_raw_gripper_to_hardware(value)
 
 
-def _thresholded_gripper_for_piper(value: float, threshold: float | None, gripper_cfg: Any | None = None) -> float:
-    value = max(0.0, float(value))
+def _thresholded_gripper_for_piper(value: float, threshold: float | None) -> float:
+    value = float(value)
     if threshold is None:
-        return _action_gripper_for_piper(value, gripper_cfg)
-    threshold_value = (threshold / gripper_cfg.full_width) if gripper_cfg is not None and gripper_cfg.type == "01" else _hardware_gripper_to_legacy_raw(threshold)
-    full_open_value = 1.0 if gripper_cfg is not None and gripper_cfg.type == "01" else _hardware_gripper_to_legacy_raw(0.10)
-    return _action_gripper_for_piper(full_open_value if value >= threshold_value else 0.0, gripper_cfg)
+        return value
+    return value if value >= threshold else 0.0
 
 
 def _arm_full_state(arm: PiperArmState, *, ee_rotation: str, gripper_cfg: Any) -> np.ndarray:
@@ -605,9 +603,11 @@ class MotusPiperClient:
         decoded: dict[str, DecodedArmAction] = {}
         for arm in action_space["arms"]:
             gripper = _thresholded_gripper_for_piper(
-                float(action[slices[f"{arm}_gripper"]][0]),
+                _action_gripper_for_piper(
+                    float(action[slices[f"{arm}_gripper"]][0]),
+                    self.spec.action_space.gripper,
+                ),
                 self.gripper_threshold,
-                self.spec.action_space.gripper,
             )
             joint = None
             ee_pose = None

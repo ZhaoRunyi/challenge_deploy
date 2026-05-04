@@ -5,34 +5,36 @@ import cv2
 import json
 from pathlib import Path
 import signal
-import time
 from typing import Any
 
 import numpy as np
+from openpi.policies import slai_piper_policy
 
 from challenge_deploy.config import load_config, set_by_dotted_path
-from challenge_deploy.lerobot_assets import repo_id_distribution_image_path
-from challenge_deploy.motus_client import (
+from challenge_deploy.lerobot_assets import (
+    dataset_asset_info,
+    prepare_train_assets,
+    resolve_prompt,
+)
+from challenge_deploy.openpi_client import (
     ControlMode,
-    MotusPiperClient,
-    MotusPolicySpec,
-    _motus_slai_policy,
+    OpenPiPiperClient,
+    PiperPolicySpec,
     build_configured_piper_state,
     decoded_action_summary,
-    load_motus_policy_spec,
+    load_piper_policy_spec,
     spec_summary,
-)
-from challenge_deploy.openpi_rollout import (
-    action_sequence,
-    resolve_chunk_size,
-    run_chunk_sync_rollout,
-    save_rollout_metrics,
-    run_temporal_smoothing_rollout,
 )
 from challenge_deploy.piper import DualPiperSystem
 from challenge_deploy.realsense import RealSenseRig
 from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema, stack_vertical
 from challenge_deploy.runtime import DualPiperObservationSource
+from challenge_deploy.openpi_rollout import (
+    action_sequence,
+    resolve_chunk_size,
+    run_chunk_sync_rollout,
+    run_temporal_smoothing_rollout,
+)
 
 
 DEPLOY_ROOT = Path(__file__).resolve().parent
@@ -57,11 +59,10 @@ INIT_JOINTS = np.array(
 )
 
 
-def _used_action_names(spec: MotusPolicySpec, control_mode: ControlMode) -> frozenset[str]:
-    slai_policy = _motus_slai_policy()
-    action_space = slai_policy._space_from_action_config(spec.action_space)
-    names = slai_policy.get_vector_names(spec.action_space)
-    slices = slai_policy._field_slices_from_space(action_space)
+def _used_action_names(spec: PiperPolicySpec, control_mode: ControlMode) -> frozenset[str]:
+    action_space = slai_piper_policy._space_from_action_config(spec.action_space)
+    names = slai_piper_policy.get_vector_names(spec.action_space)
+    slices = slai_piper_policy._field_slices_from_space(action_space)
     used_fields = {"gripper"}
     if control_mode == "joints":
         used_fields.add("joint")
@@ -78,18 +79,17 @@ def _used_action_names(spec: MotusPolicySpec, control_mode: ControlMode) -> froz
     return frozenset(used)
 
 
-def _make_recording_schema(spec: MotusPolicySpec, control_mode: ControlMode) -> RecordingSchema:
-    slai_policy = _motus_slai_policy()
+def _make_recording_schema(spec: PiperPolicySpec, control_mode: ControlMode) -> RecordingSchema:
     return RecordingSchema(
         camera_names=spec.image_ids,
-        action_names=tuple(slai_policy.get_vector_names(spec.action_space)),
-        state_names=tuple(slai_policy.get_vector_names(spec.state_space)),
+        action_names=tuple(slai_piper_policy.get_vector_names(spec.action_space)),
+        state_names=tuple(slai_piper_policy.get_vector_names(spec.state_space)),
         used_action_names=_used_action_names(spec, control_mode),
     )
 
 
 def _record_name_prefix(args: argparse.Namespace) -> str:
-    ckpt_name = Path(args.ckpt_dir).name if args.ckpt_dir else Path(args.train_config).stem
+    ckpt_name = Path(args.ckpt_dir).name if args.ckpt_dir else args.train_config
     return f"{ckpt_name}_{args.control_mode}_{args.execution_mode}"
 
 
@@ -118,19 +118,11 @@ def _ignore_record_signal_handlers() -> None:
             pass
 
 
-def _new_session_id() -> str:
-    return f"motus_{time.strftime('%Y%m%d_%H%M%S')}"
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Motus SLAI Piper client: capture snapshots, infer chunks, and command Piper in a rollout."
+        description="OpenPI SLAI Piper client: capture snapshots, infer chunks, and command Piper in a rollout."
     )
-    parser.add_argument(
-        "--train-config",
-        required=True,
-        help="Motus YAML config path, e.g. baselines/Motus/configs/piper_click_bell_0403_robotwin_like.yaml.",
-    )
+    parser.add_argument("--train-config", required=True, help="OpenPI train config name, e.g. pi0_slai_piper_template.")
     parser.add_argument("--ckpt-dir", default=None, help="Checkpoint directory used only for record video filenames.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -143,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--gripper_threshold",
         type=float,
         default=None,
-        help="Optional executable-scale gripper threshold in meters. Values below threshold close the gripper, and values above threshold command full open.",
+        help="Optional executable-scale gripper threshold. Final gripper values below this are clipped to 0.",
     )
     parser.add_argument(
         "--rollout-steps",
@@ -175,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--buffer-max-chunks", type=int, default=None, help="Action buffer chunk cap; default from config.")
     parser.add_argument("--metrics-json", default=None, help="Optional path to save rollout timing metrics as JSON.")
     parser.add_argument("--record", action="store_true", help="Record cameras, actions, and states into one deploy video.")
-    parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "motus_records"))
+    parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "openpi_records"))
     parser.add_argument("--config", default=str(DEPLOY_ROOT / "configs" / "dual_piper_example.yaml"))
     parser.add_argument("--left-can", default=None)
     parser.add_argument("--right-can", default=None)
@@ -187,13 +179,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spec-only", action="store_true", help="Only print the train-config-derived spaces; no server or hardware.")
     parser.add_argument("--ready-timeout", type=float, default=15.0)
     return parser
-
-
-def _normalized_prompt(value: str | None) -> str | None:
-    if value is None:
-        return None
-    prompt = value.strip()
-    return prompt or None
 
 
 def _apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -217,7 +202,7 @@ def _make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[An
         left_can_name=config["robot"]["left"]["can_name"],
         right_can_name=config["robot"]["right"]["can_name"],
         commands_enabled=commands_enabled,
-        name="motus_piper_client",
+        name="openpi_piper_client",
     )
     cameras = None
     if config["cameras"]["enabled"]:
@@ -231,9 +216,29 @@ def _make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[An
     return robot, cameras, DualPiperObservationSource(robot=robot, cameras=cameras)
 
 
+def _normalized_prompt(value: str | None) -> str | None:
+    if value is None:
+        return None
+    prompt = value.strip()
+    return prompt or None
+
+
+def _save_frame1_comparison(
+    *,
+    recorder: OpenPiRolloutRecorder,
+    distribution_image_path: Path,
+    frame1_image: np.ndarray,
+) -> Path:
+    distribution_image = cv2.imread(str(distribution_image_path), cv2.IMREAD_COLOR)
+    if distribution_image is None:
+        raise RuntimeError(f"Failed to read train distribution image: {distribution_image_path}")
+    comparison = stack_vertical(distribution_image, frame1_image)
+    return recorder.save_extra_image(comparison, suffix="frame1")
+
+
 def _print_rollout_chunk_summary(
     *,
-    client: MotusPiperClient,
+    client: OpenPiPiperClient,
     chunk_index: int,
     action_count: int,
     executed_steps: int,
@@ -257,51 +262,8 @@ def _print_rollout_chunk_summary(
     )
 
 
-def _save_first_frame_image(
-    *,
-    recorder: OpenPiRolloutRecorder,
-    snapshot: Any | None,
-    spec: MotusPolicySpec,
-    distribution_image_path: Path | None = None,
-) -> Path | None:
-    if snapshot is None:
-        return None
-    if distribution_image_path is not None and "cam_high" in snapshot.images:
-        distribution_image = cv2.imread(str(distribution_image_path), cv2.IMREAD_COLOR)
-        if distribution_image is None:
-            raise RuntimeError(f"Failed to read train distribution image: {distribution_image_path}")
-        comparison = stack_vertical(distribution_image, snapshot.images["cam_high"])
-        return recorder.save_extra_image(comparison, suffix="frame1")
-    preferred_names = ("cam_high",) + tuple(spec.image_ids)
-    for image_name in preferred_names:
-        image = snapshot.images.get(image_name)
-        if image is None:
-            continue
-        return recorder.save_extra_image(image, suffix="frame1")
-    return None
-
-
-def _record_repo_id_for_distribution(spec: MotusPolicySpec) -> str | None:
-    if not spec.repo_id:
-        return None
-    owner, sep, dataset_name = str(spec.repo_id).partition("/")
-    if sep and dataset_name.startswith("Motus_"):
-        return f"{owner}/{dataset_name[len('Motus_'):]}"
-    return str(spec.repo_id)
-
-
-def _resolve_motus_distribution_image(spec: MotusPolicySpec) -> tuple[Path | None, str | None]:
-    repo_id = _record_repo_id_for_distribution(spec)
-    if repo_id is None:
-        return None, "train config does not define dataset.params.repo_id"
-    distribution_image_path = repo_id_distribution_image_path(repo_id)
-    if distribution_image_path.exists():
-        return distribution_image_path, None
-    return None, f"train distribution image not found: {distribution_image_path}"
-
-
 def run_once(args: argparse.Namespace) -> None:
-    spec = load_motus_policy_spec(args.train_config)
+    spec = load_piper_policy_spec(args.train_config)
     print(json.dumps(spec_summary(spec), indent=2))
     if args.spec_only:
         return
@@ -314,7 +276,31 @@ def run_once(args: argparse.Namespace) -> None:
         raise ValueError("--gripper_threshold must be non-negative")
     if args.inference_rate is not None and args.inference_rate < 0.0:
         raise ValueError("--inference-rate must be non-negative")
-    client = MotusPiperClient(
+
+    record_assets = None
+    if args.record:
+        record_assets = prepare_train_assets(
+            train_config_name=args.train_config,
+            cli_prompt=cli_prompt,
+        )
+        resolved_prompt = record_assets.prompt
+        prompt_source = record_assets.prompt_source
+    else:
+        asset_info = dataset_asset_info(args.train_config)
+        resolved_prompt, prompt_source = resolve_prompt(
+            train_config_name=args.train_config,
+            cli_prompt=cli_prompt,
+            dataset_dir=asset_info.dataset_dir,
+        )
+
+    if resolved_prompt is None:
+        raise RuntimeError(
+            "No prompt available. Provide --prompt, or ensure the train config's LeRobot dataset exists "
+            "and has a cached/discoverable task prompt."
+        )
+    print(json.dumps({"prompt": {"value": resolved_prompt, "source": prompt_source}}, indent=2), flush=True)
+
+    client = OpenPiPiperClient(
         args.train_config,
         host=args.host,
         port=args.port,
@@ -324,28 +310,6 @@ def run_once(args: argparse.Namespace) -> None:
         ee_speed_percent=args.ee_speed_percent,
         gripper_threshold=args.gripper_threshold,
     )
-    server_metadata = client.get_server_metadata()
-    print(json.dumps({"server_metadata": server_metadata}, indent=2), flush=True)
-
-    resolved_prompt = cli_prompt or server_metadata.get("default_prompt")
-    prompt_source = "cli" if cli_prompt is not None else "server_default"
-    if resolved_prompt is None:
-        raise RuntimeError(
-            "No prompt available. Provide --prompt, or ensure the remote Motus server was started with --default_prompt."
-        )
-    print(
-        json.dumps(
-            {
-                "prompt": {
-                    "value": resolved_prompt,
-                    "source": prompt_source,
-                }
-            },
-            indent=2,
-        ),
-        flush=True,
-    )
-
     runtime_config = _apply_runtime_overrides(load_config(args.config), args)
     robot, cameras, source = _make_runtime(runtime_config, commands_enabled=not args.dry_run)
     recorder = (
@@ -362,13 +326,7 @@ def run_once(args: argparse.Namespace) -> None:
         _install_record_signal_handlers()
 
     first_obs_snapshot = None
-    distribution_image_path = None
-    distribution_skip_reason = None
-    if recorder is not None:
-        distribution_image_path, distribution_skip_reason = _resolve_motus_distribution_image(spec)
-    session_id = _new_session_id()
-    client.set_default_session_id(session_id)
-    metrics = None
+    frame1_compare_path: Path | None = None
     robot.connect(read_only=args.dry_run)
     try:
         if cameras is not None:
@@ -386,7 +344,7 @@ def run_once(args: argparse.Namespace) -> None:
                     action=actions[0],
                     state=build_configured_piper_state(snapshot, spec),
                     timestamp_s=snapshot.timestamp_s,
-                )
+            )
             print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2))
             return
 
@@ -394,9 +352,6 @@ def run_once(args: argparse.Namespace) -> None:
         if not robot.enable():
             print("Warning: Piper arm enable check did not report success; continuing anyway.", flush=True)
 
-        print(json.dumps({"initial_pose": {"qpos": INIT_JOINTS.tolist()}}, indent=2), flush=True)
-        robot.move_to_joint_positions(INIT_JOINTS, speed_percent=args.joint_speed_percent)
-        first_obs_snapshot = source.capture_snapshot()
         chunk_size = resolve_chunk_size(spec, args.chunk_size)
         inference_rate = (
             float(args.inference_rate)
@@ -418,6 +373,9 @@ def run_once(args: argparse.Namespace) -> None:
             if args.buffer_max_chunks is not None
             else int(runtime_config["policy"]["buffer_max_chunks"])
         )
+        print(json.dumps({"initial_pose": {"qpos": INIT_JOINTS.tolist()}}, indent=2), flush=True)
+        robot.move_to_joint_positions(INIT_JOINTS, speed_percent=args.joint_speed_percent)
+        first_obs_snapshot = source.capture_snapshot()
 
         print(
             json.dumps(
@@ -468,7 +426,6 @@ def run_once(args: argparse.Namespace) -> None:
                 recorder=recorder,
                 log_chunk=log_chunk,
                 initial_snapshot=first_obs_snapshot,
-                state_builder=build_configured_piper_state,
             )
         else:
             metrics = run_chunk_sync_rollout(
@@ -483,23 +440,20 @@ def run_once(args: argparse.Namespace) -> None:
                 recorder=recorder,
                 log_chunk=log_chunk,
                 initial_snapshot=first_obs_snapshot,
-                state_builder=build_configured_piper_state,
             )
-        if metrics.interrupted:
-            print("Interrupted by user; stopping rollout.", flush=True)
-        metrics_summary, written_metric_paths = save_rollout_metrics(
-            metrics,
-            metrics_json_path=args.metrics_json,
-            run_dir=recorder.run_dir if recorder is not None else None,
-            record_stem=recorder.record_stem if recorder is not None else None,
-        )
+        metrics_summary = metrics.summary()
         print(json.dumps({"rollout_metrics": metrics_summary}, indent=2), flush=True)
-        for metrics_path in written_metric_paths:
-            print(f"Rollout metrics saved to {metrics_path}", flush=True)
+        if args.metrics_json:
+            metrics_path = Path(args.metrics_json)
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            metrics_path.write_text(json.dumps(metrics_summary, indent=2), encoding="utf-8")
+        if recorder is not None:
+            (recorder.run_dir / f"{recorder.record_stem}_rollout_metrics.json").write_text(json.dumps(metrics_summary, indent=2), encoding="utf-8")
     except KeyboardInterrupt:
         print("Interrupted by user; stopping rollout.", flush=True)
     finally:
-        _ignore_record_signal_handlers()
+        if recorder is not None:
+            _ignore_record_signal_handlers()
         if cameras is not None:
             try:
                 cameras.stop()
@@ -518,28 +472,23 @@ def run_once(args: argparse.Namespace) -> None:
             if output_path is not None:
                 print(f"Recording saved to {output_path}", flush=True)
                 try:
-                    predicted_video_path = client.save_predicted_video(
-                        session_id=session_id,
-                        output_dir=recorder.run_dir,
-                        file_stem=recorder.record_stem,
-                    )
-                    if predicted_video_path is not None:
-                        print(f"Predicted video saved to {predicted_video_path}", flush=True)
+                    if (
+                        first_obs_snapshot is not None
+                        and record_assets is not None
+                        and record_assets.distribution_ready
+                        and record_assets.distribution_image_path is not None
+                        and "cam_high" in first_obs_snapshot.images
+                    ):
+                        frame1_compare_path = _save_frame1_comparison(
+                            recorder=recorder,
+                            distribution_image_path=record_assets.distribution_image_path,
+                            frame1_image=first_obs_snapshot.images["cam_high"],
+                        )
+                        print(f"Frame1 comparison saved to {frame1_compare_path}", flush=True)
+                    elif record_assets is not None and record_assets.skip_reason is not None:
+                        print(f"Skipped train-distribution frame1 image: {record_assets.skip_reason}", flush=True)
                 except Exception as exc:
-                    print(f"Failed to save predicted video: {exc}", flush=True)
-                try:
-                    frame1_path = _save_first_frame_image(
-                        recorder=recorder,
-                        snapshot=first_obs_snapshot,
-                        spec=spec,
-                        distribution_image_path=distribution_image_path,
-                    )
-                    if frame1_path is not None:
-                        print(f"Frame1 image saved to {frame1_path}", flush=True)
-                    elif distribution_skip_reason is not None:
-                        print(f"Skipped train-distribution frame1 image: {distribution_skip_reason}", flush=True)
-                except Exception as exc:
-                    print(f"Failed to save frame1 image: {exc}", flush=True)
+                    print(f"Failed to save frame1 comparison image: {exc}", flush=True)
 
 
 def main() -> None:

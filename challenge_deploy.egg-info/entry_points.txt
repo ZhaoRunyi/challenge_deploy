@@ -1,0 +1,2 @@
+[console_scripts]
+challenge-deploy-openpi-client = run_openpi_clients:main

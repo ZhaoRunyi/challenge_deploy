@@ -33,6 +33,7 @@ from challenge_deploy.openpi_rollout import (
     action_sequence,
     resolve_chunk_size,
     run_chunk_sync_rollout,
+    save_rollout_metrics,
     run_temporal_smoothing_rollout,
 )
 
@@ -327,6 +328,7 @@ def run_once(args: argparse.Namespace) -> None:
 
     first_obs_snapshot = None
     frame1_compare_path: Path | None = None
+    metrics = None
     robot.connect(read_only=args.dry_run)
     try:
         if cameras is not None:
@@ -441,14 +443,17 @@ def run_once(args: argparse.Namespace) -> None:
                 log_chunk=log_chunk,
                 initial_snapshot=first_obs_snapshot,
             )
-        metrics_summary = metrics.summary()
+        if metrics.interrupted:
+            print("Interrupted by user; stopping rollout.", flush=True)
+        metrics_summary, written_metric_paths = save_rollout_metrics(
+            metrics,
+            metrics_json_path=args.metrics_json,
+            run_dir=recorder.run_dir if recorder is not None else None,
+            record_stem=recorder.record_stem if recorder is not None else None,
+        )
         print(json.dumps({"rollout_metrics": metrics_summary}, indent=2), flush=True)
-        if args.metrics_json:
-            metrics_path = Path(args.metrics_json)
-            metrics_path.parent.mkdir(parents=True, exist_ok=True)
-            metrics_path.write_text(json.dumps(metrics_summary, indent=2), encoding="utf-8")
-        if recorder is not None:
-            (recorder.run_dir / f"{recorder.record_stem}_rollout_metrics.json").write_text(json.dumps(metrics_summary, indent=2), encoding="utf-8")
+        for metrics_path in written_metric_paths:
+            print(f"Rollout metrics saved to {metrics_path}", flush=True)
     except KeyboardInterrupt:
         print("Interrupted by user; stopping rollout.", flush=True)
     finally:
