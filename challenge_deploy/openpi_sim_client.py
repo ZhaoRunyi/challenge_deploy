@@ -8,7 +8,13 @@ import numpy as np
 from openpi.training import config as openpi_config
 from openpi_client import image_tools, websocket_client_policy
 
-from .constants import KAI0_GRIPPER_UNIT_SCALE, LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE
+from .constants import PIPER_GRIPPER_FULL_OPEN_METERS
+from .conversions import (
+    legacy_piper_raw_gripper_to_opening,
+    normalized_gripper_to_opening,
+    opening_to_legacy_piper_raw_gripper,
+    opening_to_normalized_gripper,
+)
 from .schemas import PiperArmState, RobotSnapshot
 
 
@@ -34,7 +40,7 @@ SIM_STATE_NAMES = (
 SIM_ACTION_NAMES = SIM_STATE_NAMES
 SIM_ACTION_DIM = 14
 SIM_IMAGE_SIZE = 224
-SIM_GRIPPER_FULL_OPEN_M = 0.10
+SIM_GRIPPER_FULL_OPEN_M = PIPER_GRIPPER_FULL_OPEN_METERS
 
 
 @dataclass(frozen=True)
@@ -49,27 +55,30 @@ class OpenPiSimPolicySpec:
     default_prompt: str | None
 
 
-def _hardware_gripper_to_legacy_raw(value: float) -> float:
-    return float(value) * (KAI0_GRIPPER_UNIT_SCALE / LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE)
+def _hardware_gripper_to_model_raw(value: float, *, old_gripper: bool) -> float:
+    if old_gripper:
+        return opening_to_legacy_piper_raw_gripper(value)
+    return opening_to_normalized_gripper(value)
 
 
-def _legacy_raw_gripper_to_hardware(value: float) -> float:
-    return max(0.0, float(value) * (LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE / KAI0_GRIPPER_UNIT_SCALE))
+def _model_raw_gripper_to_hardware(value: float, *, old_gripper: bool) -> float:
+    if old_gripper:
+        return legacy_piper_raw_gripper_to_opening(value)
+    return normalized_gripper_to_opening(value)
 
 
-def _state_gripper_for_openpi(value: float, gripper_cfg: Any) -> float:
+def _state_gripper_for_openpi(value: float, gripper_cfg: Any, *, old_gripper: bool) -> float:
     value = float(value)
     if gripper_cfg is not None and gripper_cfg.type == "01":
         return value / gripper_cfg.full_width if gripper_cfg.full_width > 0 else value
-    # Same raw Piper dataset convention as openpi_client.py.
-    return _hardware_gripper_to_legacy_raw(value)
+    return _hardware_gripper_to_model_raw(value, old_gripper=old_gripper)
 
 
-def _action_gripper_for_piper(value: float, gripper_cfg: Any) -> float:
+def _action_gripper_for_piper(value: float, gripper_cfg: Any, *, old_gripper: bool) -> float:
     value = float(value)
     if gripper_cfg is not None and gripper_cfg.type == "01":
         return gripper_cfg.full_width if value >= 0.5 else 0.0
-    return _legacy_raw_gripper_to_hardware(value)
+    return _model_raw_gripper_to_hardware(value, old_gripper=old_gripper)
 
 
 def _thresholded_gripper_for_piper(value: float, threshold: float | None) -> float:
@@ -112,35 +121,60 @@ def load_openpi_sim_policy_spec(train_config_name: str) -> OpenPiSimPolicySpec:
     )
 
 
-def _sim_gripper_to_legacy_raw(value: float) -> float:
-    return float(np.clip(float(value), 0.0, 1.0) * _hardware_gripper_to_legacy_raw(SIM_GRIPPER_FULL_OPEN_M))
+def _sim_gripper_to_model_raw(value: float, *, old_gripper: bool) -> float:
+    full_open = _hardware_gripper_to_model_raw(SIM_GRIPPER_FULL_OPEN_M, old_gripper=old_gripper)
+    return float(np.clip(float(value), 0.0, 1.0) * full_open)
 
 
-def sim_gripper_to_piper(value: float, threshold: float | None = None) -> float:
-    return _thresholded_gripper_for_piper(_action_gripper_for_piper(_sim_gripper_to_legacy_raw(value), None), threshold)
+def sim_gripper_to_piper(
+    value: float,
+    threshold: float | None = None,
+    *,
+    old_gripper: bool = False,
+) -> float:
+    return _thresholded_gripper_for_piper(
+        _action_gripper_for_piper(
+            _sim_gripper_to_model_raw(value, old_gripper=old_gripper),
+            None,
+            old_gripper=old_gripper,
+        ),
+        threshold,
+    )
 
 
-def _piper_gripper_to_sim(value: float) -> float:
-    return float(np.clip(_state_gripper_for_openpi(value, None) / _hardware_gripper_to_legacy_raw(SIM_GRIPPER_FULL_OPEN_M), 0.0, 1.0))
+def _piper_gripper_to_sim(value: float, *, old_gripper: bool) -> float:
+    full_open = _hardware_gripper_to_model_raw(SIM_GRIPPER_FULL_OPEN_M, old_gripper=old_gripper)
+    return float(
+        np.clip(
+            _state_gripper_for_openpi(value, None, old_gripper=old_gripper) / full_open,
+            0.0,
+            1.0,
+        )
+    )
 
 
-def _arm_state_for_openpi_sim(arm: PiperArmState) -> np.ndarray:
+def _arm_state_for_openpi_sim(arm: PiperArmState, *, old_gripper: bool) -> np.ndarray:
     return np.concatenate(
         (
             arm.qpos[:6],
-            np.array([_piper_gripper_to_sim(arm.qpos[6])], dtype=np.float64),
+            np.array([_piper_gripper_to_sim(arm.qpos[6], old_gripper=old_gripper)], dtype=np.float64),
         ),
         axis=0,
     ).astype(np.float64)
 
 
-def build_configured_piper_state(snapshot: RobotSnapshot, spec: OpenPiSimPolicySpec) -> np.ndarray:
+def build_configured_piper_state(
+    snapshot: RobotSnapshot,
+    spec: OpenPiSimPolicySpec,
+    *,
+    old_gripper: bool = False,
+) -> np.ndarray:
     """Build EmbodiChain's fixed qpos state: left 6+gripper01, right 6+gripper01."""
 
     return np.concatenate(
         (
-            _arm_state_for_openpi_sim(snapshot.state.left),
-            _arm_state_for_openpi_sim(snapshot.state.right),
+            _arm_state_for_openpi_sim(snapshot.state.left, old_gripper=old_gripper),
+            _arm_state_for_openpi_sim(snapshot.state.right, old_gripper=old_gripper),
         ),
         axis=0,
     )
@@ -162,6 +196,7 @@ def build_policy_payload(
     *,
     prompt: str,
     spec: OpenPiSimPolicySpec,
+    old_gripper: bool = False,
 ) -> dict[str, Any]:
     missing = [image_id for image_id in spec.image_ids if image_id not in snapshot.images]
     if missing:
@@ -170,7 +205,7 @@ def build_policy_payload(
         "observation/image": _image_to_embodichain_rgb(snapshot.images["cam_high"]),
         "observation/left_wrist_image": _image_to_embodichain_rgb(snapshot.images["cam_left_wrist"]),
         "observation/right_wrist_image": _image_to_embodichain_rgb(snapshot.images["cam_right_wrist"]),
-        "observation/state": build_configured_piper_state(snapshot, spec),
+        "observation/state": build_configured_piper_state(snapshot, spec, old_gripper=old_gripper),
         "prompt": prompt,
     }
 
@@ -201,6 +236,7 @@ class OpenPiSimPiperClient:
         api_key: str | None = None,
         joint_speed_percent: int = 50,
         gripper_threshold: float | None = None,
+        old_gripper: bool = False,
     ) -> None:
         if control_mode != "joints":
             raise ValueError("openpi_sim only exposes joint+gripper actions; use control_mode='joints'")
@@ -210,6 +246,7 @@ class OpenPiSimPiperClient:
         self.control_mode = control_mode
         self.joint_speed_percent = joint_speed_percent
         self.gripper_threshold = gripper_threshold
+        self.old_gripper = old_gripper
         self._client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
 
     @property
@@ -220,7 +257,7 @@ class OpenPiSimPiperClient:
         return self._client.get_server_metadata()
 
     def build_payload(self, snapshot: RobotSnapshot, prompt: str) -> dict[str, Any]:
-        return build_policy_payload(snapshot, prompt=prompt, spec=self.spec)
+        return build_policy_payload(snapshot, prompt=prompt, spec=self.spec, old_gripper=self.old_gripper)
 
     def infer(self, snapshot: RobotSnapshot, prompt: str) -> dict[str, Any]:
         return self._client.infer(self.build_payload(snapshot, prompt))
@@ -235,8 +272,16 @@ class OpenPiSimPiperClient:
         if action.shape[0] < SIM_ACTION_DIM:
             raise ValueError(f"openpi_sim action dim {action.shape[0]} is smaller than expected {SIM_ACTION_DIM}")
 
-        left_gripper = sim_gripper_to_piper(float(action[6]), self.gripper_threshold)
-        right_gripper = sim_gripper_to_piper(float(action[13]), self.gripper_threshold)
+        left_gripper = sim_gripper_to_piper(
+            float(action[6]),
+            self.gripper_threshold,
+            old_gripper=self.old_gripper,
+        )
+        right_gripper = sim_gripper_to_piper(
+            float(action[13]),
+            self.gripper_threshold,
+            old_gripper=self.old_gripper,
+        )
         return DecodedSimPiperAction(
             control_mode=self.control_mode,
             arms={

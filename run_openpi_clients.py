@@ -139,6 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional executable-scale gripper threshold. Final gripper values below this are clipped to 0.",
     )
     parser.add_argument(
+        "--old_gripper",
+        action="store_true",
+        help="Use the historical wrong Piper raw-gripper scaling for models trained before the 2lerobot fix.",
+    )
+    parser.add_argument(
         "--rollout-steps",
         type=int,
         default=1000,
@@ -310,6 +315,12 @@ def run_once(args: argparse.Namespace) -> None:
         joint_speed_percent=args.joint_speed_percent,
         ee_speed_percent=args.ee_speed_percent,
         gripper_threshold=args.gripper_threshold,
+        old_gripper=args.old_gripper,
+    )
+    state_builder = lambda snapshot, policy_spec: build_configured_piper_state(
+        snapshot,
+        policy_spec,
+        old_gripper=args.old_gripper,
     )
     runtime_config = _apply_runtime_overrides(load_config(args.config), args)
     robot, cameras, source = _make_runtime(runtime_config, commands_enabled=not args.dry_run)
@@ -344,9 +355,9 @@ def run_once(args: argparse.Namespace) -> None:
                 recorder.record(
                     images=snapshot.images,
                     action=actions[0],
-                    state=build_configured_piper_state(snapshot, spec),
+                    state=state_builder(snapshot, spec),
                     timestamp_s=snapshot.timestamp_s,
-            )
+                )
             print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2))
             return
 
@@ -394,6 +405,7 @@ def run_once(args: argparse.Namespace) -> None:
                         "joint_speed_percent": args.joint_speed_percent,
                         "ee_speed_percent": args.ee_speed_percent,
                         "gripper_threshold": args.gripper_threshold,
+                        "old_gripper": args.old_gripper,
                     }
                 },
                 indent=2,
@@ -428,6 +440,7 @@ def run_once(args: argparse.Namespace) -> None:
                 recorder=recorder,
                 log_chunk=log_chunk,
                 initial_snapshot=first_obs_snapshot,
+                state_builder=state_builder,
             )
         else:
             metrics = run_chunk_sync_rollout(
@@ -442,6 +455,7 @@ def run_once(args: argparse.Namespace) -> None:
                 recorder=recorder,
                 log_chunk=log_chunk,
                 initial_snapshot=first_obs_snapshot,
+                state_builder=state_builder,
             )
         if metrics.interrupted:
             print("Interrupted by user; stopping rollout.", flush=True)

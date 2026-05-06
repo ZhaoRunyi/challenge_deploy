@@ -52,9 +52,12 @@ INIT_EMBODICHAIN_QPOS = np.array(
 )
 
 
-def _initial_piper_joints() -> np.ndarray:
+def _initial_piper_joints(*, old_gripper: bool = False) -> np.ndarray:
     qpos = INIT_EMBODICHAIN_QPOS.copy()
-    qpos[[6, 13]] = [sim_gripper_to_piper(qpos[6]), sim_gripper_to_piper(qpos[13])]
+    qpos[[6, 13]] = [
+        sim_gripper_to_piper(qpos[6], old_gripper=old_gripper),
+        sim_gripper_to_piper(qpos[13], old_gripper=old_gripper),
+    ]
     return qpos
 
 
@@ -162,6 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Optional executable-scale gripper threshold. Final gripper values below this are clipped to 0.",
+    )
+    parser.add_argument(
+        "--old_gripper",
+        action="store_true",
+        help="Use the historical wrong Piper raw-gripper scaling for models trained before the 2lerobot fix.",
     )
     parser.add_argument(
         "--rollout-steps",
@@ -297,10 +305,16 @@ def _snapshot_with_grippers(snapshot: RobotSnapshot, grippers: np.ndarray) -> Ro
     return snapshot
 
 
-def _configured_state_after_command(robot: Any, spec: OpenPiSimPolicySpec, grippers: np.ndarray) -> np.ndarray:
+def _configured_state_after_command(
+    robot: Any,
+    spec: OpenPiSimPolicySpec,
+    grippers: np.ndarray,
+    *,
+    old_gripper: bool = False,
+) -> np.ndarray:
     snapshot = RobotSnapshot(timestamp_s=time.time(), state=robot.read_state(), images={})
     snapshot = _snapshot_with_grippers(snapshot, grippers)
-    return build_configured_piper_state(snapshot, spec)
+    return build_configured_piper_state(snapshot, spec, old_gripper=old_gripper)
 
 
 def _print_rollout_chunk_summary(
@@ -341,6 +355,7 @@ def run_chunk_sync_rollout(
     recorder: OpenPiRolloutRecorder | None = None,
     initial_snapshot: Any | None = None,
     initial_grippers: np.ndarray | None = None,
+    old_gripper: bool = False,
 ) -> RolloutMetrics:
     metrics = RolloutMetrics()
     chunk_index = 0
@@ -393,7 +408,12 @@ def run_chunk_sync_rollout(
                     recorder.record(
                         images=frame_snapshot.images,
                         action=action,
-                        state=_configured_state_after_command(robot, spec, last_grippers),
+                        state=_configured_state_after_command(
+                            robot,
+                            spec,
+                            last_grippers,
+                            old_gripper=old_gripper,
+                        ),
                         timestamp_s=time.time(),
                     )
                 metrics.record_command(period_seconds=period_seconds, command_seconds=time.monotonic() - command_start_s)
@@ -466,6 +486,7 @@ def run_once(args: argparse.Namespace) -> None:
         api_key=args.api_key,
         joint_speed_percent=args.joint_speed_percent,
         gripper_threshold=args.gripper_threshold,
+        old_gripper=args.old_gripper,
     )
 
     runtime_config = _apply_runtime_overrides(load_config(args.config), args)
@@ -500,7 +521,7 @@ def run_once(args: argparse.Namespace) -> None:
                 recorder.record(
                     images=snapshot.images,
                     action=actions[0],
-                    state=build_configured_piper_state(snapshot, spec),
+                    state=build_configured_piper_state(snapshot, spec, old_gripper=args.old_gripper),
                     timestamp_s=snapshot.timestamp_s,
                 )
             print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2), flush=True)
@@ -511,7 +532,7 @@ def run_once(args: argparse.Namespace) -> None:
             print("Warning: Piper arm enable check did not report success; continuing anyway.", flush=True)
 
         chunk_size = resolve_chunk_size(spec, args.chunk_size)
-        initial_joints = _initial_piper_joints()
+        initial_joints = _initial_piper_joints(old_gripper=args.old_gripper)
         print(json.dumps({"initial_pose": {"qpos": initial_joints.tolist()}}, indent=2), flush=True)
         robot.move_to_joint_positions(initial_joints, speed_percent=args.joint_speed_percent)
         first_obs_snapshot = _snapshot_with_grippers(source.capture_snapshot(), initial_joints[[6, 13]])
@@ -526,6 +547,7 @@ def run_once(args: argparse.Namespace) -> None:
                         "joint_speed_percent": args.joint_speed_percent,
                         "ee_speed_percent": args.ee_speed_percent,
                         "gripper_threshold": args.gripper_threshold,
+                        "old_gripper": args.old_gripper,
                     }
                 },
                 indent=2,
@@ -545,6 +567,7 @@ def run_once(args: argparse.Namespace) -> None:
             recorder=recorder,
             initial_snapshot=first_obs_snapshot,
             initial_grippers=initial_joints[[6, 13]],
+            old_gripper=args.old_gripper,
         )
         if metrics.interrupted:
             print("Interrupted by user; stopping rollout.", flush=True)

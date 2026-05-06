@@ -26,14 +26,16 @@ KAI0_RAD_PER_MILLI_DEGREE = 0.017444 / 1000.0
 KAI0_MILLI_DEGREE_PER_RAD = 57324.840764
 KAI0_GRIPPER_UNIT_SCALE = 1_000_000.0
 KAI0_TRANSLATION_UNIT_SCALE = 1_000_000.0
+PIPER_GRIPPER_FULL_OPEN_METERS = 0.10
 
 # Historical Piper HDF5 data in this workspace was collected through
 # `control_your_robot`'s PiperController, which used:
 #   state["gripper"] = grippers_angle * 0.001 / 70
 #   set_gripper(x)   = int(x * 70 * 1000)
-# OpenPI models trained on those datasets therefore expect the "raw" gripper
-# dimension in 70_000-scale units rather than the later deploy-side 1_000_000
-# scale used by piper.py for direct hardware access.
+# Newly corrected LeRobot datasets instead use a normalized opening ratio where
+# 0.0 = fully closed and 1.0 ~= 100 mm open. Deploy defaults to that corrected
+# convention, while `--old_gripper` keeps compatibility with the historical
+# 70_000-scale raw values below.
 LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE = 70_000.0
 
 DEFAULT_ARM_STEP_LENGTH: tuple[float, ...] = (

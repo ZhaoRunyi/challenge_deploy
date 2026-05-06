@@ -9,7 +9,12 @@ from openpi.policies import slai_piper_policy
 from openpi.training import config as openpi_config
 from openpi_client import websocket_client_policy
 
-from .constants import KAI0_GRIPPER_UNIT_SCALE, LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE
+from .conversions import (
+    legacy_piper_raw_gripper_to_opening,
+    normalized_gripper_to_opening,
+    opening_to_legacy_piper_raw_gripper,
+    opening_to_normalized_gripper,
+)
 from .schemas import PiperArmState, RobotSnapshot
 
 try:
@@ -128,28 +133,30 @@ def rotation_to_rpy(values: np.ndarray, rotation_format: str) -> np.ndarray:
     return rotation_cls.from_matrix(matrix).as_euler("xyz", degrees=False)
 
 
-def _hardware_gripper_to_legacy_raw(value: float) -> float:
-    return float(value) * (KAI0_GRIPPER_UNIT_SCALE / LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE)
+def _hardware_gripper_to_model_raw(value: float, *, old_gripper: bool) -> float:
+    if old_gripper:
+        return opening_to_legacy_piper_raw_gripper(value)
+    return opening_to_normalized_gripper(value)
 
 
-def _legacy_raw_gripper_to_hardware(value: float) -> float:
-    return max(0.0, float(value) * (LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE / KAI0_GRIPPER_UNIT_SCALE))
+def _model_raw_gripper_to_hardware(value: float, *, old_gripper: bool) -> float:
+    if old_gripper:
+        return legacy_piper_raw_gripper_to_opening(value)
+    return normalized_gripper_to_opening(value)
 
 
-def _state_gripper_for_openpi(value: float, gripper_cfg: Any) -> float:
+def _state_gripper_for_openpi(value: float, gripper_cfg: Any, *, old_gripper: bool) -> float:
     value = float(value)
     if gripper_cfg is not None and gripper_cfg.type == "01":
         return value / gripper_cfg.full_width if gripper_cfg.full_width > 0 else value
-    # "raw" Piper datasets in this workspace use the historical 70k gripper
-    # convention from PiperController, not the later deploy-side 1e6 scale.
-    return _hardware_gripper_to_legacy_raw(value)
+    return _hardware_gripper_to_model_raw(value, old_gripper=old_gripper)
 
 
-def _action_gripper_for_piper(value: float, gripper_cfg: Any) -> float:
+def _action_gripper_for_piper(value: float, gripper_cfg: Any, *, old_gripper: bool) -> float:
     value = float(value)
     if gripper_cfg is not None and gripper_cfg.type == "01":
         return gripper_cfg.full_width if value >= 0.5 else 0.0
-    return _legacy_raw_gripper_to_hardware(value)
+    return _model_raw_gripper_to_hardware(value, old_gripper=old_gripper)
 
 
 def _thresholded_gripper_for_piper(value: float, threshold: float | None) -> float:
@@ -159,11 +166,17 @@ def _thresholded_gripper_for_piper(value: float, threshold: float | None) -> flo
     return value if value >= threshold else 0.0
 
 
-def _arm_full_state(arm: PiperArmState, *, ee_rotation: str, gripper_cfg: Any) -> np.ndarray:
+def _arm_full_state(
+    arm: PiperArmState,
+    *,
+    ee_rotation: str,
+    gripper_cfg: Any,
+    old_gripper: bool,
+) -> np.ndarray:
     return np.concatenate(
         (
             arm.qpos[:6],
-            np.array([_state_gripper_for_openpi(arm.qpos[6], gripper_cfg)], dtype=np.float64),
+            np.array([_state_gripper_for_openpi(arm.qpos[6], gripper_cfg, old_gripper=old_gripper)], dtype=np.float64),
             arm.end_pose[:3],
             rpy_to_rotation(arm.end_pose[3:6], ee_rotation),
         ),
@@ -171,7 +184,12 @@ def _arm_full_state(arm: PiperArmState, *, ee_rotation: str, gripper_cfg: Any) -
     ).astype(np.float64)
 
 
-def build_full_piper_state(snapshot: RobotSnapshot, spec: PiperPolicySpec) -> np.ndarray:
+def build_full_piper_state(
+    snapshot: RobotSnapshot,
+    spec: PiperPolicySpec,
+    *,
+    old_gripper: bool = False,
+) -> np.ndarray:
     """Build the full all-fields/all-arms vector expected before SLAIPiperInputs.
 
     SLAIPiperInputs owns the final configured state extraction. The client sends
@@ -184,19 +202,26 @@ def build_full_piper_state(snapshot: RobotSnapshot, spec: PiperPolicySpec) -> np
                 snapshot.state.left,
                 ee_rotation=spec.state_space.ee_rotation,
                 gripper_cfg=spec.state_space.gripper,
+                old_gripper=old_gripper,
             ),
             _arm_full_state(
                 snapshot.state.right,
                 ee_rotation=spec.state_space.ee_rotation,
                 gripper_cfg=spec.state_space.gripper,
+                old_gripper=old_gripper,
             ),
         ),
         axis=0,
     )
 
 
-def build_configured_piper_state(snapshot: RobotSnapshot, spec: PiperPolicySpec) -> np.ndarray:
-    full_state = build_full_piper_state(snapshot, spec)
+def build_configured_piper_state(
+    snapshot: RobotSnapshot,
+    spec: PiperPolicySpec,
+    *,
+    old_gripper: bool = False,
+) -> np.ndarray:
+    full_state = build_full_piper_state(snapshot, spec, old_gripper=old_gripper)
     state_space = slai_piper_policy._space_from_state_config(spec.state_space)
     return np.asarray(
         slai_piper_policy._extract_vec(full_state, state_space, spec.state_space.gripper),
@@ -218,9 +243,10 @@ def build_policy_payload(
     *,
     prompt: str,
     spec: PiperPolicySpec,
+    old_gripper: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "observation.state": build_full_piper_state(snapshot, spec),
+        "observation.state": build_full_piper_state(snapshot, spec, old_gripper=old_gripper),
         "prompt": prompt,
     }
     for image_id, dataset_key in spec.image_key_map.items():
@@ -258,12 +284,14 @@ class OpenPiPiperClient:
         joint_speed_percent: int = 50,
         ee_speed_percent: int = 50,
         gripper_threshold: float | None = None,
+        old_gripper: bool = False,
     ) -> None:
         self.spec = load_piper_policy_spec(train_config_name)
         self.control_mode = control_mode
         self.joint_speed_percent = joint_speed_percent
         self.ee_speed_percent = ee_speed_percent
         self.gripper_threshold = gripper_threshold
+        self.old_gripper = old_gripper
         if self.gripper_threshold is not None and self.gripper_threshold < 0.0:
             raise ValueError("gripper_threshold must be non-negative")
         self._validate_control_mode()
@@ -297,7 +325,7 @@ class OpenPiPiperClient:
         return self._client.get_server_metadata()
 
     def build_payload(self, snapshot: RobotSnapshot, prompt: str) -> dict[str, Any]:
-        return build_policy_payload(snapshot, prompt=prompt, spec=self.spec)
+        return build_policy_payload(snapshot, prompt=prompt, spec=self.spec, old_gripper=self.old_gripper)
 
     def infer(self, snapshot: RobotSnapshot, prompt: str) -> dict[str, Any]:
         return self._client.infer(self.build_payload(snapshot, prompt))
@@ -324,6 +352,7 @@ class OpenPiPiperClient:
                 _action_gripper_for_piper(
                     float(action[slices[f"{arm}_gripper"]][0]),
                     self.spec.action_space.gripper,
+                    old_gripper=self.old_gripper,
                 ),
                 self.gripper_threshold,
             )

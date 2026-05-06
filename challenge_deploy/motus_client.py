@@ -12,7 +12,13 @@ import cv2
 import numpy as np
 import yaml
 
-from .constants import KAI0_GRIPPER_UNIT_SCALE, LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE
+from .constants import PIPER_GRIPPER_FULL_OPEN_METERS
+from .conversions import (
+    legacy_piper_raw_gripper_to_opening,
+    normalized_gripper_to_opening,
+    opening_to_legacy_piper_raw_gripper,
+    opening_to_normalized_gripper,
+)
 from .schemas import PiperArmState, RobotSnapshot
 
 try:
@@ -39,6 +45,8 @@ class MotusPolicySpec:
     video_action_freq_ratio: int
     video_size: tuple[int, int]
     embodiment_type: str
+    normalization_stats_name: str
+    normalization_embodiment_types: tuple[str, ...]
     repo_id: str | None
     image_ids: tuple[str, ...]
     image_key_map: dict[str, str]
@@ -103,9 +111,19 @@ def _motus_websocket_client_policy_module() -> Any:
     )
 
 
-def load_motus_normalization_stats(embodiment_type: str) -> tuple[np.ndarray, np.ndarray]:
+@lru_cache(maxsize=1)
+def _motus_stats_payload() -> dict[str, Any]:
     with open(_motus_stats_path(), "r", encoding="utf-8") as file_obj:
         payload = json.load(file_obj)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected dict payload in {_motus_stats_path()}, got {type(payload).__name__}")
+    return payload
+
+
+def _load_single_motus_normalization_stats(
+    payload: dict[str, Any],
+    embodiment_type: str,
+) -> tuple[np.ndarray, np.ndarray]:
     if embodiment_type not in payload:
         raise KeyError(f"Normalization stats for {embodiment_type!r} not found in {_motus_stats_path()}")
     stats = payload[embodiment_type]
@@ -113,6 +131,36 @@ def load_motus_normalization_stats(embodiment_type: str) -> tuple[np.ndarray, np
         np.asarray(stats["min"], dtype=np.float32),
         np.asarray(stats["max"], dtype=np.float32),
     )
+
+
+def load_motus_normalization_stats(
+    embodiment_type: str,
+    embodiment_types: list[str] | tuple[str, ...] | None = None,
+) -> tuple[np.ndarray, np.ndarray, str, tuple[str, ...]]:
+    payload = _motus_stats_payload()
+    if not embodiment_types:
+        action_min, action_max = _load_single_motus_normalization_stats(payload, embodiment_type)
+        return action_min, action_max, embodiment_type, (embodiment_type,)
+
+    resolved_types = tuple(str(name) for name in embodiment_types)
+    mins: list[np.ndarray] = []
+    maxs: list[np.ndarray] = []
+    expected_shape: tuple[int, ...] | None = None
+    for name in resolved_types:
+        action_min, action_max = _load_single_motus_normalization_stats(payload, name)
+        if expected_shape is None:
+            expected_shape = action_min.shape
+        if action_min.shape != expected_shape or action_max.shape != expected_shape:
+            raise ValueError(
+                f"Inconsistent normalization dims for {name!r}: "
+                f"min={action_min.shape}, max={action_max.shape}, expected {expected_shape}"
+            )
+        mins.append(action_min)
+        maxs.append(action_max)
+
+    merged_min = np.minimum.reduce(mins).astype(np.float32)
+    merged_max = np.maximum.reduce(maxs).astype(np.float32)
+    return merged_min, merged_max, f"merged[{len(resolved_types)}]", resolved_types
 
 
 def _resolve_gripper_config(
@@ -184,10 +232,22 @@ def load_motus_policy_spec(config_path: str | Path) -> MotusPolicySpec:
         raise ValueError(f"{config_file}: common.state_dim={model_state_dim}, state_space dim={state_dim}")
 
     embodiment_type = str(params["embodiment_type"])
-    action_min, action_max = load_motus_normalization_stats(embodiment_type)
+    raw_embodiment_types = params.get("embodiment_types")
+    if raw_embodiment_types is None:
+        embodiment_types = None
+    elif isinstance(raw_embodiment_types, str):
+        embodiment_types = [raw_embodiment_types]
+    else:
+        embodiment_types = [str(name) for name in raw_embodiment_types]
+    action_min, action_max, normalization_stats_name, normalization_embodiment_types = (
+        load_motus_normalization_stats(embodiment_type, embodiment_types)
+    )
     if action_min.shape[0] != action_dim or action_max.shape[0] != action_dim:
+        stats_context = normalization_stats_name
+        if normalization_embodiment_types != (embodiment_type,):
+            stats_context = f"{normalization_stats_name} from {list(normalization_embodiment_types)}"
         raise ValueError(
-            f"{config_file}: normalization stats for {embodiment_type!r} have dim "
+            f"{config_file}: normalization stats {stats_context!r} have dim "
             f"{action_min.shape[0]}, expected {action_dim}"
         )
 
@@ -205,6 +265,8 @@ def load_motus_policy_spec(config_path: str | Path) -> MotusPolicySpec:
         video_action_freq_ratio=int(common["video_action_freq_ratio"]),
         video_size=(int(common["video_height"]), int(common["video_width"])),
         embodiment_type=embodiment_type,
+        normalization_stats_name=normalization_stats_name,
+        normalization_embodiment_types=normalization_embodiment_types,
         repo_id=params.get("repo_id"),
         image_ids=tuple(slai_policy.get_image_ids(image_space)),
         image_key_map=slai_policy.get_image_key_map(image_space),
@@ -271,42 +333,69 @@ def rotation_to_rpy(values: np.ndarray, rotation_format: str) -> np.ndarray:
     return rotation_cls.from_matrix(matrix).as_euler("xyz", degrees=False)
 
 
-def _hardware_gripper_to_legacy_raw(value: float) -> float:
-    return float(value) * (KAI0_GRIPPER_UNIT_SCALE / LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE)
+def _hardware_gripper_to_model_raw(value: float, *, old_gripper: bool) -> float:
+    if old_gripper:
+        return opening_to_legacy_piper_raw_gripper(value)
+    return opening_to_normalized_gripper(value)
 
 
-def _legacy_raw_gripper_to_hardware(value: float) -> float:
-    return max(0.0, float(value) * (LEGACY_PIPER_DATA_GRIPPER_UNIT_SCALE / KAI0_GRIPPER_UNIT_SCALE))
+def _model_raw_gripper_to_hardware(value: float, *, old_gripper: bool) -> float:
+    if old_gripper:
+        return legacy_piper_raw_gripper_to_opening(value)
+    return normalized_gripper_to_opening(value)
 
 
-def _state_gripper_for_motus(value: float, gripper_cfg: Any) -> float:
+def _state_gripper_for_motus(value: float, gripper_cfg: Any, *, old_gripper: bool) -> float:
     value = float(value)
     if gripper_cfg is not None and gripper_cfg.type == "01":
         return value / gripper_cfg.full_width if gripper_cfg.full_width > 0 else value
-    return _hardware_gripper_to_legacy_raw(value)
+    return _hardware_gripper_to_model_raw(value, old_gripper=old_gripper)
 
 
-def _action_gripper_for_piper(value: float, gripper_cfg: Any) -> float:
+def _action_gripper_for_piper(value: float, gripper_cfg: Any, *, old_gripper: bool) -> float:
     value = float(value)
     if gripper_cfg is not None and gripper_cfg.type == "01":
         return gripper_cfg.full_width if value >= 0.5 else 0.0
-    return _legacy_raw_gripper_to_hardware(value)
+    return _model_raw_gripper_to_hardware(value, old_gripper=old_gripper)
 
 
-def _thresholded_gripper_for_piper(value: float, threshold: float | None, gripper_cfg: Any | None = None) -> float:
+def _thresholded_gripper_for_piper(
+    value: float,
+    threshold: float | None,
+    gripper_cfg: Any | None = None,
+    *,
+    old_gripper: bool,
+) -> float:
     value = max(0.0, float(value))
     if threshold is None:
-        return _action_gripper_for_piper(value, gripper_cfg)
-    threshold_value = (threshold / gripper_cfg.full_width) if gripper_cfg is not None and gripper_cfg.type == "01" else _hardware_gripper_to_legacy_raw(threshold)
-    full_open_value = 1.0 if gripper_cfg is not None and gripper_cfg.type == "01" else _hardware_gripper_to_legacy_raw(0.10)
-    return _action_gripper_for_piper(full_open_value if value >= threshold_value else 0.0, gripper_cfg)
+        return _action_gripper_for_piper(value, gripper_cfg, old_gripper=old_gripper)
+    if gripper_cfg is not None and gripper_cfg.type == "01":
+        threshold_value = threshold / gripper_cfg.full_width
+        full_open_value = 1.0
+    else:
+        threshold_value = _hardware_gripper_to_model_raw(threshold, old_gripper=old_gripper)
+        full_open_value = _hardware_gripper_to_model_raw(
+            PIPER_GRIPPER_FULL_OPEN_METERS,
+            old_gripper=old_gripper,
+        )
+    return _action_gripper_for_piper(
+        full_open_value if value >= threshold_value else 0.0,
+        gripper_cfg,
+        old_gripper=old_gripper,
+    )
 
 
-def _arm_full_state(arm: PiperArmState, *, ee_rotation: str, gripper_cfg: Any) -> np.ndarray:
+def _arm_full_state(
+    arm: PiperArmState,
+    *,
+    ee_rotation: str,
+    gripper_cfg: Any,
+    old_gripper: bool,
+) -> np.ndarray:
     return np.concatenate(
         (
             arm.qpos[:6],
-            np.array([_state_gripper_for_motus(arm.qpos[6], gripper_cfg)], dtype=np.float64),
+            np.array([_state_gripper_for_motus(arm.qpos[6], gripper_cfg, old_gripper=old_gripper)], dtype=np.float64),
             arm.end_pose[:3],
             rpy_to_rotation(arm.end_pose[3:6], ee_rotation),
         ),
@@ -314,27 +403,39 @@ def _arm_full_state(arm: PiperArmState, *, ee_rotation: str, gripper_cfg: Any) -
     ).astype(np.float64)
 
 
-def build_full_piper_state(snapshot: RobotSnapshot, spec: MotusPolicySpec) -> np.ndarray:
+def build_full_piper_state(
+    snapshot: RobotSnapshot,
+    spec: MotusPolicySpec,
+    *,
+    old_gripper: bool = False,
+) -> np.ndarray:
     return np.concatenate(
         (
             _arm_full_state(
                 snapshot.state.left,
                 ee_rotation=spec.state_space.ee_rotation,
                 gripper_cfg=spec.state_space.gripper,
+                old_gripper=old_gripper,
             ),
             _arm_full_state(
                 snapshot.state.right,
                 ee_rotation=spec.state_space.ee_rotation,
                 gripper_cfg=spec.state_space.gripper,
+                old_gripper=old_gripper,
             ),
         ),
         axis=0,
     )
 
 
-def build_configured_piper_state(snapshot: RobotSnapshot, spec: MotusPolicySpec) -> np.ndarray:
+def build_configured_piper_state(
+    snapshot: RobotSnapshot,
+    spec: MotusPolicySpec,
+    *,
+    old_gripper: bool = False,
+) -> np.ndarray:
     slai_policy = _motus_slai_policy()
-    full_state = build_full_piper_state(snapshot, spec)
+    full_state = build_full_piper_state(snapshot, spec, old_gripper=old_gripper)
     state_space = slai_policy._space_from_state_config(spec.state_space)
     return np.asarray(
         slai_policy._extract_vec(full_state, state_space, spec.state_space.gripper),
@@ -342,8 +443,13 @@ def build_configured_piper_state(snapshot: RobotSnapshot, spec: MotusPolicySpec)
     )
 
 
-def build_normalized_policy_state(snapshot: RobotSnapshot, spec: MotusPolicySpec) -> np.ndarray:
-    configured = build_configured_piper_state(snapshot, spec)
+def build_normalized_policy_state(
+    snapshot: RobotSnapshot,
+    spec: MotusPolicySpec,
+    *,
+    old_gripper: bool = False,
+) -> np.ndarray:
+    configured = build_configured_piper_state(snapshot, spec, old_gripper=old_gripper)
     return _normalize_actions(configured, spec.action_min, spec.action_max).astype(np.float32)
 
 
@@ -428,10 +534,11 @@ def build_policy_payload(
     spec: MotusPolicySpec,
     session_id: str | None = None,
     t5_embeds: np.ndarray | None = None,
+    old_gripper: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "image": build_policy_frame(snapshot, spec),
-        "state": build_normalized_policy_state(snapshot, spec),
+        "state": build_normalized_policy_state(snapshot, spec, old_gripper=old_gripper),
     }
     if prompt is not None:
         payload["prompt"] = prompt
@@ -464,12 +571,14 @@ class MotusPiperClient:
         joint_speed_percent: int = 50,
         ee_speed_percent: int = 50,
         gripper_threshold: float | None = None,
+        old_gripper: bool = False,
     ) -> None:
         self.spec = load_motus_policy_spec(config_path)
         self.control_mode = control_mode
         self.joint_speed_percent = joint_speed_percent
         self.ee_speed_percent = ee_speed_percent
         self.gripper_threshold = gripper_threshold
+        self.old_gripper = old_gripper
         self._default_session_id: str | None = None
         if self.gripper_threshold is not None and self.gripper_threshold < 0.0:
             raise ValueError("gripper_threshold must be non-negative")
@@ -535,6 +644,7 @@ class MotusPiperClient:
             spec=self.spec,
             session_id=session_id,
             t5_embeds=t5_embeds,
+            old_gripper=self.old_gripper,
         )
 
     def infer(
@@ -608,6 +718,7 @@ class MotusPiperClient:
                 float(action[slices[f"{arm}_gripper"]][0]),
                 self.gripper_threshold,
                 self.spec.action_space.gripper,
+                old_gripper=self.old_gripper,
             )
             joint = None
             ee_pose = None
@@ -662,6 +773,8 @@ def spec_summary(spec: MotusPolicySpec) -> dict[str, Any]:
         "config_path": spec.config_path,
         "repo_id": spec.repo_id,
         "embodiment_type": spec.embodiment_type,
+        "normalization_stats_name": spec.normalization_stats_name,
+        "normalization_embodiment_types": list(spec.normalization_embodiment_types),
         "state_dim": spec.state_dim,
         "action_dim": spec.action_dim,
         "model_action_dim": spec.model_action_dim,
