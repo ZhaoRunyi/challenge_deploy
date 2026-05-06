@@ -174,7 +174,9 @@ def _resolve_gripper_config(
         return None
     gripper_type = params.get(f"{prefix}_gripper_type", params.get("gripper_type", "raw"))
     threshold = float(params.get(f"{prefix}_gripper_threshold", params.get("gripper_threshold", 0.01)))
-    full_width = float(params.get(f"{prefix}_gripper_full_width", params.get("gripper_full_width", 0.05)))
+    full_width = float(
+        params.get(f"{prefix}_gripper_full_width", params.get("gripper_full_width", PIPER_GRIPPER_FULL_OPEN_METERS))
+    )
     return slai_policy.GripperConfig(type=gripper_type, threshold=threshold, full_width=full_width)
 
 
@@ -562,6 +564,8 @@ class MotusPiperClient:
         joint_speed_percent: int = 50,
         ee_speed_percent: int = 50,
         gripper_threshold: float | None = None,
+        gripper_lower: float | None = None,
+        gripper_upper: float | None = None,
         old_gripper: bool = False,
     ) -> None:
         self.spec = load_motus_policy_spec(config_path)
@@ -569,8 +573,16 @@ class MotusPiperClient:
         self.joint_speed_percent = joint_speed_percent
         self.ee_speed_percent = ee_speed_percent
         self.gripper_threshold = gripper_threshold
+        self.gripper_lower = gripper_lower
+        self.gripper_upper = gripper_upper
         self.old_gripper = old_gripper
         self._default_session_id: str | None = None
+        if self.gripper_threshold is not None and self.gripper_threshold < 0.0:
+            raise ValueError("gripper_threshold must be non-negative")
+        if self.gripper_lower is not None and self.gripper_lower < 0.0:
+            raise ValueError("gripper_lower must be non-negative")
+        if self.gripper_upper is not None and self.gripper_upper < 0.0:
+            raise ValueError("gripper_upper must be non-negative")
         self._validate_control_mode()
         self._client = _motus_websocket_client_policy_module().WebsocketClientPolicy(host, port, api_key=api_key)
         self._validate_server_metadata()
