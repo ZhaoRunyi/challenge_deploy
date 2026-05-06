@@ -159,11 +159,13 @@ def _action_gripper_for_piper(value: float, gripper_cfg: Any, *, old_gripper: bo
     return _model_raw_gripper_to_hardware(value, old_gripper=old_gripper)
 
 
-def _thresholded_gripper_for_piper(value: float, threshold: float | None) -> float:
-    value = float(value)
-    if threshold is None:
-        return value
-    return value if value >= threshold else 0.0
+def _bounded_gripper_for_piper(value: float, threshold: float | None, lower: float | None = None, upper: float | None = None) -> float:
+    value = max(0.0, float(value))
+    if threshold is not None:
+        return value if value >= threshold else 0.0
+    if upper is not None and value > upper:
+        return 0.1
+    return 0.0 if lower is not None and value < lower else value
 
 
 def _arm_full_state(
@@ -292,8 +294,6 @@ class OpenPiPiperClient:
         self.ee_speed_percent = ee_speed_percent
         self.gripper_threshold = gripper_threshold
         self.old_gripper = old_gripper
-        if self.gripper_threshold is not None and self.gripper_threshold < 0.0:
-            raise ValueError("gripper_threshold must be non-negative")
         self._validate_control_mode()
         self._client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
 
@@ -348,13 +348,15 @@ class OpenPiPiperClient:
         fields = set(slai_piper_policy._fields_from_action_config(self.spec.action_space))
         decoded: dict[str, DecodedArmAction] = {}
         for arm in action_space["arms"]:
-            gripper = _thresholded_gripper_for_piper(
+            gripper = _bounded_gripper_for_piper(
                 _action_gripper_for_piper(
                     float(action[slices[f"{arm}_gripper"]][0]),
                     self.spec.action_space.gripper,
                     old_gripper=self.old_gripper,
                 ),
                 self.gripper_threshold,
+                getattr(self, "gripper_lower", None),
+                getattr(self, "gripper_upper", None),
             )
             joint = None
             ee_pose = None

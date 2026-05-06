@@ -145,6 +145,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional executable-scale gripper threshold in meters. Values below threshold close the gripper, and values above threshold command full open.",
     )
+    parser.add_argument("--gripper_lower", type=float, default=None)
+    parser.add_argument("--gripper_upper", type=float, default=None)
     parser.add_argument(
         "--old_gripper",
         action="store_true",
@@ -317,6 +319,8 @@ def run_once(args: argparse.Namespace) -> None:
         raise ValueError("--fps must be non-negative")
     if args.gripper_threshold is not None and args.gripper_threshold < 0.0:
         raise ValueError("--gripper_threshold must be non-negative")
+    if args.gripper_threshold is not None and (args.gripper_lower is not None or args.gripper_upper is not None):
+        raise ValueError("--gripper_threshold cannot be combined with --gripper_lower/--gripper_upper")
     if args.inference_rate is not None and args.inference_rate < 0.0:
         raise ValueError("--inference-rate must be non-negative")
     client = MotusPiperClient(
@@ -328,6 +332,8 @@ def run_once(args: argparse.Namespace) -> None:
         joint_speed_percent=args.joint_speed_percent,
         ee_speed_percent=args.ee_speed_percent,
         gripper_threshold=args.gripper_threshold,
+        gripper_lower=args.gripper_lower,
+        gripper_upper=args.gripper_upper,
         old_gripper=args.old_gripper,
     )
     state_builder = lambda snapshot, policy_spec: build_configured_piper_state(
@@ -445,6 +451,8 @@ def run_once(args: argparse.Namespace) -> None:
                         "joint_speed_percent": args.joint_speed_percent,
                         "ee_speed_percent": args.ee_speed_percent,
                         "gripper_threshold": args.gripper_threshold,
+                        "gripper_lower": args.gripper_lower,
+                        "gripper_upper": args.gripper_upper,
                         "old_gripper": args.old_gripper,
                     }
                 },

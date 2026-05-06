@@ -166,6 +166,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional executable-scale gripper threshold. Final gripper values below this are clipped to 0.",
     )
+    parser.add_argument("--gripper_lower", type=float, default=None)
+    parser.add_argument("--gripper_upper", type=float, default=None)
     parser.add_argument(
         "--old_gripper",
         action="store_true",
@@ -448,6 +450,8 @@ def run_once(args: argparse.Namespace) -> None:
         raise ValueError("--fps must be non-negative")
     if args.gripper_threshold is not None and args.gripper_threshold < 0.0:
         raise ValueError("--gripper_threshold must be non-negative")
+    if args.gripper_threshold is not None and (args.gripper_lower is not None or args.gripper_upper is not None):
+        raise ValueError("--gripper_threshold cannot be combined with --gripper_lower/--gripper_upper")
     if args.inference_rate is not None and args.inference_rate < 0.0:
         raise ValueError("--inference-rate must be non-negative")
     if args.execution_mode != "chunk_sync":
@@ -488,6 +492,7 @@ def run_once(args: argparse.Namespace) -> None:
         gripper_threshold=args.gripper_threshold,
         old_gripper=args.old_gripper,
     )
+    client.gripper_lower, client.gripper_upper = args.gripper_lower, args.gripper_upper
 
     runtime_config = _apply_runtime_overrides(load_config(args.config), args)
     robot, cameras, source = _make_runtime(runtime_config, commands_enabled=not args.dry_run)

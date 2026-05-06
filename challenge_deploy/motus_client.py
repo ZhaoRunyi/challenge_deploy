@@ -362,27 +362,18 @@ def _action_gripper_for_piper(value: float, gripper_cfg: Any, *, old_gripper: bo
 def _thresholded_gripper_for_piper(
     value: float,
     threshold: float | None,
-    gripper_cfg: Any | None = None,
+    gripper_cfg: Any | None,
+    lower: float | None = None,
+    upper: float | None = None,
     *,
     old_gripper: bool,
 ) -> float:
-    value = max(0.0, float(value))
-    if threshold is None:
-        return _action_gripper_for_piper(value, gripper_cfg, old_gripper=old_gripper)
-    if gripper_cfg is not None and gripper_cfg.type == "01":
-        threshold_value = threshold / gripper_cfg.full_width
-        full_open_value = 1.0
-    else:
-        threshold_value = _hardware_gripper_to_model_raw(threshold, old_gripper=old_gripper)
-        full_open_value = _hardware_gripper_to_model_raw(
-            PIPER_GRIPPER_FULL_OPEN_METERS,
-            old_gripper=old_gripper,
-        )
-    return _action_gripper_for_piper(
-        full_open_value if value >= threshold_value else 0.0,
-        gripper_cfg,
-        old_gripper=old_gripper,
-    )
+    value = _action_gripper_for_piper(value, gripper_cfg, old_gripper=old_gripper)
+    if threshold is not None:
+        return value if value >= threshold else 0.0
+    if upper is not None and value > upper:
+        return PIPER_GRIPPER_FULL_OPEN_METERS
+    return 0.0 if lower is not None and value < lower else value
 
 
 def _arm_full_state(
@@ -580,8 +571,6 @@ class MotusPiperClient:
         self.gripper_threshold = gripper_threshold
         self.old_gripper = old_gripper
         self._default_session_id: str | None = None
-        if self.gripper_threshold is not None and self.gripper_threshold < 0.0:
-            raise ValueError("gripper_threshold must be non-negative")
         self._validate_control_mode()
         self._client = _motus_websocket_client_policy_module().WebsocketClientPolicy(host, port, api_key=api_key)
         self._validate_server_metadata()
@@ -718,6 +707,8 @@ class MotusPiperClient:
                 float(action[slices[f"{arm}_gripper"]][0]),
                 self.gripper_threshold,
                 self.spec.action_space.gripper,
+                getattr(self, "gripper_lower", None),
+                getattr(self, "gripper_upper", None),
                 old_gripper=self.old_gripper,
             )
             joint = None

@@ -81,11 +81,13 @@ def _action_gripper_for_piper(value: float, gripper_cfg: Any, *, old_gripper: bo
     return _model_raw_gripper_to_hardware(value, old_gripper=old_gripper)
 
 
-def _thresholded_gripper_for_piper(value: float, threshold: float | None) -> float:
-    value = float(value)
-    if threshold is None:
-        return value
-    return value if value >= threshold else 0.0
+def _bounded_gripper_for_piper(value: float, threshold: float | None, lower: float | None = None, upper: float | None = None) -> float:
+    value = max(0.0, float(value))
+    if threshold is not None:
+        return value if value >= threshold else 0.0
+    if upper is not None and value > upper:
+        return PIPER_GRIPPER_FULL_OPEN_METERS
+    return 0.0 if lower is not None and value < lower else value
 
 
 @dataclass(frozen=True)
@@ -129,16 +131,20 @@ def _sim_gripper_to_model_raw(value: float, *, old_gripper: bool) -> float:
 def sim_gripper_to_piper(
     value: float,
     threshold: float | None = None,
+    lower: float | None = None,
+    upper: float | None = None,
     *,
     old_gripper: bool = False,
 ) -> float:
-    return _thresholded_gripper_for_piper(
+    return _bounded_gripper_for_piper(
         _action_gripper_for_piper(
             _sim_gripper_to_model_raw(value, old_gripper=old_gripper),
             None,
             old_gripper=old_gripper,
         ),
         threshold,
+        lower,
+        upper,
     )
 
 
@@ -240,8 +246,6 @@ class OpenPiSimPiperClient:
     ) -> None:
         if control_mode != "joints":
             raise ValueError("openpi_sim only exposes joint+gripper actions; use control_mode='joints'")
-        if gripper_threshold is not None and gripper_threshold < 0.0:
-            raise ValueError("gripper_threshold must be non-negative")
         self.spec = load_openpi_sim_policy_spec(train_config_name)
         self.control_mode = control_mode
         self.joint_speed_percent = joint_speed_percent
@@ -275,11 +279,15 @@ class OpenPiSimPiperClient:
         left_gripper = sim_gripper_to_piper(
             float(action[6]),
             self.gripper_threshold,
+            getattr(self, "gripper_lower", None),
+            getattr(self, "gripper_upper", None),
             old_gripper=self.old_gripper,
         )
         right_gripper = sim_gripper_to_piper(
             float(action[13]),
             self.gripper_threshold,
+            getattr(self, "gripper_lower", None),
+            getattr(self, "gripper_upper", None),
             old_gripper=self.old_gripper,
         )
         return DecodedSimPiperAction(
