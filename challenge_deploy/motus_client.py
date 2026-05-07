@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import importlib.util
 import json
@@ -53,6 +53,7 @@ class MotusPolicySpec:
     model_image_key_map: dict[str, str]
     action_min: np.ndarray
     action_max: np.ndarray
+    per_task_gripper_thresholds: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,12 @@ def _resolve_rotation(params: dict[str, Any], key: str) -> str:
     return str(params.get(key, "rot6d"))
 
 
+def _space_with_gripper_threshold(space: Any, threshold: float) -> Any:
+    if getattr(space, "gripper", None) is None or space.gripper.type != "01":
+        return space
+    return replace(space, gripper=replace(space.gripper, threshold=threshold))
+
+
 def load_motus_policy_spec(config_path: str | Path) -> MotusPolicySpec:
     config_file = Path(config_path).expanduser().resolve()
     with open(config_file, "r", encoding="utf-8") as file_obj:
@@ -252,6 +259,19 @@ def load_motus_policy_spec(config_path: str | Path) -> MotusPolicySpec:
             f"{config_file}: normalization stats {stats_context!r} have dim "
             f"{action_min.shape[0]}, expected {action_dim}"
         )
+    gripper_stats = _motus_stats_payload().get(embodiment_type, {})
+    if "gripper_threshold" not in params and gripper_stats.get("gripper_threshold") is not None:
+        state_space = _space_with_gripper_threshold(state_space, float(gripper_stats["gripper_threshold"]))
+        action_space = _space_with_gripper_threshold(action_space, float(gripper_stats["gripper_threshold"]))
+    per_task_gripper_thresholds = {}
+    if params.get("per_task_gripper_01"):
+        grasp_values = gripper_stats.get("gripper_grasp_values", {})
+        for task_name, value in grasp_values.get("task", {}).items():
+            if value is None:
+                continue
+            threshold = float(value) * float(gripper_stats.get("gripper_full_width", PIPER_GRIPPER_FULL_OPEN_METERS))
+            per_task_gripper_thresholds[str(task_name)] = threshold
+            per_task_gripper_thresholds[str(grasp_values.get("prompt", {}).get(task_name, task_name))] = threshold
 
     return MotusPolicySpec(
         config_path=str(config_file),
@@ -275,6 +295,7 @@ def load_motus_policy_spec(config_path: str | Path) -> MotusPolicySpec:
         model_image_key_map=slai_policy.get_model_image_key_map(image_space),
         action_min=action_min,
         action_max=action_max,
+        per_task_gripper_thresholds=per_task_gripper_thresholds,
     )
 
 
@@ -436,12 +457,33 @@ def build_configured_piper_state(
     )
 
 
+def _resolve_per_task_gripper_threshold(spec: MotusPolicySpec, prompt: str | None) -> float | None:
+    if not prompt or not spec.per_task_gripper_thresholds:
+        return None
+    prompt = prompt.strip()
+    if not prompt:
+        return None
+    if prompt in spec.per_task_gripper_thresholds:
+        return spec.per_task_gripper_thresholds[prompt]
+    prompt_lower = prompt.lower()
+    for task_prompt, threshold in spec.per_task_gripper_thresholds.items():
+        task_prompt_lower = task_prompt.lower()
+        if task_prompt and (task_prompt_lower in prompt_lower or prompt_lower in task_prompt_lower):
+            return threshold
+    return None
+
+
 def build_normalized_policy_state(
     snapshot: RobotSnapshot,
     spec: MotusPolicySpec,
     *,
+    prompt: str | None = None,
     old_gripper: bool = False,
 ) -> np.ndarray:
+    threshold = _resolve_per_task_gripper_threshold(spec, prompt)
+    if threshold is not None and spec.state_space.gripper is not None:
+        gripper = replace(spec.state_space.gripper, threshold=threshold)
+        spec = replace(spec, state_space=replace(spec.state_space, gripper=gripper))
     configured = build_configured_piper_state(snapshot, spec, old_gripper=old_gripper)
     return _normalize_actions(configured, spec.action_min, spec.action_max).astype(np.float32)
 
@@ -531,7 +573,7 @@ def build_policy_payload(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "image": build_policy_frame(snapshot, spec),
-        "state": build_normalized_policy_state(snapshot, spec, old_gripper=old_gripper),
+        "state": build_normalized_policy_state(snapshot, spec, prompt=prompt, old_gripper=old_gripper),
     }
     if prompt is not None:
         payload["prompt"] = prompt
