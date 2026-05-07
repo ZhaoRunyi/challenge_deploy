@@ -162,7 +162,7 @@ def _action_gripper_for_piper(value: float, gripper_cfg: Any, *, old_gripper: bo
 def _bounded_gripper_for_piper(value: float, threshold: float | None, lower: float | None = None, upper: float | None = None) -> float:
     value = max(0.0, float(value))
     if threshold is not None:
-        return value if value >= threshold else 0.0
+        return 0.1 if value >= threshold else 0.0
     if upper is not None and value > upper:
         return 0.1
     return 0.0 if lower is not None and value < lower else value

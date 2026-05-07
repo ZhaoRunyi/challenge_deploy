@@ -158,6 +158,7 @@ def run_chunk_sync_rollout(
     chunk_size: int | None,
     fps: float,
     recorder: Any | None = None,
+    saved_actions: list[np.ndarray] | None = None,
     log_chunk: ChunkLogger | None = None,
     initial_snapshot: Any | None = None,
     state_builder: ConfiguredStateBuilder = default_build_configured_piper_state,
@@ -191,6 +192,8 @@ def run_chunk_sync_rollout(
                 frame_snapshot = chunk_snapshot if action_index == 0 else source.capture_snapshot()
                 command_start_s = time.monotonic()
                 client.command_action(robot, action)
+                if saved_actions is not None:
+                    saved_actions.append(np.asarray(action, dtype=np.float64).copy())
                 if recorder is not None:
                     recorder.record(
                         images=frame_snapshot.images,
@@ -227,6 +230,7 @@ def run_temporal_smoothing_rollout(
     min_smooth_steps: int,
     buffer_max_chunks: int,
     recorder: Any | None = None,
+    saved_actions: list[np.ndarray] | None = None,
     log_chunk: ChunkLogger | None = None,
     first_action_timeout_s: float = 15.0,
     initial_snapshot: Any | None = None,
@@ -308,6 +312,8 @@ def run_temporal_smoothing_rollout(
             frame_snapshot = capture_snapshot()
             command_start_s = time.monotonic()
             client.command_action(robot, action)
+            if saved_actions is not None:
+                saved_actions.append(np.asarray(action, dtype=np.float64).copy())
             if recorder is not None:
                 recorder.record(
                     images=frame_snapshot.images,

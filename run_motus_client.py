@@ -365,10 +365,12 @@ def run_once(args: argparse.Namespace) -> None:
 
     runtime_config = _apply_runtime_overrides(load_config(args.config), args)
     robot, cameras, source = _make_runtime(runtime_config, commands_enabled=not args.dry_run)
+    recording_schema = _make_recording_schema(spec, args.control_mode)
+    saved_actions: list[np.ndarray] | None = [] if args.record else None
     recorder = (
         OpenPiRolloutRecorder(
             output_dir=args.record_dir,
-            schema=_make_recording_schema(spec, args.control_mode),
+            schema=recording_schema,
             fps=args.fps,
             name_prefix=_record_name_prefix(args),
         )
@@ -404,6 +406,8 @@ def run_once(args: argparse.Namespace) -> None:
                     state=state_builder(snapshot, spec),
                     timestamp_s=snapshot.timestamp_s,
                 )
+            if saved_actions is not None:
+                saved_actions.append(actions[0].copy())
             print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2))
             return
 
@@ -486,6 +490,7 @@ def run_once(args: argparse.Namespace) -> None:
                 min_smooth_steps=min_smooth_steps,
                 buffer_max_chunks=buffer_max_chunks,
                 recorder=recorder,
+                saved_actions=saved_actions,
                 log_chunk=log_chunk,
                 initial_snapshot=first_obs_snapshot,
                 state_builder=state_builder,
@@ -501,6 +506,7 @@ def run_once(args: argparse.Namespace) -> None:
                 chunk_size=chunk_size,
                 fps=args.fps,
                 recorder=recorder,
+                saved_actions=saved_actions,
                 log_chunk=log_chunk,
                 initial_snapshot=first_obs_snapshot,
                 state_builder=state_builder,
@@ -530,6 +536,13 @@ def run_once(args: argparse.Namespace) -> None:
         except Exception as exc:
             print(f"Failed to disconnect robot cleanly: {exc}", flush=True)
         if recorder is not None:
+            try:
+                action_path = recorder.run_dir / f"{recorder.record_stem}_actions.npz"
+                action_trajectory = np.stack(saved_actions, axis=0) if saved_actions else np.empty((0, len(recording_schema.action_names)), dtype=np.float64)
+                np.savez_compressed(action_path, action_mean_trajectory=action_trajectory, action_names=np.asarray(recording_schema.action_names))
+                print(f"Actions saved to {action_path}", flush=True)
+            except Exception as exc:
+                print(f"Failed to save actions: {exc}", flush=True)
             output_path = None
             try:
                 output_path = recorder.finalize()

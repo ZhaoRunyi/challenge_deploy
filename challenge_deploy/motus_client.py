@@ -372,7 +372,7 @@ def _thresholded_gripper_for_piper(
 ) -> float:
     value = _action_gripper_for_piper(value, gripper_cfg, old_gripper=old_gripper)
     if threshold is not None:
-        return value if value >= threshold else 0.0
+        return PIPER_GRIPPER_FULL_OPEN_METERS if value >= threshold else 0.0
     if upper is not None and value > upper:
         return PIPER_GRIPPER_FULL_OPEN_METERS
     return 0.0 if lower is not None and value < lower else value

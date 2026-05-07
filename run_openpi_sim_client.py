@@ -355,6 +355,7 @@ def run_chunk_sync_rollout(
     chunk_size: int | None,
     fps: float,
     recorder: OpenPiRolloutRecorder | None = None,
+    saved_actions: list[np.ndarray] | None = None,
     initial_snapshot: Any | None = None,
     initial_grippers: np.ndarray | None = None,
     old_gripper: bool = False,
@@ -402,6 +403,8 @@ def run_chunk_sync_rollout(
                 decoded = client.decode_action(action)
                 command_start_s = time.monotonic()
                 client.command_action(robot, action)
+                if saved_actions is not None:
+                    saved_actions.append(np.asarray(action, dtype=np.float64).copy())
                 last_grippers = np.array(
                     [decoded.arms["left"].gripper, decoded.arms["right"].gripper],
                     dtype=np.float64,
@@ -496,10 +499,12 @@ def run_once(args: argparse.Namespace) -> None:
 
     runtime_config = _apply_runtime_overrides(load_config(args.config), args)
     robot, cameras, source = _make_runtime(runtime_config, commands_enabled=not args.dry_run)
+    recording_schema = _make_recording_schema(spec)
+    saved_actions: list[np.ndarray] | None = [] if args.record else None
     recorder = (
         OpenPiRolloutRecorder(
             output_dir=args.record_dir,
-            schema=_make_recording_schema(spec),
+            schema=recording_schema,
             fps=args.fps,
             name_prefix=_record_name_prefix(args),
         )
@@ -529,6 +534,8 @@ def run_once(args: argparse.Namespace) -> None:
                     state=build_configured_piper_state(snapshot, spec, old_gripper=args.old_gripper),
                     timestamp_s=snapshot.timestamp_s,
                 )
+            if saved_actions is not None:
+                saved_actions.append(actions[0].copy())
             print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2), flush=True)
             return
 
@@ -570,6 +577,7 @@ def run_once(args: argparse.Namespace) -> None:
             chunk_size=chunk_size,
             fps=args.fps,
             recorder=recorder,
+            saved_actions=saved_actions,
             initial_snapshot=first_obs_snapshot,
             initial_grippers=initial_joints[[6, 13]],
             old_gripper=args.old_gripper,
@@ -594,6 +602,13 @@ def run_once(args: argparse.Namespace) -> None:
         except Exception as exc:
             print(f"Failed to disconnect robot cleanly: {exc}", flush=True)
         if recorder is not None:
+            try:
+                action_path = recorder.run_dir / f"{recorder.record_stem}_actions.npz"
+                action_trajectory = np.stack(saved_actions, axis=0) if saved_actions else np.empty((0, len(recording_schema.action_names)), dtype=np.float64)
+                np.savez_compressed(action_path, action_mean_trajectory=action_trajectory, action_names=np.asarray(recording_schema.action_names))
+                print(f"Actions saved to {action_path}", flush=True)
+            except Exception as exc:
+                print(f"Failed to save actions: {exc}", flush=True)
             output_path = None
             try:
                 output_path = recorder.finalize()
