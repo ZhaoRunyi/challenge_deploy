@@ -197,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--latency-k", type=int, default=None, help="Max prefix actions to trim from a fresh chunk; default from config.")
     parser.add_argument("--min-smooth-steps", type=int, default=None, help="Minimum old-tail length for overlap smoothing; default from config.")
     parser.add_argument("--buffer-max-chunks", type=int, default=None, help="Action buffer chunk cap; default from config.")
+    parser.add_argument("--num-inference-timesteps", type=int, default=None, help="Override Motus denoising steps for server inference.")
     parser.add_argument("--metrics-json", default=None, help="Optional path to save rollout timing metrics as JSON.")
     parser.add_argument("--record", action="store_true", help="Record cameras, actions, and states into one deploy video.")
     parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "motus_records"))
@@ -353,6 +354,7 @@ def run_once(args: argparse.Namespace) -> None:
         gripper_threshold=args.gripper_threshold,
         gripper_lower=args.gripper_lower,
         gripper_upper=args.gripper_upper,
+        num_inference_timesteps=args.num_inference_timesteps,
         old_gripper=args.old_gripper,
     )
     client.left_gripper_threshold, client.right_gripper_threshold, client.left_gripper_lower, client.left_gripper_upper, client.right_gripper_lower, client.right_gripper_upper = args.left_gripper_threshold, args.right_gripper_threshold, args.left_gripper_lower, args.left_gripper_upper, args.right_gripper_lower, args.right_gripper_upper

@@ -573,6 +573,7 @@ def build_policy_payload(
     spec: MotusPolicySpec,
     session_id: str | None = None,
     t5_embeds: np.ndarray | None = None,
+    num_inference_timesteps: int | None = None,
     old_gripper: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -585,6 +586,8 @@ def build_policy_payload(
         payload["session_id"] = session_id
     if t5_embeds is not None:
         payload["t5_embeds"] = t5_embeds
+    if num_inference_timesteps is not None:
+        payload["num_inference_timesteps"] = num_inference_timesteps
     return payload
 
 
@@ -614,6 +617,7 @@ class MotusPiperClient:
         gripper_threshold: float | None = None,
         gripper_lower: float | None = None,
         gripper_upper: float | None = None,
+        num_inference_timesteps: int | None = None,
         old_gripper: bool = False,
     ) -> None:
         self.spec = load_motus_policy_spec(config_path)
@@ -625,6 +629,7 @@ class MotusPiperClient:
         self.gripper_threshold = gripper_threshold
         self.gripper_lower = gripper_lower
         self.gripper_upper = gripper_upper
+        self.num_inference_timesteps = num_inference_timesteps
         self.old_gripper = old_gripper
         self._default_session_id: str | None = None
         self._last_commanded: DecodedPiperAction | None = None
@@ -701,6 +706,7 @@ class MotusPiperClient:
             spec=self.spec,
             session_id=session_id,
             t5_embeds=t5_embeds,
+            num_inference_timesteps=self.num_inference_timesteps,
             old_gripper=self.old_gripper,
         )
 
