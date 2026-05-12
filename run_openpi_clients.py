@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import cv2
 import json
 from pathlib import Path
 import signal
@@ -27,7 +26,7 @@ from challenge_deploy.openpi_client import (
 )
 from challenge_deploy.piper import DualPiperSystem
 from challenge_deploy.realsense import RealSenseRig
-from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema, stack_vertical
+from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema, preview_until_continue, save_frame1_image
 from challenge_deploy.runtime import DualPiperObservationSource
 from challenge_deploy.openpi_rollout import (
     action_sequence,
@@ -138,6 +137,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional executable-scale gripper threshold. Final gripper values below this are clipped to 0.",
     )
+    for side in ("left", "right"):
+        parser.add_argument(f"--{side}_gripper_threshold", *([f"--{side}_gripper_thrshold"] if side == "left" else []), dest=f"{side}_gripper_threshold", type=float, default=None)
+        parser.add_argument(f"--{side}_gripper_lower", type=float, default=None); parser.add_argument(f"--{side}_gripper_upper", type=float, default=None)
     parser.add_argument("--gripper_lower", type=float, default=None)
     parser.add_argument("--gripper_upper", type=float, default=None)
     parser.add_argument(
@@ -183,6 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-left-serial", default=None)
     parser.add_argument("--camera-right-serial", default=None)
     parser.add_argument("--no-cameras", action="store_true")
+    parser.add_argument("--window", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Infer and decode the first action, but do not command Piper.")
     parser.add_argument("--spec-only", action="store_true", help="Only print the train-config-derived spaces; no server or hardware.")
     parser.add_argument("--ready-timeout", type=float, default=15.0)
@@ -231,19 +234,6 @@ def _normalized_prompt(value: str | None) -> str | None:
     return prompt or None
 
 
-def _save_frame1_comparison(
-    *,
-    recorder: OpenPiRolloutRecorder,
-    distribution_image_path: Path,
-    frame1_image: np.ndarray,
-) -> Path:
-    distribution_image = cv2.imread(str(distribution_image_path), cv2.IMREAD_COLOR)
-    if distribution_image is None:
-        raise RuntimeError(f"Failed to read train distribution image: {distribution_image_path}")
-    comparison = stack_vertical(distribution_image, frame1_image)
-    return recorder.save_extra_image(comparison, suffix="frame1")
-
-
 def _print_rollout_chunk_summary(
     *,
     client: OpenPiPiperClient,
@@ -288,7 +278,7 @@ def run_once(args: argparse.Namespace) -> None:
         raise ValueError("--inference-rate must be non-negative")
 
     record_assets = None
-    if args.record:
+    if args.record or args.window:
         record_assets = prepare_train_assets(
             train_config_name=args.train_config,
             cli_prompt=cli_prompt,
@@ -321,6 +311,7 @@ def run_once(args: argparse.Namespace) -> None:
         gripper_threshold=args.gripper_threshold,
         old_gripper=args.old_gripper,
     )
+    client.left_gripper_threshold, client.right_gripper_threshold, client.left_gripper_lower, client.left_gripper_upper, client.right_gripper_lower, client.right_gripper_upper = args.left_gripper_threshold, args.right_gripper_threshold, args.left_gripper_lower, args.left_gripper_upper, args.right_gripper_lower, args.right_gripper_upper
     client.gripper_lower, client.gripper_upper = args.gripper_lower, args.gripper_upper
     state_builder = lambda snapshot, policy_spec: build_configured_piper_state(
         snapshot,
@@ -367,6 +358,18 @@ def run_once(args: argparse.Namespace) -> None:
                 )
             if saved_actions is not None:
                 saved_actions.append(actions[0].copy())
+            if recorder is not None:
+                distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
+                frame1_compare_path = save_frame1_image(
+                    recorder,
+                    snapshot,
+                    distribution_image_path=distribution_image_path,
+                )
+                if frame1_compare_path is not None:
+                    print(f"Frame1 comparison saved to {frame1_compare_path}", flush=True)
+            if args.window:
+                distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
+                preview_until_continue(source, distribution_image_path=distribution_image_path)
             print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2))
             return
 
@@ -398,6 +401,18 @@ def run_once(args: argparse.Namespace) -> None:
         print(json.dumps({"initial_pose": {"qpos": INIT_JOINTS.tolist()}}, indent=2), flush=True)
         robot.move_to_joint_positions(INIT_JOINTS, speed_percent=args.joint_speed_percent)
         first_obs_snapshot = source.capture_snapshot()
+        if recorder is not None:
+            distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
+            frame1_compare_path = save_frame1_image(
+                recorder,
+                first_obs_snapshot,
+                distribution_image_path=distribution_image_path,
+            )
+            if frame1_compare_path is not None:
+                print(f"Frame1 comparison saved to {frame1_compare_path}", flush=True)
+        if args.window:
+            distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
+            preview_until_continue(source, distribution_image_path=distribution_image_path)
 
         print(
             json.dumps(
@@ -509,18 +524,14 @@ def run_once(args: argparse.Namespace) -> None:
             if output_path is not None:
                 print(f"Recording saved to {output_path}", flush=True)
                 try:
-                    if (
-                        first_obs_snapshot is not None
-                        and record_assets is not None
-                        and record_assets.distribution_ready
-                        and record_assets.distribution_image_path is not None
-                        and "cam_high" in first_obs_snapshot.images
-                    ):
-                        frame1_compare_path = _save_frame1_comparison(
-                            recorder=recorder,
-                            distribution_image_path=record_assets.distribution_image_path,
-                            frame1_image=first_obs_snapshot.images["cam_high"],
+                    if frame1_compare_path is None:
+                        distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
+                        frame1_compare_path = save_frame1_image(
+                            recorder,
+                            first_obs_snapshot,
+                            distribution_image_path=distribution_image_path,
                         )
+                    if frame1_compare_path is not None:
                         print(f"Frame1 comparison saved to {frame1_compare_path}", flush=True)
                     elif record_assets is not None and record_assets.skip_reason is not None:
                         print(f"Skipped train-distribution frame1 image: {record_assets.skip_reason}", flush=True)

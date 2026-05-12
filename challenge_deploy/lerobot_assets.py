@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import imageio.v3 as iio
 import numpy as np
 import pandas as pd
 from openpi.training import config as openpi_config
@@ -23,6 +24,29 @@ def _safe_filename_part(value: str) -> str:
     while "__" in value:
         value = value.replace("__", "_")
     return value.strip("._-")
+
+
+def _read_bgr_image(path: Path) -> np.ndarray:
+    image = np.asarray(iio.imread(path))
+    if image.ndim == 2:
+        image = np.repeat(image[..., None], 3, axis=2)
+    if image.ndim == 3 and image.shape[-1] == 4:
+        image = image[..., :3]
+    if image.ndim != 3 or image.shape[-1] != 3:
+        raise ValueError(f"Expected HWC 3-channel image, got shape {image.shape} from {path}")
+    if image.dtype != np.uint8:
+        scale = 255.0 if np.issubdtype(image.dtype, np.floating) and float(image.max()) <= 1.0 + 1e-6 else 1.0
+        image = np.clip(image * scale, 0.0, 255.0).astype(np.uint8)
+    return image[..., ::-1].copy()
+
+
+def _write_bgr_image(path: Path, image: np.ndarray) -> None:
+    image = np.asarray(image)
+    if image.ndim != 3 or image.shape[-1] != 3:
+        raise ValueError(f"Expected HWC 3-channel image, got shape {image.shape}")
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    iio.imwrite(path, image[..., ::-1])
 
 
 @dataclass(frozen=True)
@@ -238,9 +262,7 @@ def _decode_image_value(value: Any, *, dataset_dir: Path) -> np.ndarray:
             image_path = Path(str(path_value))
             if not image_path.is_absolute():
                 image_path = dataset_dir / image_path
-            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-            if image is None:
-                raise RuntimeError(f"cv2 failed to read image path: {image_path}")
+            image = _read_bgr_image(image_path)
     else:
         raise TypeError(f"Unsupported image entry type: {type(value)!r}")
 
@@ -316,10 +338,7 @@ def load_cam_high_background_image(*, artifacts_root: Path = ARTIFACTS_ROOT) -> 
     background_path = default_cam_high_background_path(artifacts_root=artifacts_root)
     if not background_path.exists():
         return None
-    image = cv2.imread(str(background_path), cv2.IMREAD_COLOR)
-    if image is None:
-        raise RuntimeError(f"Failed to read clean cam_high background image: {background_path}")
-    return image
+    return _read_bgr_image(background_path)
 
 
 def build_cam_high_first_frame_overlay(dataset_dir: Path, *, repo_id: str | None = None) -> np.ndarray:
@@ -397,8 +416,7 @@ def ensure_distribution_image(
     if output_path.exists() and not force:
         return output_path
     image = build_cam_high_first_frame_overlay(dataset_dir, repo_id=repo_id)
-    if not cv2.imwrite(str(output_path), image):
-        raise RuntimeError(f"Failed to write train distribution image: {output_path}")
+    _write_bgr_image(output_path, image)
     return output_path
 
 

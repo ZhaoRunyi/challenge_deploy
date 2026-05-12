@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 
 from challenge_deploy.config import load_config, set_by_dotted_path
-from challenge_deploy.lerobot_assets import dataset_asset_info, resolve_prompt
+from challenge_deploy.lerobot_assets import dataset_asset_info, prepare_train_assets, resolve_prompt
 from challenge_deploy.rollout_metrics import save_rollout_metrics_summary
 from challenge_deploy.openpi_sim_client import (
     SIM_ACTION_NAMES,
@@ -26,7 +26,7 @@ from challenge_deploy.openpi_sim_client import (
 )
 from challenge_deploy.piper import DualPiperSystem
 from challenge_deploy.realsense import RealSenseRig
-from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema
+from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema, preview_until_continue, save_frame1_image
 from challenge_deploy.runtime import DualPiperObservationSource
 from challenge_deploy.schemas import RobotSnapshot
 
@@ -47,6 +47,26 @@ INIT_EMBODICHAIN_QPOS = np.array(
         0.6446187496185303,
         0.13154016435146332,
         1.0000003576278687,
+    ],
+    dtype=np.float64,
+) # OLD
+
+INIT_EMBODICHAIN_QPOS = np.array(
+    [
+        -0.05918411,
+        0.00076794,
+        -0.12870058,
+        -0.13548991,
+        0.29586821,
+        0.13372713,
+        0.0,
+        0.08932595,
+        0.00970403,
+        -0.21027726,
+        -0.08838347,
+        0.39285615,
+        0.08686504,
+        0.0,
     ],
     dtype=np.float64,
 )
@@ -166,6 +186,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional executable-scale gripper threshold. Final gripper values below this are clipped to 0.",
     )
+    for side in ("left", "right"):
+        parser.add_argument(f"--{side}_gripper_threshold", *([f"--{side}_gripper_thrshold"] if side == "left" else []), dest=f"{side}_gripper_threshold", type=float, default=None)
+        parser.add_argument(f"--{side}_gripper_lower", type=float, default=None); parser.add_argument(f"--{side}_gripper_upper", type=float, default=None)
     parser.add_argument("--gripper_lower", type=float, default=None)
     parser.add_argument("--gripper_upper", type=float, default=None)
     parser.add_argument(
@@ -203,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--buffer-max-chunks", type=int, default=None, help="Action buffer chunk cap; default from config.")
     parser.add_argument("--metrics-json", default=None, help="Optional path to save rollout timing metrics as JSON.")
     parser.add_argument("--record", action="store_true", help="Record cameras, actions, and states into one deploy video.")
-    parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "openpi_records"))
+    parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "openpi_sim_records"))
     parser.add_argument("--config", default=str(DEPLOY_ROOT / "configs" / "dual_piper_example.yaml"))
     parser.add_argument("--left-can", default=None)
     parser.add_argument("--right-can", default=None)
@@ -211,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-left-serial", default=None)
     parser.add_argument("--camera-right-serial", default=None)
     parser.add_argument("--no-cameras", action="store_true")
+    parser.add_argument("--window", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Infer and decode the first action, but do not command Piper.")
     parser.add_argument("--spec-only", action="store_true", help="Only print the train-config-derived spaces; no server or hardware.")
     parser.add_argument("--ready-timeout", type=float, default=15.0)
@@ -460,12 +484,8 @@ def run_once(args: argparse.Namespace) -> None:
     if args.execution_mode != "chunk_sync":
         raise NotImplementedError("openpi_sim EmbodiChain runner currently supports --execution-mode chunk_sync only")
 
-    asset_info = dataset_asset_info(args.train_config)
-    resolved_prompt, prompt_source = resolve_prompt(
-        train_config_name=args.train_config,
-        cli_prompt=cli_prompt,
-        dataset_dir=asset_info.dataset_dir,
-    )
+    asset_info = dataset_asset_info(args.train_config); record_assets = prepare_train_assets(train_config_name=args.train_config, cli_prompt=cli_prompt) if (args.record or args.window) else None
+    resolved_prompt, prompt_source = (record_assets.prompt, record_assets.prompt_source) if record_assets is not None else resolve_prompt(train_config_name=args.train_config, cli_prompt=cli_prompt, dataset_dir=asset_info.dataset_dir)
 
     if resolved_prompt is None:
         raise RuntimeError(
@@ -495,6 +515,7 @@ def run_once(args: argparse.Namespace) -> None:
         gripper_threshold=args.gripper_threshold,
         old_gripper=args.old_gripper,
     )
+    client.left_gripper_threshold, client.right_gripper_threshold, client.left_gripper_lower, client.left_gripper_upper, client.right_gripper_lower, client.right_gripper_upper = args.left_gripper_threshold, args.right_gripper_threshold, args.left_gripper_lower, args.left_gripper_upper, args.right_gripper_lower, args.right_gripper_upper
     client.gripper_lower, client.gripper_upper = args.gripper_lower, args.gripper_upper
 
     runtime_config = _apply_runtime_overrides(load_config(args.config), args)
@@ -515,6 +536,7 @@ def run_once(args: argparse.Namespace) -> None:
         _install_record_signal_handlers()
 
     first_obs_snapshot = None
+    frame1_path = None
     metrics = None
     robot.connect(read_only=args.dry_run)
     try:
@@ -536,6 +558,18 @@ def run_once(args: argparse.Namespace) -> None:
                 )
             if saved_actions is not None:
                 saved_actions.append(actions[0].copy())
+            if recorder is not None:
+                distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
+                frame1_path = save_frame1_image(
+                    recorder,
+                    first_obs_snapshot,
+                    distribution_image_path=distribution_image_path,
+                )
+                if frame1_path is not None:
+                    print(f"Frame1 image saved to {frame1_path}", flush=True)
+            if args.window:
+                distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
+                preview_until_continue(source, distribution_image_path=distribution_image_path)
             print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2), flush=True)
             return
 
@@ -548,6 +582,18 @@ def run_once(args: argparse.Namespace) -> None:
         print(json.dumps({"initial_pose": {"qpos": initial_joints.tolist()}}, indent=2), flush=True)
         robot.move_to_joint_positions(initial_joints, speed_percent=args.joint_speed_percent)
         first_obs_snapshot = _snapshot_with_grippers(source.capture_snapshot(), initial_joints[[6, 13]])
+        if recorder is not None:
+            distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
+            frame1_path = save_frame1_image(
+                recorder,
+                first_obs_snapshot,
+                distribution_image_path=distribution_image_path,
+            )
+            if frame1_path is not None:
+                print(f"Frame1 image saved to {frame1_path}", flush=True)
+        if args.window:
+            distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
+            preview_until_continue(source, distribution_image_path=distribution_image_path)
         print(
             json.dumps(
                 {
@@ -616,10 +662,11 @@ def run_once(args: argparse.Namespace) -> None:
                 print(f"Failed to finalize recording: {exc}", flush=True)
             if output_path is not None:
                 print(f"Recording saved to {output_path}", flush=True)
-                if first_obs_snapshot is not None and "cam_high" in first_obs_snapshot.images:
+                if frame1_path is None:
                     try:
-                        frame1_path = recorder.save_extra_image(first_obs_snapshot.images["cam_high"], suffix="frame1")
-                        print(f"Frame1 image saved to {frame1_path}", flush=True)
+                        frame1_path = save_frame1_image(recorder, first_obs_snapshot)
+                        if frame1_path is not None:
+                            print(f"Frame1 image saved to {frame1_path}", flush=True)
                     except Exception as exc:
                         print(f"Failed to save frame1 image: {exc}", flush=True)
 

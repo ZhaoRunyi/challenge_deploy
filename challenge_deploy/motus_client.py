@@ -61,6 +61,7 @@ class DecodedArmAction:
     joint: np.ndarray | None
     gripper: float
     ee_pose: np.ndarray | None
+    binary_gripper: bool = False
 
 
 @dataclass(frozen=True)
@@ -382,7 +383,7 @@ def _action_gripper_for_piper(value: float, gripper_cfg: Any, *, old_gripper: bo
     return _model_raw_gripper_to_hardware(value, old_gripper=old_gripper)
 
 
-def _thresholded_gripper_for_piper(
+def _decoded_gripper_for_piper(
     value: float,
     threshold: float | None,
     gripper_cfg: Any | None,
@@ -390,13 +391,16 @@ def _thresholded_gripper_for_piper(
     upper: float | None = None,
     *,
     old_gripper: bool,
-) -> float:
+) -> tuple[float, bool]:
     value = _action_gripper_for_piper(value, gripper_cfg, old_gripper=old_gripper)
+    binary_gripper = bool(gripper_cfg is not None and getattr(gripper_cfg, "type", None) == "01")
     if threshold is not None:
-        return PIPER_GRIPPER_FULL_OPEN_METERS if value >= threshold else 0.0
+        return (PIPER_GRIPPER_FULL_OPEN_METERS if value >= threshold else 0.0), True
     if upper is not None and value > upper:
-        return PIPER_GRIPPER_FULL_OPEN_METERS
-    return 0.0 if lower is not None and value < lower else value
+        return PIPER_GRIPPER_FULL_OPEN_METERS, True
+    if lower is not None and value < lower:
+        return 0.0, True
+    return value, binary_gripper
 
 
 def _arm_full_state(
@@ -605,6 +609,8 @@ class MotusPiperClient:
         api_key: str | None = None,
         joint_speed_percent: int = 50,
         ee_speed_percent: int = 50,
+        gripper_effort: int = 1000,
+        gripper_action_frames: int = 5,
         gripper_threshold: float | None = None,
         gripper_lower: float | None = None,
         gripper_upper: float | None = None,
@@ -614,11 +620,19 @@ class MotusPiperClient:
         self.control_mode = control_mode
         self.joint_speed_percent = joint_speed_percent
         self.ee_speed_percent = ee_speed_percent
+        self.gripper_effort = gripper_effort
+        self.gripper_action_frames = gripper_action_frames
         self.gripper_threshold = gripper_threshold
         self.gripper_lower = gripper_lower
         self.gripper_upper = gripper_upper
         self.old_gripper = old_gripper
         self._default_session_id: str | None = None
+        self._last_commanded: DecodedPiperAction | None = None
+        self._gripper_transition: tuple[DecodedPiperAction, DecodedPiperAction, int] | None = None
+        if not 0 <= self.gripper_effort <= 5000:
+            raise ValueError("gripper_effort must be in [0, 5000]")
+        if self.gripper_action_frames <= 0:
+            raise ValueError("gripper_action_frames must be positive")
         if self.gripper_threshold is not None and self.gripper_threshold < 0.0:
             raise ValueError("gripper_threshold must be non-negative")
         if self.gripper_lower is not None and self.gripper_lower < 0.0:
@@ -757,12 +771,13 @@ class MotusPiperClient:
         fields = set(slai_policy._fields_from_action_config(self.spec.action_space))
         decoded: dict[str, DecodedArmAction] = {}
         for arm in action_space["arms"]:
-            gripper = _thresholded_gripper_for_piper(
+            arm_threshold, arm_lower, arm_upper = getattr(self, f"{arm}_gripper_threshold", None), getattr(self, f"{arm}_gripper_lower", None), getattr(self, f"{arm}_gripper_upper", None)
+            gripper, binary_gripper = _decoded_gripper_for_piper(
                 float(action[slices[f"{arm}_gripper"]][0]),
-                self.gripper_threshold,
+                arm_threshold if arm_threshold is not None else self.gripper_threshold,
                 self.spec.action_space.gripper,
-                getattr(self, "gripper_lower", None),
-                getattr(self, "gripper_upper", None),
+                arm_lower if arm_lower is not None else getattr(self, "gripper_lower", None),
+                arm_upper if arm_upper is not None else getattr(self, "gripper_upper", None),
                 old_gripper=self.old_gripper,
             )
             joint = None
@@ -772,21 +787,80 @@ class MotusPiperClient:
             if {"ee_pos", "ee_rot"}.issubset(fields):
                 ee_rpy = rotation_to_rpy(action[slices[f"{arm}_ee_rot"]], self.spec.action_space.ee_rotation)
                 ee_pose = np.concatenate((action[slices[f"{arm}_ee_pos"]], ee_rpy, np.array([gripper])), axis=0)
-            decoded[arm] = DecodedArmAction(joint=joint, gripper=gripper, ee_pose=ee_pose)
+            decoded[arm] = DecodedArmAction(
+                joint=joint,
+                gripper=gripper,
+                ee_pose=ee_pose,
+                binary_gripper=binary_gripper,
+            )
         return DecodedPiperAction(arms=decoded, control_mode=self.control_mode)
 
-    def command_action(self, robot: Any, action: np.ndarray) -> None:
-        decoded = self.decode_action(action)
+    def _command_decoded(self, robot: Any, decoded: DecodedPiperAction) -> None:
         for arm_name, arm_action in decoded.arms.items():
             arm = robot.left if arm_name == "left" else robot.right
             if decoded.control_mode == "joints":
                 if arm_action.joint is None:
                     raise ValueError(f"Decoded action for {arm_name} has no joint block")
-                arm.command_joint_positions(arm_action.joint, speed_percent=self.joint_speed_percent)
+                arm.command_joint_positions(
+                    arm_action.joint,
+                    speed_percent=self.joint_speed_percent,
+                    gripper_effort=self.gripper_effort,
+                )
             else:
                 if arm_action.ee_pose is None:
                     raise ValueError(f"Decoded action for {arm_name} has no ee_pose block")
-                arm.command_end_pose(arm_action.ee_pose, speed_percent=self.ee_speed_percent)
+                arm.command_end_pose(
+                    arm_action.ee_pose,
+                    speed_percent=self.ee_speed_percent,
+                    gripper_effort=self.gripper_effort,
+                )
+
+    def _current_decoded_from_robot(self, robot: Any) -> DecodedPiperAction:
+        state = robot.read_state()
+        arms = {
+            "left": DecodedArmAction(joint=np.asarray(state.left.qpos, dtype=np.float64).copy(), gripper=float(state.left.qpos[6]), ee_pose=None if self.control_mode == "joints" else np.asarray(state.left.end_pose, dtype=np.float64).copy()),
+            "right": DecodedArmAction(joint=np.asarray(state.right.qpos, dtype=np.float64).copy(), gripper=float(state.right.qpos[6]), ee_pose=None if self.control_mode == "joints" else np.asarray(state.right.end_pose, dtype=np.float64).copy()),
+        }
+        if self.control_mode != "joints":
+            arms["left"] = DecodedArmAction(joint=None, gripper=arms["left"].gripper, ee_pose=arms["left"].ee_pose)
+            arms["right"] = DecodedArmAction(joint=None, gripper=arms["right"].gripper, ee_pose=arms["right"].ee_pose)
+        return DecodedPiperAction(arms=arms, control_mode=self.control_mode)
+
+    def _command_transition_step(self, robot: Any, start: DecodedPiperAction, target: DecodedPiperAction, step: int) -> None:
+        ratio = float(step) / float(self.gripper_action_frames)
+        arms: dict[str, DecodedArmAction] = {}
+        for arm_name, start_arm in start.arms.items():
+            target_arm = target.arms[arm_name]
+            gripper = start_arm.gripper if not target_arm.binary_gripper else start_arm.gripper + (target_arm.gripper - start_arm.gripper) * ratio
+            if self.control_mode == "joints":
+                arms[arm_name] = DecodedArmAction(joint=np.concatenate((start_arm.joint[:6], np.array([gripper], dtype=np.float64))), gripper=gripper, ee_pose=None, binary_gripper=target_arm.binary_gripper)
+            else:
+                arms[arm_name] = DecodedArmAction(joint=None, gripper=gripper, ee_pose=np.concatenate((start_arm.ee_pose[:6], np.array([gripper], dtype=np.float64))), binary_gripper=target_arm.binary_gripper)
+        decoded = DecodedPiperAction(arms=arms, control_mode=self.control_mode)
+        self._command_decoded(robot, decoded)
+        self._last_commanded = decoded
+
+    def command_action(self, robot: Any, action: np.ndarray) -> None:
+        if self._gripper_transition is not None:
+            start, target, step = self._gripper_transition
+            self._command_transition_step(robot, start, target, step)
+            self._gripper_transition = None if step >= self.gripper_action_frames else (start, target, step + 1)
+            return
+
+        decoded = self.decode_action(action)
+        if self._last_commanded is None:
+            self._last_commanded = self._current_decoded_from_robot(robot)
+        if (
+            self._last_commanded is not None
+            and self.gripper_action_frames > 1
+            and any(arm.binary_gripper and not np.isclose(arm.gripper, self._last_commanded.arms[name].gripper, atol=1e-6) for name, arm in decoded.arms.items())
+        ):
+            start = self._last_commanded
+            self._command_transition_step(robot, start, decoded, 1)
+            self._gripper_transition = (start, decoded, 2)
+            return
+        self._command_decoded(robot, decoded)
+        self._last_commanded = decoded
 
     def command_first_action(self, robot: Any, response_or_actions: dict[str, Any] | np.ndarray) -> None:
         actions = _action_array_from_response(response_or_actions) if isinstance(response_or_actions, dict) else response_or_actions

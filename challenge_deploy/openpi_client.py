@@ -348,15 +348,16 @@ class OpenPiPiperClient:
         fields = set(slai_piper_policy._fields_from_action_config(self.spec.action_space))
         decoded: dict[str, DecodedArmAction] = {}
         for arm in action_space["arms"]:
+            arm_threshold, arm_lower, arm_upper = getattr(self, f"{arm}_gripper_threshold", None), getattr(self, f"{arm}_gripper_lower", None), getattr(self, f"{arm}_gripper_upper", None)
             gripper = _bounded_gripper_for_piper(
                 _action_gripper_for_piper(
                     float(action[slices[f"{arm}_gripper"]][0]),
                     self.spec.action_space.gripper,
                     old_gripper=self.old_gripper,
                 ),
-                self.gripper_threshold,
-                getattr(self, "gripper_lower", None),
-                getattr(self, "gripper_upper", None),
+                arm_threshold if arm_threshold is not None else self.gripper_threshold,
+                arm_lower if arm_lower is not None else getattr(self, "gripper_lower", None),
+                arm_upper if arm_upper is not None else getattr(self, "gripper_upper", None),
             )
             joint = None
             ee_pose = None

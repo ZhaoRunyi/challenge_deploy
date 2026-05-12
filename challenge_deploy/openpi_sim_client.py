@@ -276,18 +276,20 @@ class OpenPiSimPiperClient:
         if action.shape[0] < SIM_ACTION_DIM:
             raise ValueError(f"openpi_sim action dim {action.shape[0]} is smaller than expected {SIM_ACTION_DIM}")
 
+        left_threshold, left_lower, left_upper = getattr(self, "left_gripper_threshold", None), getattr(self, "left_gripper_lower", None), getattr(self, "left_gripper_upper", None)
         left_gripper = sim_gripper_to_piper(
             float(action[6]),
-            self.gripper_threshold,
-            getattr(self, "gripper_lower", None),
-            getattr(self, "gripper_upper", None),
+            left_threshold if left_threshold is not None else self.gripper_threshold,
+            left_lower if left_lower is not None else getattr(self, "gripper_lower", None),
+            left_upper if left_upper is not None else getattr(self, "gripper_upper", None),
             old_gripper=self.old_gripper,
         )
+        right_threshold, right_lower, right_upper = getattr(self, "right_gripper_threshold", None), getattr(self, "right_gripper_lower", None), getattr(self, "right_gripper_upper", None)
         right_gripper = sim_gripper_to_piper(
             float(action[13]),
-            self.gripper_threshold,
-            getattr(self, "gripper_lower", None),
-            getattr(self, "gripper_upper", None),
+            right_threshold if right_threshold is not None else self.gripper_threshold,
+            right_lower if right_lower is not None else getattr(self, "gripper_lower", None),
+            right_upper if right_upper is not None else getattr(self, "gripper_upper", None),
             old_gripper=self.old_gripper,
         )
         return DecodedSimPiperAction(

@@ -4,11 +4,15 @@ from dataclasses import dataclass
 from pathlib import Path
 import math
 import re
+import select
 import shutil
+import sys
 import time
-from typing import Mapping
+from typing import Any, Mapping
 
 import cv2
+import imageio
+import imageio.v3 as iio
 import numpy as np
 
 
@@ -80,8 +84,7 @@ class OpenPiRolloutRecorder:
     def save_extra_image(self, image: np.ndarray, *, suffix: str, extension: str = ".png") -> Path:
         path = self.extra_image_path(suffix, extension=extension)
         image = _to_bgr_uint8(image)
-        if not cv2.imwrite(str(path), image):
-            raise RuntimeError(f"Failed to write extra recording image: {path}")
+        iio.imwrite(path, image[..., ::-1])
         return path
 
     def record(
@@ -94,8 +97,7 @@ class OpenPiRolloutRecorder:
     ) -> None:
         camera_row = self._compose_camera_row(images)
         frame_path = self.frames_dir / f"frame_{len(self.frame_paths):06d}.jpg"
-        if not cv2.imwrite(str(frame_path), camera_row, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
-            raise RuntimeError(f"Failed to write recording frame: {frame_path}")
+        iio.imwrite(frame_path, camera_row[..., ::-1], quality=92)
 
         self.frame_paths.append(frame_path)
         self.actions.append(np.asarray(action, dtype=np.float64).copy())
@@ -112,9 +114,7 @@ class OpenPiRolloutRecorder:
 
         actions = np.stack(self.actions, axis=0)
         states = np.stack(self.states, axis=0)
-        first_frame = cv2.imread(str(self.frame_paths[0]), cv2.IMREAD_COLOR)
-        if first_frame is None:
-            raise RuntimeError(f"Failed to read first recording frame: {self.frame_paths[0]}")
+        first_frame = iio.imread(self.frame_paths[0])[..., ::-1]
 
         camera_h, camera_w = first_frame.shape[:2]
         base_plot, final_plot, plot_rects = self._make_plot_canvases(
@@ -126,28 +126,19 @@ class OpenPiRolloutRecorder:
         video_w, video_h = camera_w, camera_h + plot_h
         tmp_output = self.output_path.with_suffix(".tmp.mp4")
 
-        writer = cv2.VideoWriter(
-            str(tmp_output),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            self.fps,
-            (video_w, video_h),
-        )
-        if not writer.isOpened():
-            raise RuntimeError(f"Failed to open recording video writer: {tmp_output}")
+        writer = imageio.get_writer(tmp_output, fps=self.fps, codec="mpeg4")
 
         try:
             total = len(self.frame_paths)
             for index, frame_path in enumerate(self.frame_paths):
-                camera_row = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
-                if camera_row is None:
-                    raise RuntimeError(f"Failed to read recording frame: {frame_path}")
+                camera_row = iio.imread(frame_path)[..., ::-1]
                 if camera_row.shape[:2] != (camera_h, camera_w):
                     camera_row = cv2.resize(camera_row, (camera_w, camera_h), interpolation=cv2.INTER_AREA)
                 ratio = (index + 1) / total
                 plot_row = _reveal_plot_frame(base_plot, final_plot, plot_rects, ratio)
-                writer.write(np.concatenate((camera_row, plot_row), axis=0))
+                writer.append_data(np.concatenate((camera_row, plot_row), axis=0)[..., ::-1])
         finally:
-            writer.release()
+            writer.close()
 
         tmp_output.replace(self.output_path)
         shutil.rmtree(self.frames_dir, ignore_errors=True)
@@ -236,6 +227,66 @@ def stack_vertical(top: np.ndarray, bottom: np.ndarray) -> np.ndarray:
     top_resized = resize_to_width(top_bgr, target_width)
     bottom_resized = resize_to_width(bottom_bgr, target_width)
     return np.concatenate((top_resized, bottom_resized), axis=0)
+
+
+def _load_distribution_image(distribution_image_path: Path | None) -> np.ndarray | None:
+    if distribution_image_path is None or not distribution_image_path.exists():
+        return None
+    distribution_image = np.asarray(iio.imread(distribution_image_path))[..., :3]
+    return _to_bgr_uint8(distribution_image)[..., ::-1].copy()
+
+
+def _select_preview_frame(
+    images: Mapping[str, np.ndarray],
+    preferred_names: tuple[str, ...],
+) -> tuple[str, np.ndarray] | None:
+    for image_name in preferred_names + tuple(images):
+        frame = images.get(image_name)
+        if frame is not None:
+            return image_name, _to_bgr_uint8(frame)
+    return None
+
+
+def preview_until_continue(
+    source: Any,
+    *,
+    distribution_image_path: Path | None = None,
+    image_name: str = "cam_high",
+    window_name: str = "train_distribution",
+) -> None:
+    distribution_image = _load_distribution_image(distribution_image_path)
+    print("Place the object to match the train distribution, then type c and press Enter to continue.", flush=True)
+    while True:
+        images = source.capture_snapshot().images
+        selected = _select_preview_frame(images, (image_name,))
+        if selected is None:
+            continue
+        _, frame = selected
+        preview_frame = stack_vertical(distribution_image, frame) if distribution_image is not None else frame
+        cv2.imshow(window_name, preview_frame)
+        cv2.waitKey(1)
+        if select.select([sys.stdin], [], [], 0.05)[0] and sys.stdin.readline().strip().lower() == "c":
+            return
+
+
+def save_frame1_image(
+    recorder: OpenPiRolloutRecorder,
+    snapshot: Any | None,
+    *,
+    distribution_image_path: Path | None = None,
+    preferred_names: tuple[str, ...] = ("cam_high",),
+) -> Path | None:
+    if snapshot is None:
+        return None
+    images = getattr(snapshot, "images", {}) or {}
+    selected = _select_preview_frame(images, preferred_names)
+    if selected is None:
+        return None
+    image_name, frame = selected
+    distribution_image = _load_distribution_image(distribution_image_path)
+    if distribution_image is not None and image_name == "cam_high":
+        frame = stack_vertical(distribution_image, frame)
+    return recorder.save_extra_image(frame, suffix="frame1")
 
 
 def _plot_rects(*, width: int, height: int, count: int, cols: int) -> list[tuple[int, int, int, int]]:

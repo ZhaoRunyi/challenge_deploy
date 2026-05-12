@@ -23,6 +23,10 @@ class MotionNotAllowedError(RuntimeError):
     pass
 
 
+DEFAULT_GRIPPER_EFFORT = 1000
+MAX_GRIPPER_EFFORT = 5000
+
+
 def _motor_field(container: Any, index: int) -> Any:
     return getattr(container, f"motor_{index}")
 
@@ -42,6 +46,15 @@ def _joint_values_from_sdk(joint_state: Any) -> np.ndarray:
             joint_state.joint_6,
         ]
     )
+
+
+def _gripper_effort(value: int | None) -> int:
+    if value is None:
+        return DEFAULT_GRIPPER_EFFORT
+    effort = int(value)
+    if not 0 <= effort <= MAX_GRIPPER_EFFORT:
+        raise ValueError(f"gripper_effort must be in [0, {MAX_GRIPPER_EFFORT}], got {effort}")
+    return effort
 
 
 def _status_to_dict(status: Any) -> dict[str, Any]:
@@ -169,7 +182,13 @@ class SinglePiperArm:
         self._require_motion_allowed("exit teach mode")
         self.interface.MotionCtrl_1(grag_teach_ctrl=0x02)
 
-    def command_joint_positions(self, qpos: Iterable[float], *, speed_percent: int = 100) -> None:
+    def command_joint_positions(
+        self,
+        qpos: Iterable[float],
+        *,
+        speed_percent: int = 100,
+        gripper_effort: int | None = None,
+    ) -> None:
         self._require_motion_allowed("send joint commands")
         qpos_arr = np.asarray(list(qpos), dtype=np.float64)
         if qpos_arr.shape != (7,):
@@ -177,6 +196,7 @@ class SinglePiperArm:
 
         sdk_joints = joints_rad_to_sdk(qpos_arr[:6])
         sdk_gripper = opening_to_sdk_gripper(qpos_arr[6])
+        effort = _gripper_effort(gripper_effort)
         self.set_joint_mode(speed_percent=speed_percent)
         self.interface.JointCtrl(
             int(sdk_joints[0]),
@@ -186,16 +206,23 @@ class SinglePiperArm:
             int(sdk_joints[4]),
             int(sdk_joints[5]),
         )
-        self.interface.GripperCtrl(abs(int(sdk_gripper)), 1000, 0x01, 0)
+        self.interface.GripperCtrl(abs(int(sdk_gripper)), effort, 0x01, 0)
         self.set_joint_mode(speed_percent=speed_percent)
 
-    def command_end_pose(self, pose: Iterable[float], *, speed_percent: int = 50) -> None:
+    def command_end_pose(
+        self,
+        pose: Iterable[float],
+        *,
+        speed_percent: int = 50,
+        gripper_effort: int | None = None,
+    ) -> None:
         self._require_motion_allowed("send end-effector commands")
         pose_arr = np.asarray(list(pose), dtype=np.float64)
         if pose_arr.shape != (7,):
             raise ValueError(f"{self.name} expects 7-D pose input, got shape {pose_arr.shape}")
 
         x, y, z, rx, ry, rz, gripper = pose_arr
+        effort = _gripper_effort(gripper_effort)
         self.set_cartesian_mode(speed_percent=speed_percent)
         self.interface.EndPoseCtrl(
             int(round(x * 1_000_000.0)),
@@ -205,7 +232,7 @@ class SinglePiperArm:
             int(round(ry * 57_324.840764)),
             int(round(rz * 57_324.840764)),
         )
-        self.interface.GripperCtrl(abs(opening_to_sdk_gripper(gripper)), 1000, 0x01, 0)
+        self.interface.GripperCtrl(abs(opening_to_sdk_gripper(gripper)), effort, 0x01, 0)
         self.set_cartesian_mode(speed_percent=speed_percent)
 
     def read_state(self, *, prefer_joint_ctrl: bool = False) -> PiperArmState:
@@ -294,6 +321,7 @@ class SinglePiperArm:
         hz: float = 30.0,
         step_sizes: Iterable[float] = DEFAULT_ARM_STEP_LENGTH,
         speed_percent: int = 100,
+        gripper_effort: int | None = None,
     ) -> None:
         self._require_motion_allowed("move the arm")
         current = self.read_state().qpos
@@ -307,10 +335,18 @@ class SinglePiperArm:
         while True:
             diff = target - current
             if np.all(np.abs(diff) <= step):
-                self.command_joint_positions(target, speed_percent=speed_percent)
+                self.command_joint_positions(
+                    target,
+                    speed_percent=speed_percent,
+                    gripper_effort=gripper_effort,
+                )
                 break
             current = np.where(np.abs(diff) <= step, target, current + np.sign(diff) * step)
-            self.command_joint_positions(current, speed_percent=speed_percent)
+            self.command_joint_positions(
+                current,
+                speed_percent=speed_percent,
+                gripper_effort=gripper_effort,
+            )
             time.sleep(1.0 / hz)
 
     def probe(self, *, samples: int = 5, interval_s: float = 0.2, prefer_joint_ctrl: bool = False) -> PiperProbeResult:
@@ -382,12 +418,26 @@ class DualPiperSystem:
         self.left.disable()
         self.right.disable()
 
-    def set_joint_positions(self, qpos: Iterable[float], *, speed_percent: int = 100) -> None:
+    def set_joint_positions(
+        self,
+        qpos: Iterable[float],
+        *,
+        speed_percent: int = 100,
+        gripper_effort: int | None = None,
+    ) -> None:
         values = np.asarray(list(qpos), dtype=np.float64)
         if values.shape != (14,):
             raise ValueError(f"{self.name} expects a 14-D target, got {values.shape}")
-        self.left.command_joint_positions(values[:7], speed_percent=speed_percent)
-        self.right.command_joint_positions(values[7:], speed_percent=speed_percent)
+        self.left.command_joint_positions(
+            values[:7],
+            speed_percent=speed_percent,
+            gripper_effort=gripper_effort,
+        )
+        self.right.command_joint_positions(
+            values[7:],
+            speed_percent=speed_percent,
+            gripper_effort=gripper_effort,
+        )
 
     def move_to_joint_positions(
         self,
@@ -396,12 +446,25 @@ class DualPiperSystem:
         hz: float = 30.0,
         step_sizes: Iterable[float] = DEFAULT_ARM_STEP_LENGTH,
         speed_percent: int = 100,
+        gripper_effort: int | None = None,
     ) -> None:
         values = np.asarray(list(qpos), dtype=np.float64)
         if values.shape != (14,):
             raise ValueError(f"{self.name} expects a 14-D target, got {values.shape}")
-        self.left.move_to_joint_positions(values[:7], hz=hz, step_sizes=step_sizes, speed_percent=speed_percent)
-        self.right.move_to_joint_positions(values[7:], hz=hz, step_sizes=step_sizes, speed_percent=speed_percent)
+        self.left.move_to_joint_positions(
+            values[:7],
+            hz=hz,
+            step_sizes=step_sizes,
+            speed_percent=speed_percent,
+            gripper_effort=gripper_effort,
+        )
+        self.right.move_to_joint_positions(
+            values[7:],
+            hz=hz,
+            step_sizes=step_sizes,
+            speed_percent=speed_percent,
+            gripper_effort=gripper_effort,
+        )
 
     def configure_masters_for_teaching(self, *, align_to: np.ndarray | None = None, hz: float = 10.0) -> None:
         self.left.configure_as_master_input()

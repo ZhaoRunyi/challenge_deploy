@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import cv2
 import json
 from pathlib import Path
 import signal
@@ -31,7 +30,7 @@ from challenge_deploy.openpi_rollout import (
 )
 from challenge_deploy.piper import DualPiperSystem
 from challenge_deploy.realsense import RealSenseRig
-from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema, stack_vertical
+from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema, preview_until_continue, save_frame1_image
 from challenge_deploy.runtime import DualPiperObservationSource
 
 
@@ -137,14 +136,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--control-mode", choices=["joints", "ee_pose"], default="joints")
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--joint-speed-percent", type=int, default=50)
-    parser.add_argument("--ee-speed-percent", type=int, default=50)
+    parser.add_argument("--joint-speed-percent", type=int, default=100)
+    parser.add_argument("--ee-speed-percent", type=int, default=100)
+    parser.add_argument(
+        "--gripper-effort",
+        type=int,
+        default=1000,
+        help="Piper SDK GripperCtrl effort in [0, 5000].",
+    )
+    parser.add_argument(
+        "--gripper-action-frames",
+        type=int,
+        default=3,
+        help=(
+            "Only used when gripper commands are binarized. Open/close transitions are executed linearly "
+            "across this many command frames while the other joints stay frozen."
+        ),
+    )
     parser.add_argument(
         "--gripper_threshold",
         type=float,
         default=None,
         help="Optional executable-scale gripper threshold in meters. Values below threshold close the gripper, and values above threshold command full open.",
     )
+    for side in ("left", "right"):
+        parser.add_argument(f"--{side}_gripper_threshold", *([f"--{side}_gripper_thrshold"] if side == "left" else []), dest=f"{side}_gripper_threshold", type=float, default=None)
+        parser.add_argument(f"--{side}_gripper_lower", type=float, default=None); parser.add_argument(f"--{side}_gripper_upper", type=float, default=None)
     parser.add_argument("--gripper_lower", type=float, default=None)
     parser.add_argument("--gripper_upper", type=float, default=None)
     parser.add_argument(
@@ -190,6 +207,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-left-serial", default=None)
     parser.add_argument("--camera-right-serial", default=None)
     parser.add_argument("--no-cameras", action="store_true")
+    parser.add_argument("--window", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Infer and decode the first action, but do not command Piper.")
     parser.add_argument("--spec-only", action="store_true", help="Only print the train-config-derived spaces; no server or hardware.")
     parser.add_argument("--ready-timeout", type=float, default=15.0)
@@ -264,30 +282,6 @@ def _print_rollout_chunk_summary(
     )
 
 
-def _save_first_frame_image(
-    *,
-    recorder: OpenPiRolloutRecorder,
-    snapshot: Any | None,
-    spec: MotusPolicySpec,
-    distribution_image_path: Path | None = None,
-) -> Path | None:
-    if snapshot is None:
-        return None
-    if distribution_image_path is not None and "cam_high" in snapshot.images:
-        distribution_image = cv2.imread(str(distribution_image_path), cv2.IMREAD_COLOR)
-        if distribution_image is None:
-            raise RuntimeError(f"Failed to read train distribution image: {distribution_image_path}")
-        comparison = stack_vertical(distribution_image, snapshot.images["cam_high"])
-        return recorder.save_extra_image(comparison, suffix="frame1")
-    preferred_names = ("cam_high",) + tuple(spec.image_ids)
-    for image_name in preferred_names:
-        image = snapshot.images.get(image_name)
-        if image is None:
-            continue
-        return recorder.save_extra_image(image, suffix="frame1")
-    return None
-
-
 def _record_repo_id_for_distribution(spec: MotusPolicySpec) -> str | None:
     if not spec.repo_id:
         return None
@@ -297,8 +291,27 @@ def _record_repo_id_for_distribution(spec: MotusPolicySpec) -> str | None:
     return str(spec.repo_id)
 
 
-def _resolve_motus_distribution_image(spec: MotusPolicySpec) -> tuple[Path | None, str | None]:
+def _record_dataset_name_for_prompt(spec: MotusPolicySpec, prompt: str | None) -> str | None:
+    if prompt is None:
+        return None
+    task_names = spec.config.get("dataset", {}).get("task_name") or []
+    if isinstance(task_names, str):
+        task_names = [task_names]
+    manifest_path = DEPLOY_ROOT.parent / "baselines" / "Motus" / "t5_prompt_cache" / "prompt_cache_manifest.json"
+    for dataset in json.loads(manifest_path.read_text(encoding="utf-8")).get("datasets", []) if manifest_path.exists() else []:
+        dataset_name = str(dataset.get("dataset_name") or Path(str(dataset.get("dataset_root", ""))).name)
+        if task_names and dataset_name not in task_names:
+            continue
+        if any(str(item.get("prompt", "")).strip() == prompt for item in dataset.get("prompts", [])):
+            return dataset_name
+    return None
+
+
+def _resolve_motus_distribution_image(spec: MotusPolicySpec, prompt: str | None = None) -> tuple[Path | None, str | None]:
     repo_id = _record_repo_id_for_distribution(spec)
+    matched_task = _record_dataset_name_for_prompt(spec, prompt)
+    if matched_task:
+        repo_id = f"{Path(spec.config['dataset']['params']['root']).name}/{matched_task.removeprefix('Motus_')}"
     if repo_id is None:
         return None, "train config does not define dataset.params.repo_id"
     distribution_image_path = repo_id_distribution_image_path(repo_id)
@@ -317,6 +330,10 @@ def run_once(args: argparse.Namespace) -> None:
         raise ValueError("--rollout-steps must be non-negative")
     if args.fps < 0.0:
         raise ValueError("--fps must be non-negative")
+    if not 0 <= args.gripper_effort <= 5000:
+        raise ValueError("--gripper-effort must be in [0, 5000]")
+    if args.gripper_action_frames <= 0:
+        raise ValueError("--gripper-action-frames must be positive")
     if args.gripper_threshold is not None and args.gripper_threshold < 0.0:
         raise ValueError("--gripper_threshold must be non-negative")
     if args.gripper_threshold is not None and (args.gripper_lower is not None or args.gripper_upper is not None):
@@ -331,11 +348,14 @@ def run_once(args: argparse.Namespace) -> None:
         api_key=args.api_key,
         joint_speed_percent=args.joint_speed_percent,
         ee_speed_percent=args.ee_speed_percent,
+        gripper_effort=args.gripper_effort,
+        gripper_action_frames=args.gripper_action_frames,
         gripper_threshold=args.gripper_threshold,
         gripper_lower=args.gripper_lower,
         gripper_upper=args.gripper_upper,
         old_gripper=args.old_gripper,
     )
+    client.left_gripper_threshold, client.right_gripper_threshold, client.left_gripper_lower, client.left_gripper_upper, client.right_gripper_lower, client.right_gripper_upper = args.left_gripper_threshold, args.right_gripper_threshold, args.left_gripper_lower, args.left_gripper_upper, args.right_gripper_lower, args.right_gripper_upper
     state_builder = lambda snapshot, policy_spec: build_configured_piper_state(
         snapshot,
         policy_spec,
@@ -381,10 +401,11 @@ def run_once(args: argparse.Namespace) -> None:
         _install_record_signal_handlers()
 
     first_obs_snapshot = None
+    frame1_path = None
     distribution_image_path = None
     distribution_skip_reason = None
-    if recorder is not None:
-        distribution_image_path, distribution_skip_reason = _resolve_motus_distribution_image(spec)
+    if recorder is not None or args.window:
+        distribution_image_path, distribution_skip_reason = _resolve_motus_distribution_image(spec, resolved_prompt)
     session_id = _new_session_id()
     client.set_default_session_id(session_id)
     metrics = None
@@ -408,6 +429,17 @@ def run_once(args: argparse.Namespace) -> None:
                 )
             if saved_actions is not None:
                 saved_actions.append(actions[0].copy())
+            if recorder is not None:
+                frame1_path = save_frame1_image(
+                    recorder,
+                    snapshot,
+                    distribution_image_path=distribution_image_path,
+                    preferred_names=("cam_high",) + tuple(spec.image_ids),
+                )
+                if frame1_path is not None:
+                    print(f"Frame1 image saved to {frame1_path}", flush=True)
+            if args.window:
+                preview_until_continue(source, distribution_image_path=distribution_image_path)
             print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2))
             return
 
@@ -416,8 +448,23 @@ def run_once(args: argparse.Namespace) -> None:
             print("Warning: Piper arm enable check did not report success; continuing anyway.", flush=True)
 
         print(json.dumps({"initial_pose": {"qpos": INIT_JOINTS.tolist()}}, indent=2), flush=True)
-        robot.move_to_joint_positions(INIT_JOINTS, speed_percent=args.joint_speed_percent)
+        robot.move_to_joint_positions(
+            INIT_JOINTS,
+            speed_percent=args.joint_speed_percent,
+            gripper_effort=args.gripper_effort,
+        )
         first_obs_snapshot = source.capture_snapshot()
+        if recorder is not None:
+            frame1_path = save_frame1_image(
+                recorder,
+                first_obs_snapshot,
+                distribution_image_path=distribution_image_path,
+                preferred_names=("cam_high",) + tuple(spec.image_ids),
+            )
+            if frame1_path is not None:
+                print(f"Frame1 image saved to {frame1_path}", flush=True)
+        if args.window:
+            preview_until_continue(source, distribution_image_path=distribution_image_path)
         chunk_size = resolve_chunk_size(spec, args.chunk_size)
         inference_rate = (
             float(args.inference_rate)
@@ -454,6 +501,8 @@ def run_once(args: argparse.Namespace) -> None:
                         "buffer_max_chunks": buffer_max_chunks if args.execution_mode == "streaming" else None,
                         "joint_speed_percent": args.joint_speed_percent,
                         "ee_speed_percent": args.ee_speed_percent,
+                        "gripper_effort": args.gripper_effort,
+                        "gripper_action_frames": args.gripper_action_frames,
                         "gripper_threshold": args.gripper_threshold,
                         "gripper_lower": args.gripper_lower,
                         "gripper_upper": args.gripper_upper,
@@ -561,12 +610,13 @@ def run_once(args: argparse.Namespace) -> None:
                 except Exception as exc:
                     print(f"Failed to save predicted video: {exc}", flush=True)
                 try:
-                    frame1_path = _save_first_frame_image(
-                        recorder=recorder,
-                        snapshot=first_obs_snapshot,
-                        spec=spec,
-                        distribution_image_path=distribution_image_path,
-                    )
+                    if frame1_path is None:
+                        frame1_path = save_frame1_image(
+                            recorder,
+                            first_obs_snapshot,
+                            distribution_image_path=distribution_image_path,
+                            preferred_names=("cam_high",) + tuple(spec.image_ids),
+                        )
                     if frame1_path is not None:
                         print(f"Frame1 image saved to {frame1_path}", flush=True)
                     elif distribution_skip_reason is not None:
