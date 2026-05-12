@@ -242,6 +242,7 @@ class OpenPiSimPiperClient:
         api_key: str | None = None,
         joint_speed_percent: int = 50,
         gripper_threshold: float | None = None,
+        num_steps: int | None = None,
         old_gripper: bool = False,
     ) -> None:
         if control_mode != "joints":
@@ -250,6 +251,7 @@ class OpenPiSimPiperClient:
         self.control_mode = control_mode
         self.joint_speed_percent = joint_speed_percent
         self.gripper_threshold = gripper_threshold
+        self.num_steps = num_steps
         self.old_gripper = old_gripper
         self._client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
 
@@ -261,7 +263,10 @@ class OpenPiSimPiperClient:
         return self._client.get_server_metadata()
 
     def build_payload(self, snapshot: RobotSnapshot, prompt: str) -> dict[str, Any]:
-        return build_policy_payload(snapshot, prompt=prompt, spec=self.spec, old_gripper=self.old_gripper)
+        payload = build_policy_payload(snapshot, prompt=prompt, spec=self.spec, old_gripper=self.old_gripper)
+        if self.num_steps is not None:
+            payload["num_steps"] = self.num_steps
+        return payload
 
     def infer(self, snapshot: RobotSnapshot, prompt: str) -> dict[str, Any]:
         return self._client.infer(self.build_payload(snapshot, prompt))
