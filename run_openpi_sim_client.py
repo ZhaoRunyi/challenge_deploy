@@ -196,6 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use the historical wrong Piper raw-gripper scaling for models trained before the 2lerobot fix.",
     )
+    parser.add_argument("--bad-sim", action="store_true", help="Treat gripper outputs as 0-0.05 sim-width and renormalize them to 0-1 before decoding.")
     parser.add_argument(
         "--rollout-steps",
         type=int,
@@ -516,6 +517,7 @@ def run_once(args: argparse.Namespace) -> None:
         gripper_threshold=args.gripper_threshold,
         num_steps=args.num_steps,
         old_gripper=args.old_gripper,
+        bad_sim=args.bad_sim,
     )
     client.left_gripper_threshold, client.right_gripper_threshold, client.left_gripper_lower, client.left_gripper_upper, client.right_gripper_lower, client.right_gripper_upper = args.left_gripper_threshold, args.right_gripper_threshold, args.left_gripper_lower, args.left_gripper_upper, args.right_gripper_lower, args.right_gripper_upper
     client.gripper_lower, client.gripper_upper = args.gripper_lower, args.gripper_upper

@@ -69,6 +69,12 @@ SAMPLE_SPECS: str | list[str] = "0" # 000
 DATASET_DIR = Path("/home/edemlab/challenge_ws/embodichain_ws/Embodied_Challenge/lerobot_dataset/manipulate_pipette/cobotmagic_Sim_manipulate_pipette_001")
 SAMPLE_SPECS: str | list[str] = "0" # 000
 
+DATASET_DIR = Path("/home/edemlab/challenge_ws/embodichain_ws/Embodied_Challenge/lerobot_dataset/drawer_open_place/cobotmagic_Sim_drawer_open_place_005")
+SAMPLE_SPECS: str | list[str] = "0" # 000
+
+DATASET_DIR = Path("/home/edemlab/challenge_ws/embodichain_ws/Embodied_Challenge/lerobot_dataset/open_drawer/cobotmagic_Sim_drawer_open_place_004")
+SAMPLE_SPECS: str | list[str] = "0" # 000
+
 CONFIG_PATH = ROOT / "configs" / "dual_piper_example.yaml"
 OUTPUT_DIR = ROOT / "artifacts" / "lerobot_sample_action_compare"
 FPS = 10.0

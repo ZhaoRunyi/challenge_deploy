@@ -32,6 +32,12 @@ KEYWORD = "Pi0-Embodichain-Random-Joint1Long-ClickBell-30000-0508"
 MODEL_KIND = "openpi_sim"
 KEYWORD = "Pi0-Embodichain-Random-Direct-ClickBell-30000-0508"
 
+MODEL_KIND = "openpi_sim"
+KEYWORD = "Pi0-Embodichain-Random-OpenDrawer-30000"
+
+MODEL_KIND = "openpi_sim"
+KEYWORD = "Pi0-Embodichain-Random-OpenPan-30000"
+
 RECORD_ROOTS = {"openpi": ROOT / "artifacts" / "openpi_records", "openpi_sim": ROOT / "artifacts" / "openpi_sim_records", "motus": ROOT / "artifacts" / "motus_records"}
 def safe_name(text: str) -> str:
     return re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9_.-]+", "_", text.strip())).strip("._-")

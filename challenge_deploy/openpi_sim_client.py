@@ -244,6 +244,7 @@ class OpenPiSimPiperClient:
         gripper_threshold: float | None = None,
         num_steps: int | None = None,
         old_gripper: bool = False,
+        bad_sim: bool = False,
     ) -> None:
         if control_mode != "joints":
             raise ValueError("openpi_sim only exposes joint+gripper actions; use control_mode='joints'")
@@ -253,6 +254,7 @@ class OpenPiSimPiperClient:
         self.gripper_threshold = gripper_threshold
         self.num_steps = num_steps
         self.old_gripper = old_gripper
+        self.bad_sim = bad_sim
         self._client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
 
     @property
@@ -283,7 +285,7 @@ class OpenPiSimPiperClient:
 
         left_threshold, left_lower, left_upper = getattr(self, "left_gripper_threshold", None), getattr(self, "left_gripper_lower", None), getattr(self, "left_gripper_upper", None)
         left_gripper = sim_gripper_to_piper(
-            float(action[6]),
+            float(action[6]) / 0.05 if self.bad_sim else float(action[6]),
             left_threshold if left_threshold is not None else self.gripper_threshold,
             left_lower if left_lower is not None else getattr(self, "gripper_lower", None),
             left_upper if left_upper is not None else getattr(self, "gripper_upper", None),
@@ -291,7 +293,7 @@ class OpenPiSimPiperClient:
         )
         right_threshold, right_lower, right_upper = getattr(self, "right_gripper_threshold", None), getattr(self, "right_gripper_lower", None), getattr(self, "right_gripper_upper", None)
         right_gripper = sim_gripper_to_piper(
-            float(action[13]),
+            float(action[13]) / 0.05 if self.bad_sim else float(action[13]),
             right_threshold if right_threshold is not None else self.gripper_threshold,
             right_lower if right_lower is not None else getattr(self, "gripper_lower", None),
             right_upper if right_upper is not None else getattr(self, "gripper_upper", None),
