@@ -133,6 +133,12 @@ def rotation_to_rpy(values: np.ndarray, rotation_format: str) -> np.ndarray:
     return rotation_cls.from_matrix(matrix).as_euler("xyz", degrees=False)
 
 
+def stabilize_rpy(rpy: np.ndarray, previous: np.ndarray | None) -> np.ndarray:
+    if previous is None:
+        return rpy
+    return rpy + 2 * np.pi * np.round((previous - rpy) / (2 * np.pi))
+
+
 def _hardware_gripper_to_model_raw(value: float, *, old_gripper: bool) -> float:
     if old_gripper:
         return opening_to_legacy_piper_raw_gripper(value)
@@ -294,6 +300,7 @@ class OpenPiPiperClient:
         self.ee_speed_percent = ee_speed_percent
         self.gripper_threshold = gripper_threshold
         self.old_gripper = old_gripper
+        self._previous_ee_rpy = {"left": None, "right": None}
         self._validate_control_mode()
         self._client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
 
@@ -380,7 +387,10 @@ class OpenPiPiperClient:
             else:
                 if arm_action.ee_pose is None:
                     raise ValueError(f"Decoded action for {arm_name} has no ee_pose block")
-                arm.command_end_pose(arm_action.ee_pose, speed_percent=self.ee_speed_percent)
+                pose = arm_action.ee_pose.copy()
+                pose[3:6] = stabilize_rpy(pose[3:6], self._previous_ee_rpy[arm_name])
+                self._previous_ee_rpy[arm_name] = pose[3:6].copy()
+                arm.command_end_pose(pose, speed_percent=self.ee_speed_percent)
 
     def command_first_action(self, robot: Any, response_or_actions: dict[str, Any] | np.ndarray) -> None:
         actions = (
