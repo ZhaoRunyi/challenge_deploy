@@ -7,15 +7,15 @@ import signal
 from typing import Any
 
 import numpy as np
-from openpi.policies import slai_piper_policy
+from clients import slai_piper_policy
 
-from challenge_deploy.config import load_config, set_by_dotted_path
-from challenge_deploy.lerobot_assets import (
+from hardware.config import load_config, set_by_dotted_path
+from rollout.assets import (
     dataset_asset_info,
     prepare_train_assets,
     resolve_prompt,
 )
-from challenge_deploy.openpi_client import (
+from clients.openpi import (
     ControlMode,
     OpenPiPiperClient,
     PiperPolicySpec,
@@ -24,11 +24,11 @@ from challenge_deploy.openpi_client import (
     load_piper_policy_spec,
     spec_summary,
 )
-from challenge_deploy.piper import DualPiperSystem
-from challenge_deploy.realsense import RealSenseRig
-from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema, preview_until_continue, save_frame1_image
-from challenge_deploy.runtime import DualPiperObservationSource
-from challenge_deploy.openpi_rollout import (
+from hardware import DualPiperSystem
+from hardware import RealSenseRig
+from rollout.recording import OpenPiRolloutRecorder, RecordingSchema, preview_until_continue, save_frame1_image
+from hardware import DualPiperObservationSource
+from rollout.execution import (
     action_sequence,
     resolve_chunk_size,
     run_chunk_sync_rollout,
@@ -59,10 +59,10 @@ INIT_JOINTS = np.array(
 )
 
 
-def _used_action_names(spec: PiperPolicySpec, control_mode: ControlMode) -> frozenset[str]:
-    action_space = slai_piper_policy._space_from_action_config(spec.action_space)
+def used_action_names(spec: PiperPolicySpec, control_mode: ControlMode) -> frozenset[str]:
+    action_space = slai_piper_policy.space_from_action_config(spec.action_space)
     names = slai_piper_policy.get_vector_names(spec.action_space)
-    slices = slai_piper_policy._field_slices_from_space(action_space)
+    slices = slai_piper_policy.field_slices_from_space(action_space)
     used_fields = {"gripper"}
     if control_mode == "joints":
         used_fields.add("joint")
@@ -79,22 +79,22 @@ def _used_action_names(spec: PiperPolicySpec, control_mode: ControlMode) -> froz
     return frozenset(used)
 
 
-def _make_recording_schema(spec: PiperPolicySpec, control_mode: ControlMode) -> RecordingSchema:
+def make_recording_schema(spec: PiperPolicySpec, control_mode: ControlMode) -> RecordingSchema:
     return RecordingSchema(
         camera_names=spec.image_ids,
         action_names=tuple(slai_piper_policy.get_vector_names(spec.action_space)),
         state_names=tuple(slai_piper_policy.get_vector_names(spec.state_space)),
-        used_action_names=_used_action_names(spec, control_mode),
+        used_action_names=used_action_names(spec, control_mode),
     )
 
 
-def _record_name_prefix(args: argparse.Namespace) -> str:
+def record_name_prefix(args: argparse.Namespace) -> str:
     ckpt_name = Path(args.ckpt_dir).name if args.ckpt_dir else args.train_config
     return f"{ckpt_name}_{args.control_mode}_{args.execution_mode}"
 
 
-def _install_record_signal_handlers() -> None:
-    def _raise_keyboard_interrupt(signum: int, _frame: Any) -> None:
+def install_record_signal_handlers() -> None:
+    def raise_keyboard_interrupt(signum: int, frame: Any) -> None:
         raise KeyboardInterrupt(f"received signal {signum}")
 
     for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
@@ -102,12 +102,12 @@ def _install_record_signal_handlers() -> None:
         if signal_value is None:
             continue
         try:
-            signal.signal(signal_value, _raise_keyboard_interrupt)
+            signal.signal(signal_value, raise_keyboard_interrupt)
         except (OSError, ValueError):
             pass
 
 
-def _ignore_record_signal_handlers() -> None:
+def ignore_record_signal_handlers() -> None:
     for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
         signal_value = getattr(signal, signal_name, None)
         if signal_value is None:
@@ -138,8 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional executable-scale gripper threshold. Final gripper values below this are clipped to 0.",
     )
     for side in ("left", "right"):
-        parser.add_argument(f"--{side}_gripper_threshold", *([f"--{side}_gripper_thrshold"] if side == "left" else []), dest=f"{side}_gripper_threshold", type=float, default=None)
-        parser.add_argument(f"--{side}_gripper_lower", type=float, default=None); parser.add_argument(f"--{side}_gripper_upper", type=float, default=None)
+        typo_aliases = [f"--{side}_gripper_thrshold"] if side == "left" else []
+        parser.add_argument(
+            f"--{side}_gripper_threshold",
+            *typo_aliases,
+            dest=f"{side}_gripper_threshold",
+            type=float,
+            default=None,
+        )
+        parser.add_argument(f"--{side}_gripper_lower", type=float, default=None)
+        parser.add_argument(f"--{side}_gripper_upper", type=float, default=None)
     parser.add_argument("--gripper_lower", type=float, default=None)
     parser.add_argument("--gripper_upper", type=float, default=None)
     parser.add_argument(
@@ -192,7 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+def apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     if args.left_can:
         set_by_dotted_path(config, "robot.left.can_name", args.left_can)
     if args.right_can:
@@ -208,7 +216,7 @@ def _apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -
     return config
 
 
-def _make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[Any, Any, Any]:
+def make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[Any, Any, Any]:
     robot = DualPiperSystem(
         left_can_name=config["robot"]["left"]["can_name"],
         right_can_name=config["robot"]["right"]["can_name"],
@@ -227,14 +235,14 @@ def _make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[An
     return robot, cameras, DualPiperObservationSource(robot=robot, cameras=cameras)
 
 
-def _normalized_prompt(value: str | None) -> str | None:
+def normalized_prompt(value: str | None) -> str | None:
     if value is None:
         return None
     prompt = value.strip()
     return prompt or None
 
 
-def _print_rollout_chunk_summary(
+def print_rollout_chunk_summary(
     *,
     client: OpenPiPiperClient,
     chunk_index: int,
@@ -265,7 +273,7 @@ def run_once(args: argparse.Namespace) -> None:
     print(json.dumps(spec_summary(spec), indent=2))
     if args.spec_only:
         return
-    cli_prompt = _normalized_prompt(args.prompt)
+    cli_prompt = normalized_prompt(args.prompt)
     if args.rollout_steps < 0:
         raise ValueError("--rollout-steps must be non-negative")
     if args.fps < 0.0:
@@ -318,22 +326,22 @@ def run_once(args: argparse.Namespace) -> None:
         policy_spec,
         old_gripper=args.old_gripper,
     )
-    runtime_config = _apply_runtime_overrides(load_config(args.config), args)
-    robot, cameras, source = _make_runtime(runtime_config, commands_enabled=not args.dry_run)
-    recording_schema = _make_recording_schema(spec, args.control_mode)
+    runtime_config = apply_runtime_overrides(load_config(args.config), args)
+    robot, cameras, source = make_runtime(runtime_config, commands_enabled=not args.dry_run)
+    recording_schema = make_recording_schema(spec, args.control_mode)
     saved_actions: list[np.ndarray] | None = [] if args.record else None
     recorder = (
         OpenPiRolloutRecorder(
             output_dir=args.record_dir,
             schema=recording_schema,
             fps=args.fps,
-            name_prefix=_record_name_prefix(args),
+            name_prefix=record_name_prefix(args),
         )
         if args.record
         else None
     )
     if recorder is not None:
-        _install_record_signal_handlers()
+        install_record_signal_handlers()
 
     first_obs_snapshot = None
     frame1_compare_path: Path | None = None
@@ -438,7 +446,7 @@ def run_once(args: argparse.Namespace) -> None:
         )
 
         def log_chunk(chunk_index: int, action_count: int, executed_steps: int, first_action: np.ndarray) -> None:
-            _print_rollout_chunk_summary(
+            print_rollout_chunk_summary(
                 client=client,
                 chunk_index=chunk_index,
                 action_count=action_count,
@@ -498,7 +506,7 @@ def run_once(args: argparse.Namespace) -> None:
         print("Interrupted by user; stopping rollout.", flush=True)
     finally:
         if recorder is not None:
-            _ignore_record_signal_handlers()
+            ignore_record_signal_handlers()
         if cameras is not None:
             try:
                 cameras.stop()

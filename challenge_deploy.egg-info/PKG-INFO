@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: challenge_deploy
-Version: 0.1.0
-Summary: ROS-free Piper deployment utilities for challenge_ws.
-Requires-Python: >=3.10

@@ -9,29 +9,29 @@ from typing import Any
 
 import numpy as np
 
-from challenge_deploy.config import load_config, set_by_dotted_path
-from challenge_deploy.lerobot_assets import repo_id_distribution_image_path
-from challenge_deploy.motus_client import (
+from hardware.config import load_config, set_by_dotted_path
+from rollout.assets import resolve_motus_distribution_image
+from clients import slai_piper_policy
+from clients.motus import (
     ControlMode,
     MotusPiperClient,
     MotusPolicySpec,
-    _motus_slai_policy,
     build_configured_piper_state,
     decoded_action_summary,
     load_motus_policy_spec,
     spec_summary,
 )
-from challenge_deploy.openpi_rollout import (
+from rollout.execution import (
     action_sequence,
     resolve_chunk_size,
     run_chunk_sync_rollout,
     save_rollout_metrics,
     run_temporal_smoothing_rollout,
 )
-from challenge_deploy.piper import DualPiperSystem
-from challenge_deploy.realsense import RealSenseRig
-from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema, preview_until_continue, save_frame1_image
-from challenge_deploy.runtime import DualPiperObservationSource
+from hardware import DualPiperSystem
+from hardware import RealSenseRig
+from rollout.recording import RolloutVideoRecorder, RecordingSchema, preview_until_continue, save_frame1_image
+from hardware import DualPiperObservationSource
 
 
 DEPLOY_ROOT = Path(__file__).resolve().parent
@@ -56,11 +56,11 @@ INIT_JOINTS = np.array(
 )
 
 
-def _used_action_names(spec: MotusPolicySpec, control_mode: ControlMode) -> frozenset[str]:
-    slai_policy = _motus_slai_policy()
-    action_space = slai_policy._space_from_action_config(spec.action_space)
+def used_action_names(spec: MotusPolicySpec, control_mode: ControlMode) -> frozenset[str]:
+    slai_policy = slai_piper_policy
+    action_space = slai_policy.space_from_action_config(spec.action_space)
     names = slai_policy.get_vector_names(spec.action_space)
-    slices = slai_policy._field_slices_from_space(action_space)
+    slices = slai_policy.field_slices_from_space(action_space)
     used_fields = {"gripper"}
     if control_mode == "joints":
         used_fields.add("joint")
@@ -77,23 +77,23 @@ def _used_action_names(spec: MotusPolicySpec, control_mode: ControlMode) -> froz
     return frozenset(used)
 
 
-def _make_recording_schema(spec: MotusPolicySpec, control_mode: ControlMode) -> RecordingSchema:
-    slai_policy = _motus_slai_policy()
+def make_recording_schema(spec: MotusPolicySpec, control_mode: ControlMode) -> RecordingSchema:
+    slai_policy = slai_piper_policy
     return RecordingSchema(
         camera_names=spec.image_ids,
         action_names=tuple(slai_policy.get_vector_names(spec.action_space)),
         state_names=tuple(slai_policy.get_vector_names(spec.state_space)),
-        used_action_names=_used_action_names(spec, control_mode),
+        used_action_names=used_action_names(spec, control_mode),
     )
 
 
-def _record_name_prefix(args: argparse.Namespace) -> str:
+def record_name_prefix(args: argparse.Namespace) -> str:
     ckpt_name = Path(args.ckpt_dir).name if args.ckpt_dir else Path(args.train_config).stem
     return f"{ckpt_name}_{args.control_mode}_{args.execution_mode}"
 
 
-def _install_record_signal_handlers() -> None:
-    def _raise_keyboard_interrupt(signum: int, _frame: Any) -> None:
+def install_record_signal_handlers() -> None:
+    def raise_keyboard_interrupt(signum: int, frame: Any) -> None:
         raise KeyboardInterrupt(f"received signal {signum}")
 
     for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
@@ -101,12 +101,12 @@ def _install_record_signal_handlers() -> None:
         if signal_value is None:
             continue
         try:
-            signal.signal(signal_value, _raise_keyboard_interrupt)
+            signal.signal(signal_value, raise_keyboard_interrupt)
         except (OSError, ValueError):
             pass
 
 
-def _ignore_record_signal_handlers() -> None:
+def ignore_record_signal_handlers() -> None:
     for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
         signal_value = getattr(signal, signal_name, None)
         if signal_value is None:
@@ -117,7 +117,7 @@ def _ignore_record_signal_handlers() -> None:
             pass
 
 
-def _new_session_id() -> str:
+def new_session_id() -> str:
     return f"motus_{time.strftime('%Y%m%d_%H%M%S')}"
 
 
@@ -160,8 +160,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional executable-scale gripper threshold in meters. Values below threshold close the gripper, and values above threshold command full open.",
     )
     for side in ("left", "right"):
-        parser.add_argument(f"--{side}_gripper_threshold", *([f"--{side}_gripper_thrshold"] if side == "left" else []), dest=f"{side}_gripper_threshold", type=float, default=None)
-        parser.add_argument(f"--{side}_gripper_lower", type=float, default=None); parser.add_argument(f"--{side}_gripper_upper", type=float, default=None)
+        typo_aliases = [f"--{side}_gripper_thrshold"] if side == "left" else []
+        parser.add_argument(
+            f"--{side}_gripper_threshold",
+            *typo_aliases,
+            dest=f"{side}_gripper_threshold",
+            type=float,
+            default=None,
+        )
+        parser.add_argument(f"--{side}_gripper_lower", type=float, default=None)
+        parser.add_argument(f"--{side}_gripper_upper", type=float, default=None)
     parser.add_argument("--gripper_lower", type=float, default=None)
     parser.add_argument("--gripper_upper", type=float, default=None)
     parser.add_argument(
@@ -215,14 +223,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _normalized_prompt(value: str | None) -> str | None:
+def normalized_prompt(value: str | None) -> str | None:
     if value is None:
         return None
     prompt = value.strip()
     return prompt or None
 
 
-def _apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+def apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     if args.left_can:
         set_by_dotted_path(config, "robot.left.can_name", args.left_can)
     if args.right_can:
@@ -238,7 +246,7 @@ def _apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -
     return config
 
 
-def _make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[Any, Any, Any]:
+def make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[Any, Any, Any]:
     robot = DualPiperSystem(
         left_can_name=config["robot"]["left"]["can_name"],
         right_can_name=config["robot"]["right"]["can_name"],
@@ -257,7 +265,7 @@ def _make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[An
     return robot, cameras, DualPiperObservationSource(robot=robot, cameras=cameras)
 
 
-def _print_rollout_chunk_summary(
+def print_rollout_chunk_summary(
     *,
     client: MotusPiperClient,
     chunk_index: int,
@@ -283,50 +291,12 @@ def _print_rollout_chunk_summary(
     )
 
 
-def _record_repo_id_for_distribution(spec: MotusPolicySpec) -> str | None:
-    if not spec.repo_id:
-        return None
-    owner, sep, dataset_name = str(spec.repo_id).partition("/")
-    if sep and dataset_name.startswith("Motus_"):
-        return f"{owner}/{dataset_name[len('Motus_'):]}"
-    return str(spec.repo_id)
-
-
-def _record_dataset_name_for_prompt(spec: MotusPolicySpec, prompt: str | None) -> str | None:
-    if prompt is None:
-        return None
-    task_names = spec.config.get("dataset", {}).get("task_name") or []
-    if isinstance(task_names, str):
-        task_names = [task_names]
-    manifest_path = DEPLOY_ROOT.parent / "baselines" / "Motus" / "t5_prompt_cache" / "prompt_cache_manifest.json"
-    for dataset in json.loads(manifest_path.read_text(encoding="utf-8")).get("datasets", []) if manifest_path.exists() else []:
-        dataset_name = str(dataset.get("dataset_name") or Path(str(dataset.get("dataset_root", ""))).name)
-        if task_names and dataset_name not in task_names:
-            continue
-        if any(str(item.get("prompt", "")).strip() == prompt for item in dataset.get("prompts", [])):
-            return dataset_name
-    return None
-
-
-def _resolve_motus_distribution_image(spec: MotusPolicySpec, prompt: str | None = None) -> tuple[Path | None, str | None]:
-    repo_id = _record_repo_id_for_distribution(spec)
-    matched_task = _record_dataset_name_for_prompt(spec, prompt)
-    if matched_task:
-        repo_id = f"{Path(spec.config['dataset']['params']['root']).name}/{matched_task.removeprefix('Motus_')}"
-    if repo_id is None:
-        return None, "train config does not define dataset.params.repo_id"
-    distribution_image_path = repo_id_distribution_image_path(repo_id)
-    if distribution_image_path.exists():
-        return distribution_image_path, None
-    return None, f"train distribution image not found: {distribution_image_path}"
-
-
 def run_once(args: argparse.Namespace) -> None:
     spec = load_motus_policy_spec(args.train_config)
     print(json.dumps(spec_summary(spec), indent=2))
     if args.spec_only:
         return
-    cli_prompt = _normalized_prompt(args.prompt)
+    cli_prompt = normalized_prompt(args.prompt)
     if args.rollout_steps < 0:
         raise ValueError("--rollout-steps must be non-negative")
     if args.fps < 0.0:
@@ -385,30 +355,30 @@ def run_once(args: argparse.Namespace) -> None:
         flush=True,
     )
 
-    runtime_config = _apply_runtime_overrides(load_config(args.config), args)
-    robot, cameras, source = _make_runtime(runtime_config, commands_enabled=not args.dry_run)
-    recording_schema = _make_recording_schema(spec, args.control_mode)
+    runtime_config = apply_runtime_overrides(load_config(args.config), args)
+    robot, cameras, source = make_runtime(runtime_config, commands_enabled=not args.dry_run)
+    recording_schema = make_recording_schema(spec, args.control_mode)
     saved_actions: list[np.ndarray] | None = [] if args.record else None
     recorder = (
-        OpenPiRolloutRecorder(
+        RolloutVideoRecorder(
             output_dir=args.record_dir,
             schema=recording_schema,
             fps=args.fps,
-            name_prefix=_record_name_prefix(args),
+            name_prefix=record_name_prefix(args),
         )
         if args.record
         else None
     )
     if recorder is not None:
-        _install_record_signal_handlers()
+        install_record_signal_handlers()
 
     first_obs_snapshot = None
     frame1_path = None
     distribution_image_path = None
     distribution_skip_reason = None
     if recorder is not None or args.window:
-        distribution_image_path, distribution_skip_reason = _resolve_motus_distribution_image(spec, resolved_prompt)
-    session_id = _new_session_id()
+        distribution_image_path, distribution_skip_reason = resolve_motus_distribution_image(spec, resolved_prompt)
+    session_id = new_session_id()
     client.set_default_session_id(session_id)
     metrics = None
     robot.connect(read_only=args.dry_run)
@@ -517,7 +487,7 @@ def run_once(args: argparse.Namespace) -> None:
         )
 
         def log_chunk(chunk_index: int, action_count: int, executed_steps: int, first_action: np.ndarray) -> None:
-            _print_rollout_chunk_summary(
+            print_rollout_chunk_summary(
                 client=client,
                 chunk_index=chunk_index,
                 action_count=action_count,
@@ -576,7 +546,7 @@ def run_once(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         print("Interrupted by user; stopping rollout.", flush=True)
     finally:
-        _ignore_record_signal_handlers()
+        ignore_record_signal_handlers()
         if cameras is not None:
             try:
                 cameras.stop()

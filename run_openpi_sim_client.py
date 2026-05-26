@@ -10,10 +10,10 @@ from typing import Any
 
 import numpy as np
 
-from challenge_deploy.config import load_config, set_by_dotted_path
-from challenge_deploy.lerobot_assets import dataset_asset_info, prepare_train_assets, resolve_prompt
-from challenge_deploy.rollout_metrics import save_rollout_metrics_summary
-from challenge_deploy.openpi_sim_client import (
+from hardware.config import load_config, set_by_dotted_path
+from rollout.assets import dataset_asset_info, prepare_train_assets, resolve_prompt
+from rollout.metrics import save_rollout_metrics_summary
+from clients.openpi_sim import (
     SIM_ACTION_NAMES,
     SIM_STATE_NAMES,
     OpenPiSimPiperClient,
@@ -24,11 +24,11 @@ from challenge_deploy.openpi_sim_client import (
     sim_gripper_to_piper,
     spec_summary,
 )
-from challenge_deploy.piper import DualPiperSystem
-from challenge_deploy.realsense import RealSenseRig
-from challenge_deploy.recording import OpenPiRolloutRecorder, RecordingSchema, preview_until_continue, save_frame1_image
-from challenge_deploy.runtime import DualPiperObservationSource
-from challenge_deploy.schemas import RobotSnapshot
+from hardware import DualPiperSystem
+from hardware import RealSenseRig
+from rollout.recording import OpenPiRolloutRecorder, RecordingSchema, preview_until_continue, save_frame1_image
+from hardware import DualPiperObservationSource
+from hardware.schemas import RobotSnapshot
 
 DEPLOY_ROOT = Path(__file__).resolve().parent
 INIT_EMBODICHAIN_QPOS = np.array(
@@ -72,7 +72,7 @@ INIT_EMBODICHAIN_QPOS = np.array(
 )
 
 
-def _initial_piper_joints(*, old_gripper: bool = False) -> np.ndarray:
+def initial_piper_joints(*, old_gripper: bool = False) -> np.ndarray:
     qpos = INIT_EMBODICHAIN_QPOS.copy()
     qpos[[6, 13]] = [
         sim_gripper_to_piper(qpos[6], old_gripper=old_gripper),
@@ -108,7 +108,7 @@ class RolloutMetrics:
         self.stop_reason = reason or "KeyboardInterrupt"
 
     @staticmethod
-    def _stats(values: list[float]) -> dict[str, float | None]:
+    def stats(values: list[float]) -> dict[str, float | None]:
         if not values:
             return {"mean": None, "p50": None, "p95": None, "max": None}
         arr = np.asarray(values, dtype=np.float64)
@@ -125,9 +125,9 @@ class RolloutMetrics:
             "executed_steps": self.executed_steps,
             "inferred_chunks": self.inferred_chunks,
             "rollout_wall_seconds": float(time.monotonic() - self.rollout_started_at_s),
-            "inference_seconds": self._stats(self.inference_seconds),
-            "command_period_seconds": self._stats(self.command_period_seconds),
-            "command_seconds": self._stats(self.command_seconds),
+            "inference_seconds": self.stats(self.inference_seconds),
+            "command_period_seconds": self.stats(self.command_period_seconds),
+            "command_seconds": self.stats(self.command_seconds),
             "interrupted": self.interrupted,
             "stop_reason": self.stop_reason,
         }
@@ -187,8 +187,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional executable-scale gripper threshold. Final gripper values below this are clipped to 0.",
     )
     for side in ("left", "right"):
-        parser.add_argument(f"--{side}_gripper_threshold", *([f"--{side}_gripper_thrshold"] if side == "left" else []), dest=f"{side}_gripper_threshold", type=float, default=None)
-        parser.add_argument(f"--{side}_gripper_lower", type=float, default=None); parser.add_argument(f"--{side}_gripper_upper", type=float, default=None)
+        typo_aliases = [f"--{side}_gripper_thrshold"] if side == "left" else []
+        parser.add_argument(
+            f"--{side}_gripper_threshold",
+            *typo_aliases,
+            dest=f"{side}_gripper_threshold",
+            type=float,
+            default=None,
+        )
+        parser.add_argument(f"--{side}_gripper_lower", type=float, default=None)
+        parser.add_argument(f"--{side}_gripper_upper", type=float, default=None)
     parser.add_argument("--gripper_lower", type=float, default=None)
     parser.add_argument("--gripper_upper", type=float, default=None)
     parser.add_argument(
@@ -243,7 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+def apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     if args.left_can:
         set_by_dotted_path(config, "robot.left.can_name", args.left_can)
     if args.right_can:
@@ -259,7 +267,7 @@ def _apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -
     return config
 
 
-def _make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[Any, Any, Any]:
+def make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[Any, Any, Any]:
     robot = DualPiperSystem(
         left_can_name=config["robot"]["left"]["can_name"],
         right_can_name=config["robot"]["right"]["can_name"],
@@ -278,14 +286,14 @@ def _make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[An
     return robot, cameras, DualPiperObservationSource(robot=robot, cameras=cameras)
 
 
-def _normalized_prompt(value: str | None) -> str | None:
+def normalized_prompt(value: str | None) -> str | None:
     if value is None:
         return None
     prompt = value.strip()
     return prompt or None
 
 
-def _make_recording_schema(spec: OpenPiSimPolicySpec) -> RecordingSchema:
+def make_recording_schema(spec: OpenPiSimPolicySpec) -> RecordingSchema:
     return RecordingSchema(
         camera_names=spec.image_ids,
         action_names=SIM_ACTION_NAMES,
@@ -294,13 +302,13 @@ def _make_recording_schema(spec: OpenPiSimPolicySpec) -> RecordingSchema:
     )
 
 
-def _record_name_prefix(args: argparse.Namespace) -> str:
+def record_name_prefix(args: argparse.Namespace) -> str:
     ckpt_name = Path(args.ckpt_dir).name if args.ckpt_dir else args.train_config
     return f"{ckpt_name}_{args.control_mode}_{args.execution_mode}"
 
 
-def _install_record_signal_handlers() -> None:
-    def _raise_keyboard_interrupt(signum: int, _frame: Any) -> None:
+def install_record_signal_handlers() -> None:
+    def raise_keyboard_interrupt(signum: int, frame: Any) -> None:
         raise KeyboardInterrupt(f"received signal {signum}")
 
     for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
@@ -308,12 +316,12 @@ def _install_record_signal_handlers() -> None:
         if signal_value is None:
             continue
         try:
-            signal.signal(signal_value, _raise_keyboard_interrupt)
+            signal.signal(signal_value, raise_keyboard_interrupt)
         except (OSError, ValueError):
             pass
 
 
-def _ignore_record_signal_handlers() -> None:
+def ignore_record_signal_handlers() -> None:
     for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
         signal_value = getattr(signal, signal_name, None)
         if signal_value is None:
@@ -324,7 +332,7 @@ def _ignore_record_signal_handlers() -> None:
             pass
 
 
-def _snapshot_with_grippers(snapshot: RobotSnapshot, grippers: np.ndarray) -> RobotSnapshot:
+def snapshot_with_grippers(snapshot: RobotSnapshot, grippers: np.ndarray) -> RobotSnapshot:
     grippers = np.asarray(grippers, dtype=np.float64)
     snapshot.state.left.qpos = snapshot.state.left.qpos.copy()
     snapshot.state.right.qpos = snapshot.state.right.qpos.copy()
@@ -333,7 +341,7 @@ def _snapshot_with_grippers(snapshot: RobotSnapshot, grippers: np.ndarray) -> Ro
     return snapshot
 
 
-def _configured_state_after_command(
+def configured_state_after_command(
     robot: Any,
     spec: OpenPiSimPolicySpec,
     grippers: np.ndarray,
@@ -341,11 +349,11 @@ def _configured_state_after_command(
     old_gripper: bool = False,
 ) -> np.ndarray:
     snapshot = RobotSnapshot(timestamp_s=time.time(), state=robot.read_state(), images={})
-    snapshot = _snapshot_with_grippers(snapshot, grippers)
+    snapshot = snapshot_with_grippers(snapshot, grippers)
     return build_configured_piper_state(snapshot, spec, old_gripper=old_gripper)
 
 
-def _print_rollout_chunk_summary(
+def print_rollout_chunk_summary(
     *,
     client: OpenPiSimPiperClient,
     chunk_index: int,
@@ -399,7 +407,7 @@ def run_chunk_sync_rollout(
         while rollout_steps == 0 or metrics.executed_steps < rollout_steps:
             inference_start_s = time.monotonic()
             chunk_snapshot = next_snapshot if next_snapshot is not None else source.capture_snapshot()
-            chunk_snapshot = _snapshot_with_grippers(chunk_snapshot, last_grippers)
+            chunk_snapshot = snapshot_with_grippers(chunk_snapshot, last_grippers)
             next_snapshot = None
             actions = trim_chunk(client.infer_actions(chunk_snapshot, prompt=prompt), chunk_size)
             metrics.record_inference(time.monotonic() - inference_start_s)
@@ -410,7 +418,7 @@ def run_chunk_sync_rollout(
             if requested_actions <= 0:
                 break
 
-            _print_rollout_chunk_summary(
+            print_rollout_chunk_summary(
                 client=client,
                 chunk_index=chunk_index,
                 action_count=requested_actions,
@@ -422,7 +430,7 @@ def run_chunk_sync_rollout(
                 action_start_s = time.monotonic()
                 period_seconds = None if last_command_start_s is None else action_start_s - last_command_start_s
                 last_command_start_s = action_start_s
-                frame_snapshot = chunk_snapshot if action_index == 0 else _snapshot_with_grippers(
+                frame_snapshot = chunk_snapshot if action_index == 0 else snapshot_with_grippers(
                     source.capture_snapshot(),
                     last_grippers,
                 )
@@ -439,7 +447,7 @@ def run_chunk_sync_rollout(
                     recorder.record(
                         images=frame_snapshot.images,
                         action=action,
-                        state=_configured_state_after_command(
+                        state=configured_state_after_command(
                             robot,
                             spec,
                             last_grippers,
@@ -458,7 +466,7 @@ def run_chunk_sync_rollout(
     return metrics
 
 
-def _save_metrics(metrics_summary: dict[str, Any], *, args: argparse.Namespace, recorder: OpenPiRolloutRecorder | None) -> None:
+def save_metrics(metrics_summary: dict[str, Any], *, args: argparse.Namespace, recorder: OpenPiRolloutRecorder | None) -> None:
     save_rollout_metrics_summary(
         metrics_summary,
         metrics_json_path=args.metrics_json,
@@ -472,7 +480,7 @@ def run_once(args: argparse.Namespace) -> None:
     print(json.dumps(spec_summary(spec), indent=2), flush=True)
     if args.spec_only:
         return
-    cli_prompt = _normalized_prompt(args.prompt)
+    cli_prompt = normalized_prompt(args.prompt)
     if args.rollout_steps < 0:
         raise ValueError("--rollout-steps must be non-negative")
     if args.fps < 0.0:
@@ -522,22 +530,22 @@ def run_once(args: argparse.Namespace) -> None:
     client.left_gripper_threshold, client.right_gripper_threshold, client.left_gripper_lower, client.left_gripper_upper, client.right_gripper_lower, client.right_gripper_upper = args.left_gripper_threshold, args.right_gripper_threshold, args.left_gripper_lower, args.left_gripper_upper, args.right_gripper_lower, args.right_gripper_upper
     client.gripper_lower, client.gripper_upper = args.gripper_lower, args.gripper_upper
 
-    runtime_config = _apply_runtime_overrides(load_config(args.config), args)
-    robot, cameras, source = _make_runtime(runtime_config, commands_enabled=not args.dry_run)
-    recording_schema = _make_recording_schema(spec)
+    runtime_config = apply_runtime_overrides(load_config(args.config), args)
+    robot, cameras, source = make_runtime(runtime_config, commands_enabled=not args.dry_run)
+    recording_schema = make_recording_schema(spec)
     saved_actions: list[np.ndarray] | None = [] if args.record else None
     recorder = (
         OpenPiRolloutRecorder(
             output_dir=args.record_dir,
             schema=recording_schema,
             fps=args.fps,
-            name_prefix=_record_name_prefix(args),
+            name_prefix=record_name_prefix(args),
         )
         if args.record
         else None
     )
     if recorder is not None:
-        _install_record_signal_handlers()
+        install_record_signal_handlers()
 
     first_obs_snapshot = None
     frame1_path = None
@@ -582,10 +590,10 @@ def run_once(args: argparse.Namespace) -> None:
             print("Warning: Piper arm enable check did not report success; continuing anyway.", flush=True)
 
         chunk_size = resolve_chunk_size(spec, args.chunk_size)
-        initial_joints = _initial_piper_joints(old_gripper=args.old_gripper)
+        initial_joints = initial_piper_joints(old_gripper=args.old_gripper)
         print(json.dumps({"initial_pose": {"qpos": initial_joints.tolist()}}, indent=2), flush=True)
         robot.move_to_joint_positions(initial_joints, speed_percent=args.joint_speed_percent)
-        first_obs_snapshot = _snapshot_with_grippers(source.capture_snapshot(), initial_joints[[6, 13]])
+        first_obs_snapshot = snapshot_with_grippers(source.capture_snapshot(), initial_joints[[6, 13]])
         if recorder is not None:
             distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
             frame1_path = save_frame1_image(
@@ -636,12 +644,12 @@ def run_once(args: argparse.Namespace) -> None:
             print("Interrupted by user; stopping rollout.", flush=True)
         metrics_summary = metrics.summary()
         print(json.dumps({"rollout_metrics": metrics_summary}, indent=2), flush=True)
-        _save_metrics(metrics_summary, args=args, recorder=recorder)
+        save_metrics(metrics_summary, args=args, recorder=recorder)
     except KeyboardInterrupt:
         print("Interrupted by user; stopping rollout.", flush=True)
     finally:
         if recorder is not None:
-            _ignore_record_signal_handlers()
+            ignore_record_signal_handlers()
         if cameras is not None:
             try:
                 cameras.stop()
