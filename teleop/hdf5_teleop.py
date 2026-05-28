@@ -187,16 +187,37 @@ def infer_language_instruction(task_name: str, explicit: str | None = None) -> s
     return task_name.replace("_", " ").strip() or task_name
 
 
+def path_episode_index(path: Path) -> int | None:
+    name = path.stem if path.suffix == ".hdf5" else path.name
+    prefix = "episode_"
+    if not name.startswith(prefix):
+        return None
+    suffix = name[len(prefix):]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
 def next_episode_index(dataset_root: str | Path) -> int:
     root = Path(dataset_root)
-    existing = sorted(root.glob("episode_*.hdf5"))
-    if not existing:
-        return 0
-    return max(int(path.stem.split("_")[-1]) for path in existing) + 1
+    indices = []
+    for path in root.glob("episode_*"):
+        episode_index = path_episode_index(path)
+        if episode_index is not None and (path.is_dir() or path.suffix == ".hdf5"):
+            indices.append(episode_index)
+    return max(indices) + 1 if indices else 0
+
+
+def episode_directory(dataset_root: str | Path, episode_idx: int) -> Path:
+    return Path(dataset_root) / f"episode_{episode_idx}"
+
+
+def episode_base_path(dataset_root: str | Path, episode_idx: int) -> Path:
+    return episode_directory(dataset_root, episode_idx) / f"episode_{episode_idx}"
 
 
 def running_sentinel_path(dataset_root: str | Path, episode_idx: int) -> Path:
-    return Path(dataset_root) / f"episode_{episode_idx}_running.txt"
+    return episode_directory(dataset_root, episode_idx) / f"episode_{episode_idx}_running.txt"
 
 
 def encode_color_image(image: np.ndarray, *, jpeg_quality: int) -> np.ndarray:
@@ -324,6 +345,7 @@ class HDF5TeleopCollectionSource:
         self.trace_lock = threading.Lock()
         self.sample_history: dict[str, list[float]] = {}
         self.selected_history: list[dict[str, float]] = []
+        self.stationary_intervals: list[dict[str, float]] = []
         self.started = False
 
     def start(self) -> None:
@@ -375,12 +397,18 @@ class HDF5TeleopCollectionSource:
             return {
                 "stack_timestamps_s": {name: list(values) for name, values in self.sample_history.items()},
                 "selected_timestamps_s": [dict(values) for values in self.selected_history],
+                "stationary_intervals_s": [dict(values) for values in self.stationary_intervals],
             }
+
+    def append_stationary_interval(self, start_s: float, end_s: float) -> None:
+        with self.trace_lock:
+            self.stationary_intervals.append({"start_s": float(start_s), "end_s": float(end_s)})
 
     def reset_trace(self) -> None:
         with self.trace_lock:
             self.sample_history.clear()
             self.selected_history.clear()
+            self.stationary_intervals.clear()
 
     def run_camera_sampler(self, camera_name: str) -> None:
         while not self.stop_event.is_set():
@@ -558,12 +586,24 @@ def collect_hdf5_teleop_episode(
     target_frame_count = None if max_timesteps is None else max_timesteps + 1
     last_master_state: DualPiperState | None = None
     skipped_stationary = 0
+    stationary_start_s: float | None = None
+    stationary_end_s: float | None = None
     print_sync_failure = True
+
+    def close_stationary_interval() -> None:
+        nonlocal stationary_start_s, stationary_end_s
+        if stationary_start_s is not None and stationary_end_s is not None:
+            source.append_stationary_interval(stationary_start_s, stationary_end_s)
+        stationary_start_s = None
+        stationary_end_s = None
+
     try:
         while target_frame_count is None or len(frames) < target_frame_count:
             if running_sentinel is not None and not running_sentinel.exists():
+                close_stationary_interval()
                 break
             if stop_requested is not None and stop_requested():
+                close_stationary_interval()
                 break
             frame = source.get_frame()
             if frame is None:
@@ -575,16 +615,21 @@ def collect_hdf5_teleop_episode(
             print_sync_failure = True
             if skip_stationary and last_master_state is not None and not dual_piper_state_moved(frame.master_state, last_master_state, stationary_tolerance):
                 skipped_stationary += 1
+                if stationary_start_s is None:
+                    stationary_start_s = frame.timestamp_s
+                stationary_end_s = frame.timestamp_s
                 if skipped_stationary == 1 or skipped_stationary % 30 == 0:
                     print(f"Master arms are stationary, skipped {skipped_stationary} frame(s).", flush=True)
                 time.sleep(1.0 / fps)
                 continue
+            close_stationary_interval()
             skipped_stationary = 0
             last_master_state = frame.master_state
             frames.append(frame)
             print(f"Frame data: {len(frames)}", flush=True)
             time.sleep(1.0 / fps)
     finally:
+        close_stationary_interval()
         if running_sentinel is not None and running_sentinel.exists():
             running_sentinel.unlink()
     return frames
@@ -597,6 +642,7 @@ def save_hdf5_teleop_episode(
     language_instruction: str,
     include_depth_images: bool = False,
     jpeg_quality: int = 95,
+    action_from_state: bool = False,
 ) -> Path:
     if len(frames) < 2:
         raise ValueError("At least 2 frames are required to build an HDF5 teleop episode")
@@ -663,7 +709,9 @@ def save_hdf5_teleop_episode(
             eef_6d[index] = dual_eef_6d(observation_frame.puppet_pose_state, observation_frame.puppet_state)
             eef_left_time[index] = float(observation_frame.timestamp_s - frame0_time)
             eef_right_time[index] = float(observation_frame.timestamp_s - frame0_time)
-            action[index] = dual_state_vector_32(action_frame.master_state, master_stable_poses[index + 1])
+            action_state = action_frame.puppet_state if action_from_state else action_frame.master_state
+            action_poses = puppet_stable_poses if action_from_state else master_stable_poses
+            action[index] = dual_state_vector_32(action_state, action_poses[index + 1])
             base_action[index] = np.array([0.0, 0.0], dtype=np.float64)
 
             for name in source_timestamp_names:
@@ -687,6 +735,8 @@ def save_hdf5_teleop_record_video(
     output_dir: str | Path,
     fps: float,
     name_prefix: str,
+    action_from_state: bool = False,
+    output_path: str | Path | None = None,
 ) -> Path | None:
     if len(frames) < 2:
         return None
@@ -703,6 +753,10 @@ def save_hdf5_teleop_record_video(
         schema=schema,
         fps=fps,
         name_prefix=name_prefix,
+        output_path=output_path,
+        keep_frames_in_memory=True,
+        video_codec="libx264",
+        video_output_params=("-preset", "veryfast", "-crf", "18"),
     )
     puppet_stable_poses = stable_eef_positions([frame.puppet_pose_state for frame in frames])
     master_stable_poses = stable_eef_positions([frame.master_state for frame in frames])
@@ -712,7 +766,10 @@ def save_hdf5_teleop_record_video(
         recorder.record(
             images=observation_frame.images,
             state=dual_state_vector_32(observation_frame.puppet_state, puppet_stable_poses[index]),
-            action=dual_state_vector_32(action_frame.master_state, master_stable_poses[index + 1]),
+            action=dual_state_vector_32(
+                action_frame.puppet_state if action_from_state else action_frame.master_state,
+                (puppet_stable_poses if action_from_state else master_stable_poses)[index + 1],
+            ),
             timestamp_s=observation_frame.timestamp_s,
         )
     return recorder.finalize()
@@ -753,46 +810,107 @@ def alignment_plot_indices(total_frames: int, plot_frames: int) -> list[int]:
     return sorted(set(int(index) for index in indices))
 
 
-def draw_alignment_plot(path: Path, stack_timestamps: dict[str, list[float]], selected_timestamps: list[dict[str, float]], plot_frames: int) -> None:
+def draw_alignment_plot(
+    path: Path,
+    stack_timestamps: dict[str, list[float]],
+    selected_timestamps: list[dict[str, float]],
+    plot_frames: int,
+    stationary_intervals: list[dict[str, float]] | None = None,
+) -> None:
     topic_names = sorted(stack_timestamps)
     if not topic_names:
         return
     all_times = [timestamp for values in stack_timestamps.values() for timestamp in values]
     if not all_times:
         return
-    plotted_indices = alignment_plot_indices(len(selected_timestamps), plot_frames)
-    start_s, end_s = min(all_times), max(all_times)
-    span_s = max(end_s - start_s, 1e-6)
-    width = 1800
-    row_height = 32
-    left_margin = 260
-    image = np.full((80 + row_height * len(topic_names), width, 3), 255, dtype=np.uint8)
-    cv2.putText(image, f"alignment trace plotted={len(plotted_indices)}/{len(selected_timestamps)} span={span_s:.3f}s", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-    topic_y = {name: 60 + index * row_height for index, name in enumerate(topic_names)}
 
-    def x_value(timestamp_s: float) -> int:
-        return int(left_margin + (float(timestamp_s) - start_s) / span_s * (width - left_margin - 30))
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plotted_indices = alignment_plot_indices(len(selected_timestamps), plot_frames)
+    if selected_timestamps:
+        start_s = selected_timestamps[0].get("frame_time", min(all_times))
+    else:
+        start_s = min(all_times)
+    end_s = max(all_times)
+    span_s = max(end_s - start_s, 1e-6)
+
+    fig_height = max(4.0, len(topic_names) * 0.7 + 2.0)
+    fig, ax = plt.subplots(figsize=(20, fig_height), dpi=150)
+    colors = plt.cm.tab10(np.linspace(0.0, 1.0, max(1, len(topic_names))))
+    topic_y = {name: index for index, name in enumerate(topic_names)}
+    stationary_intervals = stationary_intervals or []
+    selected_frame_times = [float(item["frame_time"]) for item in selected_timestamps if "frame_time" in item]
+    if len(selected_frame_times) >= 2:
+        default_interval_width_s = float(np.median(np.diff(np.asarray(selected_frame_times, dtype=np.float64))))
+    else:
+        default_interval_width_s = 1.0 / 30.0
+
+    for interval in stationary_intervals:
+        interval_start = max(0.0, float(interval["start_s"]) - start_s)
+        interval_end = max(interval_start + default_interval_width_s, float(interval["end_s"]) - start_s)
+        for y in range(len(topic_names)):
+            ax.fill_between(
+                [interval_start, interval_end],
+                y - 0.36,
+                y + 0.36,
+                color="lightgray",
+                alpha=0.35,
+                linewidth=0,
+                zorder=0,
+            )
+
+    for topic_index, name in enumerate(topic_names):
+        timestamps = np.asarray(stack_timestamps.get(name, []), dtype=np.float64)
+        if timestamps.size == 0:
+            continue
+        valid_timestamps = timestamps[timestamps >= start_s]
+        relative_times = valid_timestamps - start_s
+        y_values = np.full(relative_times.shape, topic_y[name], dtype=np.float64)
+        ax.scatter(relative_times, y_values, marker=".", color=colors[topic_index], s=10, alpha=0.22, zorder=2)
+
+    selected_by_topic = {name: [] for name in topic_names}
+    for item in selected_timestamps:
+        for name in topic_names:
+            if name in item:
+                selected_by_topic[name].append(float(item[name]) - start_s)
 
     for name in topic_names:
         y = topic_y[name]
-        cv2.putText(image, name, (10, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
-        cv2.line(image, (left_margin, y), (width - 20, y), (220, 220, 220), 1)
-        for timestamp_s in stack_timestamps.get(name, []):
-            cv2.circle(image, (x_value(timestamp_s), y), 2, (170, 170, 170), -1)
+        times = np.asarray(selected_by_topic[name], dtype=np.float64)
+        if times.size == 0:
+            continue
+        y_values = np.full(times.shape, y, dtype=np.float64)
+        ax.scatter(times, y_values, marker="|", color=colors[y], s=90, linewidths=2, zorder=3)
+
     for frame_index in plotted_indices:
         item = selected_timestamps[frame_index]
         points = []
         for name in topic_names:
-            if name not in item:
-                continue
-            x, y = x_value(item[name]), topic_y[name]
-            cv2.rectangle(image, (x - 5, y - 7), (x + 5, y + 7), (0, 0, 255), 1)
-            points.append((x, y))
-        for start, end in zip(points, points[1:]):
-            cv2.line(image, start, end, (0, 0, 255), 1)
-        if "frame_time" in item:
-            cv2.putText(image, str(frame_index), (x_value(item["frame_time"]), 55), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 180), 1)
-    cv2.imwrite(str(path), image)
+            if name in item:
+                points.append((float(item[name]) - start_s, topic_y[name]))
+        if not points:
+            continue
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        ax.plot(xs, ys, color="red", alpha=0.85, linewidth=1.4, marker="o", markersize=3, zorder=4)
+        ax.text(sum(xs) / len(xs), -0.55, f"Frm{frame_index}", color="red", fontsize=8, ha="center")
+
+    ax.set_yticks(range(len(topic_names)))
+    ax.set_yticklabels(topic_names, fontsize=9)
+    ax.set_xlabel("Time (seconds) relative to first selected frame", fontsize=11)
+    ax.set_title(
+        f"Alignment trace\nframes={len(selected_timestamps)}, plotted={len(plotted_indices)}, span={span_s:.3f}s",
+        fontsize=13,
+    )
+    ax.set_xlim(left=0.0)
+    ax.invert_yaxis()
+    ax.grid(True, axis="x", alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
 
 
 def save_alignment_diagnostics(episode_path: str | Path, frames: Sequence[HDF5TeleopCaptureFrame], trace: dict[str, Any], plot_frames: int = 16) -> tuple[Path, Path]:
@@ -804,6 +922,7 @@ def save_alignment_diagnostics(episode_path: str | Path, frames: Sequence[HDF5Te
     image_path = episode_path.with_name(stem + ".png")
     selected = [dict(frame.source_timestamps) for frame in frames[:data_frames]]
     stack = {name: [float(value) for value in values] for name, values in trace.get("stack_timestamps_s", {}).items()}
+    stationary_intervals = [dict(values) for values in trace.get("stationary_intervals_s", [])]
     plotted_indices = alignment_plot_indices(len(selected), plot_frames)
     payload = {
         "episode_path": str(episode_path),
@@ -813,9 +932,10 @@ def save_alignment_diagnostics(episode_path: str | Path, frames: Sequence[HDF5Te
         "metrics": alignment_metrics(selected),
         "stack_timestamps_s": stack,
         "selected_timestamps_s": selected,
+        "stationary_intervals_s": stationary_intervals,
     }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    draw_alignment_plot(image_path, stack, selected, plot_frames)
+    draw_alignment_plot(image_path, stack, selected, plot_frames, stationary_intervals=stationary_intervals)
     return json_path, image_path
 
 def load_hdf5_teleop_episode(path: str | Path) -> HDF5TeleopLoadedEpisode:
@@ -827,9 +947,9 @@ def load_hdf5_teleop_episode(path: str | Path) -> HDF5TeleopLoadedEpisode:
         if language_raw is None:
             language_instruction = None
         elif isinstance(language_raw, np.ndarray):
-            language_instruction = str(language_raw[0]) if len(language_raw) > 0 else None
+            language_instruction = language_raw[0].decode("utf-8") if len(language_raw) > 0 and isinstance(language_raw[0], bytes) else (str(language_raw[0]) if len(language_raw) > 0 else None)
         else:
-            language_instruction = str(language_raw)
+            language_instruction = language_raw.decode("utf-8") if isinstance(language_raw, bytes) else str(language_raw)
 
         images = {
             camera_name: [decode_color_image(value) if compressed else np.asarray(value).copy() for value in root[f"/observations/images/{camera_name}"][()]]
@@ -885,28 +1005,46 @@ def save_hdf5_teleop_episode_preview(
     fps: int = 30,
     overwrite: bool = False,
 ) -> Path:
-    episode = load_hdf5_teleop_episode(input_path)
-    if set(("cam_high", "cam_left_wrist", "cam_right_wrist")) - set(episode.camera_names):
-        raise ValueError(
-            f"Expected cam_high/cam_left_wrist/cam_right_wrist in episode, got {episode.camera_names}"
-        )
-
     input_path = Path(input_path)
     output_path = input_path.with_suffix(".mp4") if output_path is None else Path(output_path)
     if output_path.exists() and not overwrite:
         return output_path
 
-    writer = imageio.get_writer(output_path, fps=fps)
-    try:
-        frame_count = len(episode.images["cam_high"])
-        for index in range(frame_count):
-            writer.append_data(
-                compose_episode_vis_frame(
-                    episode.images["cam_high"][index],
-                    episode.images["cam_left_wrist"][index],
-                    episode.images["cam_right_wrist"][index],
-                )[..., ::-1]
+    with h5py.File(input_path, "r") as root:
+        image_group = root["/observations/images"]
+        camera_names = tuple(image_group.keys())
+        if set(("cam_high", "cam_left_wrist", "cam_right_wrist")) - set(camera_names):
+            raise ValueError(
+                f"Expected cam_high/cam_left_wrist/cam_right_wrist in episode, got {camera_names}"
             )
-    finally:
-        writer.close()
+        frame_count = int(image_group["cam_high"].shape[0])
+
+        def write_video(codec: str, output_params: list[str]) -> None:
+            writer = imageio.get_writer(
+                tmp_output,
+                fps=fps,
+                codec=codec,
+                macro_block_size=1,
+                output_params=output_params,
+                ffmpeg_log_level="error",
+            )
+            try:
+                for index in range(frame_count):
+                    frame = compose_episode_vis_frame(
+                        decode_color_image(image_group["cam_high"][index]),
+                        decode_color_image(image_group["cam_left_wrist"][index]),
+                        decode_color_image(image_group["cam_right_wrist"][index]),
+                    )
+                    writer.append_data(frame[..., ::-1])
+            finally:
+                writer.close()
+
+        tmp_output = output_path.with_suffix(".tmp.mp4")
+        try:
+            write_video("libx264", ["-preset", "slow", "-crf", "0", "-pix_fmt", "yuv444p"])
+        except Exception:
+            tmp_output.unlink(missing_ok=True)
+            write_video("libx264", ["-preset", "slow", "-crf", "8", "-pix_fmt", "yuv420p"])
+
+    tmp_output.replace(output_path)
     return output_path

@@ -49,6 +49,27 @@ def joint_values_from_sdk(joint_state: Any) -> np.ndarray:
     )
 
 
+def fk_links_to_end_pose(fk_links: Any, fallback_pose: np.ndarray, gripper_opening: float) -> np.ndarray:
+    try:
+        link_pose = np.asarray(fk_links[-1], dtype=np.float64)
+    except Exception:
+        return fallback_pose.copy()
+    if link_pose.shape[0] < 6 or np.allclose(link_pose[:6], 0.0, atol=1e-9):
+        return fallback_pose.copy()
+    return np.array(
+        [
+            link_pose[0] / 1000.0,
+            link_pose[1] / 1000.0,
+            link_pose[2] / 1000.0,
+            np.deg2rad(link_pose[3]),
+            np.deg2rad(link_pose[4]),
+            np.deg2rad(link_pose[5]),
+            gripper_opening,
+        ],
+        dtype=np.float64,
+    )
+
+
 def gripper_effort_value(value: int | None) -> int:
     if value is None:
         return DEFAULT_GRIPPER_EFFORT
@@ -124,6 +145,7 @@ class SinglePiperArm:
             )
 
     def connect(self, *, read_only: bool = True) -> None:
+        self.interface.EnableFkCal()
         self.interface.ConnectPort(can_init=False, piper_init=not read_only, start_thread=True)
         self.connected = True
 
@@ -270,10 +292,10 @@ class SinglePiperArm:
             axis=0,
         )
 
-        use_command = prefer_joint_ctrl and not np.allclose(qpos_command[:6], 0.0, atol=1e-6)
-        qpos = qpos_command if use_command else qpos_feedback
         qpos_feedback_timestamp_s = max(joint_feedback_timestamp_s, gripper_feedback_timestamp_s)
         command_timestamp_s = max(joint_command_timestamp_s, gripper_command_timestamp_s)
+        use_command = prefer_joint_ctrl and command_timestamp_s > 0.0
+        qpos = qpos_command if use_command else qpos_feedback
         qpos_timestamp_s = command_timestamp_s if use_command else qpos_feedback_timestamp_s
         qvel = np.array(
             [
@@ -299,7 +321,7 @@ class SinglePiperArm:
             ],
             dtype=np.float64,
         )
-        end_pose = np.array(
+        feedback_end_pose = np.array(
             [
                 sdk_translation_to_meters(end_pose_msgs.end_pose.X_axis),
                 sdk_translation_to_meters(end_pose_msgs.end_pose.Y_axis),
@@ -311,6 +333,9 @@ class SinglePiperArm:
             ],
             dtype=np.float64,
         )
+        end_pose = feedback_end_pose
+        if use_command:
+            end_pose = fk_links_to_end_pose(self.interface.GetFK(mode="control"), feedback_end_pose, qpos[6])
 
         return PiperArmState(
             name=self.name,

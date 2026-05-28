@@ -51,19 +51,31 @@ class RolloutVideoRecorder:
         schema: RecordingSchema,
         fps: float,
         name_prefix: str = "rollout_record",
+        output_path: str | Path | None = None,
         plot_cols: int = 4,
         plot_cell_h: int = 80,
+        keep_frames_in_memory: bool = False,
+        video_codec: str = "mpeg4",
+        video_output_params: tuple[str, ...] = (),
+        frame_jpeg_quality: int = 92,
     ) -> None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         safe_prefix = safe_filename_part(name_prefix) or "rollout_record"
         self.record_stem = f"{safe_prefix}_{timestamp}"
-        self.run_dir = self.output_dir / self.record_stem
+        if output_path is None:
+            self.run_dir = self.output_dir / self.record_stem
+            self.output_path = self.run_dir / f"{self.record_stem}_videos.mp4"
+        else:
+            self.output_path = Path(output_path)
+            self.run_dir = self.output_path.parent
+            self.record_stem = self.output_path.stem
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.output_path = self.run_dir / f"{self.record_stem}_videos.mp4"
+        self.keep_frames_in_memory = keep_frames_in_memory
         self.frames_dir = self.run_dir / ".frames"
-        self.frames_dir.mkdir(parents=True, exist_ok=True)
+        if not self.keep_frames_in_memory:
+            self.frames_dir.mkdir(parents=True, exist_ok=True)
 
         self.schema = schema
         self.fps = fps if fps > 0.0 else 10.0
@@ -76,6 +88,10 @@ class RolloutVideoRecorder:
         self.camera_height: int | None = None
         self.camera_width: int | None = None
         self.finalized = False
+        self.frame_images: list[np.ndarray] = []
+        self.video_codec = video_codec
+        self.video_output_params = tuple(video_output_params)
+        self.frame_jpeg_quality = int(frame_jpeg_quality)
 
     def extra_image_path(self, suffix: str, extension: str = ".png") -> Path:
         clean_suffix = safe_filename_part(suffix)
@@ -96,10 +112,13 @@ class RolloutVideoRecorder:
         timestamp_s: float,
     ) -> None:
         camera_row = self.compose_camera_row(images)
-        frame_path = self.frames_dir / f"frame_{len(self.frame_paths):06d}.jpg"
-        iio.imwrite(frame_path, camera_row[..., ::-1], quality=92)
+        if self.keep_frames_in_memory:
+            self.frame_images.append(camera_row.copy())
+        else:
+            frame_path = self.frames_dir / f"frame_{len(self.frame_paths):06d}.jpg"
+            iio.imwrite(frame_path, camera_row[..., ::-1], quality=self.frame_jpeg_quality)
+            self.frame_paths.append(frame_path)
 
-        self.frame_paths.append(frame_path)
         self.actions.append(np.asarray(action, dtype=np.float64).copy())
         self.states.append(np.asarray(state, dtype=np.float64).copy())
         self.timestamps.append(float(timestamp_s))
@@ -108,13 +127,14 @@ class RolloutVideoRecorder:
         if self.finalized:
             return self.output_path if self.output_path.exists() else None
         self.finalized = True
-        if not self.frame_paths:
+        total = len(self.frame_images) if self.keep_frames_in_memory else len(self.frame_paths)
+        if total == 0:
             shutil.rmtree(self.frames_dir, ignore_errors=True)
             return None
 
         actions = np.stack(self.actions, axis=0)
         states = np.stack(self.states, axis=0)
-        first_frame = iio.imread(self.frame_paths[0])[..., ::-1]
+        first_frame = self.read_recorded_frame(0)
 
         camera_h, camera_w = first_frame.shape[:2]
         base_plot, final_plot, plot_rects = self.make_plot_canvases(
@@ -122,16 +142,49 @@ class RolloutVideoRecorder:
             actions=actions,
             states=states,
         )
-        plot_h = base_plot.shape[0]
-        video_w, video_h = camera_w, camera_h + plot_h
         tmp_output = self.output_path.with_suffix(".tmp.mp4")
 
-        writer = imageio.get_writer(tmp_output, fps=self.fps, codec="mpeg4")
-
         try:
-            total = len(self.frame_paths)
-            for index, frame_path in enumerate(self.frame_paths):
-                camera_row = iio.imread(frame_path)[..., ::-1]
+            self.write_video_file(tmp_output, total, camera_h, camera_w, base_plot, final_plot, plot_rects)
+        except Exception:
+            if self.video_codec == "mpeg4":
+                raise
+            tmp_output.unlink(missing_ok=True)
+            self.write_video_file(tmp_output, total, camera_h, camera_w, base_plot, final_plot, plot_rects, codec="mpeg4")
+
+        tmp_output.replace(self.output_path)
+        shutil.rmtree(self.frames_dir, ignore_errors=True)
+        return self.output_path
+
+    def read_recorded_frame(self, index: int) -> np.ndarray:
+        if self.keep_frames_in_memory:
+            return self.frame_images[index].copy()
+        return iio.imread(self.frame_paths[index])[..., ::-1]
+
+    def write_video_file(
+        self,
+        output_path: Path,
+        total: int,
+        camera_h: int,
+        camera_w: int,
+        base_plot: np.ndarray,
+        final_plot: np.ndarray,
+        plot_rects: list[tuple[int, int, int, int]],
+        *,
+        codec: str | None = None,
+    ) -> None:
+        writer_kwargs: dict[str, Any] = {
+            "fps": self.fps,
+            "codec": codec or self.video_codec,
+            "macro_block_size": 1,
+            "ffmpeg_log_level": "error",
+        }
+        if codec is None and self.video_output_params:
+            writer_kwargs["output_params"] = list(self.video_output_params)
+        writer = imageio.get_writer(output_path, **writer_kwargs)
+        try:
+            for index in range(total):
+                camera_row = self.read_recorded_frame(index)
                 if camera_row.shape[:2] != (camera_h, camera_w):
                     camera_row = cv2.resize(camera_row, (camera_w, camera_h), interpolation=cv2.INTER_AREA)
                 ratio = (index + 1) / total
@@ -139,10 +192,6 @@ class RolloutVideoRecorder:
                 writer.append_data(np.concatenate((camera_row, plot_row), axis=0)[..., ::-1])
         finally:
             writer.close()
-
-        tmp_output.replace(self.output_path)
-        shutil.rmtree(self.frames_dir, ignore_errors=True)
-        return self.output_path
 
     def compose_camera_row(self, images: Mapping[str, np.ndarray]) -> np.ndarray:
         panels = []
