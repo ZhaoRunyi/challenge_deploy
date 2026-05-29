@@ -73,7 +73,7 @@ flowchart TD
     A --> A9[cameras.start]
     A --> A10[wait_until_ready]
     A --> A11[robot.enable]
-    A --> A12[robot.move_to_joint_positions INIT_JOINTS]
+    A --> A12[robot.move_to_joint_positions resolved init joints]
     A --> A13[first_obs_snapshot = source.capture_snapshot]
 
     A13 --> A14{execution_mode}
@@ -146,7 +146,7 @@ flowchart TD
     C4 --> C7[DualPiperObservationSource]
 
     C --> C8[robot.enable]
-    C --> C9[robot.move_to_joint_positions INIT_JOINTS]
+    C --> C9[robot.move_to_joint_positions resolved init joints]
     C --> C10{execution_mode}
     C10 -->|chunk_sync| C11[openpi_rollout.run_chunk_sync_rollout]
     C10 -->|streaming| C12[openpi_rollout.run_temporal_smoothing_rollout]

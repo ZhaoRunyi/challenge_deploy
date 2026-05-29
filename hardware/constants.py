@@ -21,6 +21,23 @@ DEFAULT_CAN_NAMES: dict[str, str] = {
 
 DEFAULT_PROMPT = "fold the cloth"
 
+DUAL_PIPER_INIT_JOINTS: tuple[float, ...] = (
+    -0.05918411,
+    0.00076794,
+    -0.12870058,
+    -0.13548991,
+    0.29586821,
+    0.13372713,
+    0.0,
+    0.08932595,
+    0.00970403,
+    -0.21027726,
+    -0.08838347,
+    0.39285615,
+    0.08686504,
+    0.0,
+)
+
 # Keep the original deployment unit conversion constants instead of "fixing" them.
 KAI0_RAD_PER_MILLI_DEGREE = 0.017444 / 1000.0
 KAI0_MILLI_DEGREE_PER_RAD = 57324.840764

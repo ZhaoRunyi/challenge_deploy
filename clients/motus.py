@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from functools import lru_cache
-import importlib.util
 import json
+import os
 from pathlib import Path
-import sys
 from typing import Any
 
 import cv2
@@ -15,6 +13,7 @@ import yaml
 from hardware.constants import PIPER_GRIPPER_FULL_OPEN_METERS
 from hardware.schemas import RobotSnapshot
 from . import slai_piper_policy
+from . import websocket_client_policy
 from .base import (
     ControlMode,
     DecodedArmAction,
@@ -23,10 +22,13 @@ from .base import (
     action_array_from_response,
     action_gripper_for_piper,
     build_configured_piper_state as build_slai_configured_piper_state,
-    decoded_action_summary,
     image_to_rgb,
-    space_summary,
 )
+from .specs import space_summary
+
+MOTUS_STATS_PATH = Path(
+    os.environ.get("MOTUS_STATS_PATH", "/workspace/Motus/data/utils/stat.json")
+).expanduser().resolve()
 
 
 @dataclass(frozen=True)
@@ -55,38 +57,10 @@ class MotusPolicySpec:
     per_task_gripper_thresholds: dict[str, float]
 
 
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-def motus_root() -> Path:
-    return repo_root() / "baselines" / "Motus"
-
-
-def motus_websocket_client_policy_path() -> Path:
-    return motus_root() / "inference" / "challenge_deploy" / "websocket_client_policy.py"
-
-
 def motus_stats_path() -> Path:
-    return motus_root() / "data" / "utils" / "stat.json"
+    return MOTUS_STATS_PATH
 
 
-def load_module(name: str, path: Path) -> Any:
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load module {name!r} from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules.setdefault(name, module)
-    spec.loader.exec_module(module)
-    return module
-
-
-@lru_cache(maxsize=1)
-def motus_websocket_client_policy_module() -> Any:
-    return load_module("motus_websocket_client_policy", motus_websocket_client_policy_path())
-
-
-@lru_cache(maxsize=1)
 def motus_stats_payload() -> dict[str, Any]:
     with open(motus_stats_path(), "r", encoding="utf-8") as file_obj:
         payload = json.load(file_obj)
@@ -373,7 +347,7 @@ class MotusPiperClient(SlaiPiperClient):
         self.last_commanded: DecodedPiperAction | None = None
         self.gripper_transition: tuple[DecodedPiperAction, DecodedPiperAction, int] | None = None
         spec = load_motus_policy_spec(config_path)
-        policy_client = motus_websocket_client_policy_module().WebsocketClientPolicy(host, port, api_key=api_key)
+        policy_client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
         super().__init__(
             spec=spec,
             policy_client=policy_client,

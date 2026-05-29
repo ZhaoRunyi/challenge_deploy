@@ -2,20 +2,43 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import cv2
 import imageio.v3 as iio
 import numpy as np
-import pandas as pd
-from openpi.training import config as openpi_config
 
 DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LEROBOT_HOME = Path("/home/edemlab/challenge_ws/data")
 ARTIFACTS_ROOT = DEPLOY_ROOT / "artifacts"
 TRAIN_DISTRIBUTION_DIR = ARTIFACTS_ROOT / "train_distributions"
 PROMPT_CACHE_PATH = ARTIFACTS_ROOT / "trainconfig_prompts.json"
+XVLA_ARTIFACT_ALIASES = {
+    "slai_piper": (
+        "slai_piper_ee_gripper",
+        "slai_piper_items_handover",
+        "Piper_items_hand_over_place_0421",
+        "items_hand_over_place",
+        "items_handover",
+        "handover",
+    ),
+    "slai_piper_ee_gripper": (
+        "slai_piper",
+        "slai_piper_items_handover",
+        "Piper_items_hand_over_place_0421",
+        "items_hand_over_place",
+        "items_handover",
+        "handover",
+    ),
+    "slai_piper_joint_gripper": (
+        "slai_piper",
+        "joint_gripper",
+        "Piper_items_hand_over_place_0421",
+    ),
+    "slai_piper_all": ("slai_piper", "all", "Piper_items_hand_over_place_0421"),
+}
 
 
 def safe_filename_part(value: str) -> str:
@@ -67,18 +90,14 @@ class PreparedTrainAssets:
 
 
 def lerobot_home() -> Path:
-    raw_value = None
-    try:
-        import os
-
-        raw_value = os.environ.get("HF_LEROBOT_HOME")
-    except Exception:
-        raw_value = None
+    raw_value = os.environ.get("HF_LEROBOT_HOME")
     raw = Path(raw_value).expanduser() if raw_value else DEFAULT_LEROBOT_HOME
     return raw.resolve()
 
 
 def get_train_config_repo_id(train_config_name: str) -> str | None:
+    from openpi.training import config as openpi_config
+
     cfg = openpi_config.get_config(train_config_name)
     repo_id = getattr(cfg.data, "repo_id", None)
     if not isinstance(repo_id, str):
@@ -145,6 +164,25 @@ def set_cached_prompt(train_config_name: str, prompt: str, prompt_cache_path: Pa
 
 def cached_prompt_for_train_config(train_config_name: str, prompt_cache_path: Path = PROMPT_CACHE_PATH) -> str | None:
     return load_prompt_cache(prompt_cache_path).get(train_config_name)
+
+
+def artifact_keys(train_config_name: str, aliases: tuple[str, ...] = ()) -> list[str]:
+    keys: list[str] = []
+    for value in (train_config_name, *aliases):
+        key = str(value).strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def cached_prompt_for_keys(keys: list[str], prompt_cache_path: Path = PROMPT_CACHE_PATH) -> tuple[str | None, str | None]:
+    prompt_map = load_prompt_cache(prompt_cache_path)
+    for key in keys:
+        prompt = prompt_map.get(key)
+        if prompt:
+            source = "cache" if key == keys[0] else f"cache:{key}"
+            return prompt, source
+    return None, None
 
 
 def dataset_prompt(dataset_dir: Path) -> str | None:
@@ -277,10 +315,8 @@ def decode_image_value(value: Any, *, dataset_dir: Path) -> np.ndarray:
 
 
 def load_lerobot_decode_video_frames():
-    try:
-        from lerobot.common.datasets.video_utils import decode_video_frames
-    except Exception:
-        from lerobot.datasets.video_utils import decode_video_frames  # type: ignore
+    from lerobot.common.datasets.video_utils import decode_video_frames
+
     return decode_video_frames
 
 
@@ -316,7 +352,7 @@ def load_cam_high_first_frame(
     dataset_dir: Path,
     info: dict[str, Any],
     episode_index: int,
-    df: pd.DataFrame,
+    df: Any,
 ) -> np.ndarray:
     image_key = "observation.images.cam_high"
     if image_key in df.columns:
@@ -342,6 +378,7 @@ def load_cam_high_background_image(*, artifacts_root: Path = ARTIFACTS_ROOT) -> 
 
 
 def build_cam_high_first_frame_overlay(dataset_dir: Path, *, repo_id: str | None = None) -> np.ndarray:
+    import pandas as pd
     from .task_segmentation import select_relevant_task_masks
 
     info = info_json(dataset_dir)
@@ -466,6 +503,8 @@ def iter_valid_lerobot_datasets(root: Path | None = None) -> list[tuple[str, Pat
 
 
 def train_config_names() -> list[str]:
+    from openpi.training import config as openpi_config
+
     names = getattr(openpi_config, "_CONFIGS", {})
     if isinstance(names, dict):
         return sorted(str(name) for name in names.keys())
@@ -564,6 +603,46 @@ def resolve_motus_distribution_image(spec: Any, prompt: str | None = None) -> tu
     return None, f"train distribution image not found for repo_id={repo_id!r}; exact path would be {exact_path}"
 
 
+def resolve_named_artifact_distribution(
+    train_config_name: str,
+    *,
+    artifacts_root: Path = ARTIFACTS_ROOT,
+    aliases: tuple[str, ...] = (),
+) -> tuple[Path | None, str | None]:
+    image_path = find_distribution_image_path(
+        train_config_name,
+        artifacts_root=artifacts_root,
+        aliases=aliases,
+    )
+    if image_path is not None:
+        return image_path, None
+    exact_path = repo_id_distribution_image_path(train_config_name, artifacts_root=artifacts_root)
+    return None, f"train distribution image not found for train_config={train_config_name!r}; exact path would be {exact_path}"
+
+
+def prepare_prompt_assets(
+    *,
+    train_config_name: str,
+    cli_prompt: str | None,
+    artifacts_root: Path = ARTIFACTS_ROOT,
+    prompt_cache_path: Path = PROMPT_CACHE_PATH,
+) -> PreparedTrainAssets:
+    asset_info = dataset_asset_info(train_config_name, artifacts_root=artifacts_root)
+    prompt, prompt_source = resolve_prompt(
+        train_config_name=train_config_name,
+        cli_prompt=cli_prompt,
+        dataset_dir=asset_info.dataset_dir,
+        prompt_cache_path=prompt_cache_path,
+    )
+    return PreparedTrainAssets(
+        prompt=prompt,
+        prompt_source=prompt_source,
+        distribution_image_path=None,
+        distribution_ready=False,
+        skip_reason=None,
+    )
+
+
 def prepare_train_assets(
     *,
     train_config_name: str,
@@ -580,7 +659,9 @@ def prepare_train_assets(
     )
     existing_distribution_image_path = find_distribution_image_path(asset_info.repo_id, artifacts_root=artifacts_root)
     if asset_info.dataset_dir is None or asset_info.repo_id is None:
-        ready_path = existing_distribution_image_path or (asset_info.distribution_image_path if asset_info.distribution_image_path.exists() else None)
+        ready_path = existing_distribution_image_path
+        if ready_path is None and asset_info.distribution_image_path.exists():
+            ready_path = asset_info.distribution_image_path
         return PreparedTrainAssets(
             prompt=prompt,
             prompt_source=prompt_source,
@@ -589,10 +670,26 @@ def prepare_train_assets(
             skip_reason=f"dataset not found under {lerobot_home()} for repo_id={asset_info.repo_id!r}",
         )
     if existing_distribution_image_path is not None:
-        return PreparedTrainAssets(prompt=prompt, prompt_source=prompt_source, distribution_image_path=existing_distribution_image_path, distribution_ready=True, skip_reason=None)
+        return PreparedTrainAssets(
+            prompt=prompt,
+            prompt_source=prompt_source,
+            distribution_image_path=existing_distribution_image_path,
+            distribution_ready=True,
+            skip_reason=None,
+        )
     try:
-        image_path = ensure_distribution_image(asset_info.dataset_dir, asset_info.repo_id, artifacts_root=artifacts_root)
-        return PreparedTrainAssets(prompt=prompt, prompt_source=prompt_source, distribution_image_path=image_path, distribution_ready=True, skip_reason=None)
+        image_path = ensure_distribution_image(
+            asset_info.dataset_dir,
+            asset_info.repo_id,
+            artifacts_root=artifacts_root,
+        )
+        return PreparedTrainAssets(
+            prompt=prompt,
+            prompt_source=prompt_source,
+            distribution_image_path=image_path,
+            distribution_ready=True,
+            skip_reason=None,
+        )
     except Exception as exc:
         return PreparedTrainAssets(
             prompt=prompt,
@@ -601,3 +698,108 @@ def prepare_train_assets(
             distribution_ready=False,
             skip_reason=f"failed to build train distribution image from {asset_info.dataset_dir}: {exc}",
         )
+
+
+def prepare_named_artifact_assets(
+    *,
+    train_config_name: str,
+    cli_prompt: str | None,
+    need_distribution: bool,
+    artifacts_root: Path = ARTIFACTS_ROOT,
+    prompt_cache_path: Path = PROMPT_CACHE_PATH,
+    aliases: tuple[str, ...] = (),
+) -> PreparedTrainAssets:
+    if cli_prompt is not None:
+        prompt, prompt_source = cli_prompt, "cli"
+    else:
+        prompt, prompt_source = cached_prompt_for_keys(
+            artifact_keys(train_config_name, aliases),
+            prompt_cache_path,
+        )
+    distribution_image_path = None
+    distribution_skip_reason = None
+    if need_distribution:
+        distribution_image_path, distribution_skip_reason = resolve_named_artifact_distribution(
+            train_config_name,
+            artifacts_root=artifacts_root,
+            aliases=aliases,
+        )
+    return PreparedTrainAssets(
+        prompt=prompt,
+        prompt_source=prompt_source,
+        distribution_image_path=distribution_image_path,
+        distribution_ready=distribution_image_path is not None,
+        skip_reason=distribution_skip_reason,
+    )
+
+
+def prepare_motus_client_assets(
+    *,
+    train_config_name: str,
+    cli_prompt: str | None,
+    need_distribution: bool,
+    spec: Any,
+    server_metadata: dict[str, Any] | None,
+) -> PreparedTrainAssets:
+    server_metadata = server_metadata or {}
+    task_names = spec.config.get("dataset", {}).get("task_name") or []
+    if isinstance(task_names, str):
+        task_names = [task_names]
+    aliases = [
+        Path(train_config_name).stem,
+        str(getattr(spec, "repo_id", "") or ""),
+        Path(str(getattr(spec, "repo_id", "") or "")).name,
+        *(str(task_name) for task_name in task_names),
+    ]
+    if cli_prompt is not None:
+        prompt, prompt_source = cli_prompt, "cli"
+    else:
+        prompt, prompt_source = cached_prompt_for_keys(artifact_keys(train_config_name, tuple(aliases)))
+        if prompt is None:
+            prompt = server_metadata.get("default_prompt")
+            prompt_source = "server_default" if prompt is not None else None
+    distribution_image_path = None
+    distribution_skip_reason = None
+    if need_distribution:
+        distribution_image_path, distribution_skip_reason = resolve_motus_distribution_image(spec, prompt)
+    return PreparedTrainAssets(
+        prompt=prompt,
+        prompt_source=prompt_source,
+        distribution_image_path=distribution_image_path,
+        distribution_ready=distribution_image_path is not None,
+        skip_reason=distribution_skip_reason,
+    )
+
+
+def prepare_client_assets(
+    *,
+    client_kind: str,
+    train_config_name: str,
+    cli_prompt: str | None,
+    need_distribution: bool = False,
+    spec: Any | None = None,
+    server_metadata: dict[str, Any] | None = None,
+) -> PreparedTrainAssets:
+    if client_kind in {"openpi", "openpi_sim"}:
+        if need_distribution:
+            return prepare_train_assets(train_config_name=train_config_name, cli_prompt=cli_prompt)
+        return prepare_prompt_assets(train_config_name=train_config_name, cli_prompt=cli_prompt)
+    if client_kind == "motus":
+        if spec is None:
+            raise ValueError("Motus assets require a loaded policy spec")
+        return prepare_motus_client_assets(
+            train_config_name=train_config_name,
+            cli_prompt=cli_prompt,
+            need_distribution=need_distribution,
+            spec=spec,
+            server_metadata=server_metadata,
+        )
+    if client_kind == "xvla":
+        aliases = XVLA_ARTIFACT_ALIASES.get(train_config_name, ())
+        return prepare_named_artifact_assets(
+            train_config_name=train_config_name,
+            cli_prompt=cli_prompt,
+            need_distribution=need_distribution,
+            aliases=aliases,
+        )
+    raise ValueError(f"Unsupported client_kind: {client_kind}")

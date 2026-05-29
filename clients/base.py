@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from hardware.constants import PIPER_GRIPPER_FULL_OPEN_METERS
 from hardware.conversions import (
@@ -16,10 +17,6 @@ from hardware.conversions import (
 from hardware.schemas import PiperArmState, RobotSnapshot
 from . import slai_piper_policy
 
-try:
-    from scipy.spatial.transform import Rotation
-except ImportError:  # pragma: no cover
-    Rotation = None
 
 ControlMode = Literal["joints", "ee_pose"]
 
@@ -38,18 +35,12 @@ class DecodedPiperAction:
     control_mode: ControlMode
 
 
-def require_rotation() -> Any:
-    if Rotation is None:
-        raise RuntimeError("scipy is required for ee rotation conversion")
-    return Rotation
-
-
 def rpy_to_rotation(rpy: np.ndarray, rotation_format: str) -> np.ndarray:
     rotation_format = slai_piper_policy.resolve_rotation_format(rotation_format)
     rpy = np.asarray(rpy, dtype=np.float64).reshape(3)
     if rotation_format == "rpy":
         return rpy
-    rot = require_rotation().from_euler("xyz", rpy, degrees=False)
+    rot = Rotation.from_euler("xyz", rpy, degrees=False)
     if rotation_format == "quat":
         return rot.as_quat().astype(np.float64)
     return rot.as_matrix()[:, :2].reshape(-1).astype(np.float64)
@@ -60,7 +51,7 @@ def rotation_to_rpy(values: np.ndarray, rotation_format: str) -> np.ndarray:
     values = np.asarray(values, dtype=np.float64)
     if rotation_format == "rpy":
         return values.reshape(3)
-    rotation_cls = require_rotation()
+    rotation_cls = Rotation
     if rotation_format == "quat":
         return rotation_cls.from_quat(values.reshape(4)).as_euler("xyz", degrees=False)
     columns = values.reshape(3, 2)
@@ -171,34 +162,6 @@ def action_array_from_response(response: dict[str, Any], keys: tuple[str, ...] =
         if key in response:
             return np.asarray(response[key], dtype=np.float64)
     raise KeyError(f"Policy response does not contain any action key {keys}: {sorted(response)}")
-
-
-def space_summary(space: Any) -> dict[str, Any]:
-    gripper = getattr(space, "gripper", None)
-    return {
-        "ids": getattr(space, "ids", None),
-        "arms": getattr(space, "arms", None),
-        "ee_rotation": getattr(space, "ee_rotation", None),
-        "gripper": None if gripper is None else {
-            "type": getattr(gripper, "type", None),
-            "threshold": getattr(gripper, "threshold", None),
-            "full_width": getattr(gripper, "full_width", None),
-        },
-    }
-
-
-def decoded_action_summary(decoded: DecodedPiperAction) -> dict[str, Any]:
-    return {
-        "control_mode": decoded.control_mode,
-        "arms": {
-            arm_name: {
-                "has_joint": arm_action.joint is not None,
-                "has_ee_pose": arm_action.ee_pose is not None,
-                "gripper": arm_action.gripper,
-            }
-            for arm_name, arm_action in decoded.arms.items()
-        },
-    }
 
 
 def used_action_names(spec: Any, control_mode: ControlMode) -> frozenset[str]:

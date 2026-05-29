@@ -10,6 +10,7 @@
 ### 真机推理
 
 - `run_openpi_clients.py`
+- `run_xvla_clients.py`
 - `run_openpi_sim_client.py`
 - `run_motus_client.py`
 
@@ -32,6 +33,7 @@ challenge_deploy/
 ├── rollout/     # rollout execution, recording, metrics, train assets
 ├── teleop/      # HDF5 teleop collector and episode preview
 ├── run_openpi_clients.py
+├── run_xvla_clients.py
 ├── run_openpi_sim_client.py
 ├── run_motus_client.py
 ├── run_hdf5_teleop_collect.py
@@ -61,3 +63,27 @@ challenge_deploy/
 - SAM3 相关代码
 
 运行产物目录 `artifacts/` 保留，不在代码裁剪范围内。
+
+## X-VLA 真机入口
+
+先在 X-VLA 环境中启动 websocket policy server：
+
+```bash
+cd /workspace/X-VLA
+/workspace/X-VLA/.venv/bin/python -m scripts.serve_policy \
+  --model_path /path/to/your/xvla \
+  --processor_path /path/to/your/xvla \
+  --port 8000
+```
+
+再在 deploy 环境中运行独立 X-VLA client：
+
+```bash
+cd /workspace/deploy
+python run_xvla_clients.py \
+  --train-config slai_piper \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --prompt "hand over the item" \
+  --control-mode ee_pose
+```

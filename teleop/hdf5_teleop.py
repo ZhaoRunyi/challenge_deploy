@@ -11,18 +11,16 @@ from typing import Any, Callable, Sequence
 import cv2
 import h5py
 import imageio
+import matplotlib.pyplot as plt
 import numpy as np
+from scipy.spatial.transform import Rotation
 
-from hardware import DualPiperSystem
-from hardware import RealSenseRig
 from hardware.constants import CAMERA_NAMES, PIPER_GRIPPER_FULL_OPEN_METERS
 from hardware.piper import SinglePiperArm
+from hardware.piper import DualPiperSystem
+from hardware.realsense import RealSenseRig
 from hardware.schemas import DualPiperState, PiperArmState
-
-try:
-    from scipy.spatial.transform import Rotation
-except ImportError:  # pragma: no cover - scipy exists in the intended deploy env.
-    Rotation = None
+from rollout.recording import RolloutVideoRecorder, RecordingSchema
 
 
 @dataclass(slots=True)
@@ -94,12 +92,6 @@ class AsyncSampleQueue:
             return len(self.samples)
 
 
-def require_rotation() -> Any:
-    if Rotation is None:
-        raise RuntimeError("scipy is required for HDF5 teleop end-effector conversions")
-    return Rotation
-
-
 def rotation_matrix_to_6d(matrix: np.ndarray) -> np.ndarray:
     matrix = np.asarray(matrix, dtype=np.float64).reshape(3, 3)
     return np.concatenate([matrix[0, :2], matrix[1, :2], matrix[2, :2]], axis=0)
@@ -128,7 +120,7 @@ def abs_6d_to_abs_euler(action: np.ndarray) -> np.ndarray:
     right_6d = action[13:19]
     right_gripper = action[19]
 
-    rotation_cls = require_rotation()
+    rotation_cls = Rotation
     left_euler = rotation_cls.from_matrix(rotation_6d_to_matrix(left_6d)).as_euler("xyz", degrees=False)
     right_euler = rotation_cls.from_matrix(rotation_6d_to_matrix(right_6d)).as_euler("xyz", degrees=False)
     return np.concatenate(
@@ -145,13 +137,13 @@ def abs_6d_to_abs_euler(action: np.ndarray) -> np.ndarray:
 
 
 def arm_eef_quaternion(position: np.ndarray, gripper: float) -> np.ndarray:
-    rotation_cls = require_rotation()
+    rotation_cls = Rotation
     quat = rotation_cls.from_euler("xyz", position[3:6], degrees=False).as_quat().astype(np.float64)
     return np.concatenate((position[:3], quat, np.array([gripper], dtype=np.float64)), axis=0)
 
 
 def arm_eef_6d(position: np.ndarray, gripper: float) -> np.ndarray:
-    rotation_cls = require_rotation()
+    rotation_cls = Rotation
     matrix = rotation_cls.from_euler("xyz", position[3:6], degrees=False).as_matrix()
     rot6d = rotation_matrix_to_6d(matrix)
     return np.concatenate((position[:3], rot6d, np.array([gripper], dtype=np.float64)), axis=0)
@@ -274,7 +266,7 @@ def stable_eef_positions(states: Sequence[DualPiperState]) -> list[np.ndarray]:
 
 
 def arm_state_vector_16(arm_state: PiperArmState, stable_pose: np.ndarray) -> np.ndarray:
-    matrix = require_rotation().from_euler("xyz", stable_pose[3:6], degrees=False).as_matrix()
+    matrix = Rotation.from_euler("xyz", stable_pose[3:6], degrees=False).as_matrix()
     return np.concatenate((
         np.asarray(arm_state.qpos[:6], dtype=np.float64),
         np.asarray(stable_pose[:3], dtype=np.float64),
@@ -740,7 +732,6 @@ def save_hdf5_teleop_record_video(
 ) -> Path | None:
     if len(frames) < 2:
         return None
-    from rollout.recording import RolloutVideoRecorder, RecordingSchema
 
     schema = RecordingSchema(
         camera_names=tuple(CAMERA_NAMES),
@@ -823,11 +814,6 @@ def draw_alignment_plot(
     all_times = [timestamp for values in stack_timestamps.values() for timestamp in values]
     if not all_times:
         return
-
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
     plotted_indices = alignment_plot_indices(len(selected_timestamps), plot_frames)
     if selected_timestamps:

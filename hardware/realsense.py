@@ -7,13 +7,9 @@ from typing import Any
 
 import cv2
 import numpy as np
+import pyrealsense2 as rs
 
 from .constants import CAMERA_NAMES
-
-try:
-    import pyrealsense2 as rs
-except ImportError:  # pragma: no cover - depends on hardware env
-    rs = None
 
 
 @dataclass(slots=True)
@@ -40,8 +36,6 @@ class RealSenseCameraCapture:
 
 
 def require_realsense() -> Any:
-    if rs is None:
-        raise RuntimeError("pyrealsense2 is not installed in the active environment")
     return rs
 
 

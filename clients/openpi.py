@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 from openpi.training import config as openpi_config
@@ -10,30 +9,15 @@ from hardware.schemas import RobotSnapshot
 from . import slai_piper_policy
 from .base import (
     ControlMode,
-    DecodedArmAction,
-    DecodedPiperAction,
     SlaiPiperClient,
-    build_configured_piper_state,
     build_full_piper_state,
-    decoded_action_summary,
     image_to_rgb,
-    space_summary,
 )
+from .specs import SlaiPolicySpec, slai_policy_spec_summary
 
 
-@dataclass(frozen=True)
-class PiperPolicySpec:
-    train_config_name: str
-    train_config: Any
-    state_space: Any
-    action_space: Any
-    image_space: Any
-    state_dim: int
-    action_dim: int
-    model_action_dim: int | None
-    action_horizon: int | None
-    image_ids: tuple[str, ...]
-    image_key_map: dict[str, str]
+class PiperPolicySpec(SlaiPolicySpec):
+    pass
 
 
 def load_piper_policy_spec(train_config_name: str) -> PiperPolicySpec:
@@ -106,15 +90,4 @@ class OpenPiPiperClient(SlaiPiperClient):
 
 
 def spec_summary(spec: PiperPolicySpec) -> dict[str, Any]:
-    return {
-        "train_config_name": spec.train_config_name,
-        "state_dim": spec.state_dim,
-        "action_dim": spec.action_dim,
-        "model_action_dim": spec.model_action_dim,
-        "action_horizon": spec.action_horizon,
-        "image_ids": list(spec.image_ids),
-        "image_key_map": spec.image_key_map,
-        "state_space": space_summary(spec.state_space),
-        "action_space": space_summary(spec.action_space),
-        "image_space": {"ids": getattr(spec.image_space, "ids", None)},
-    }
+    return slai_policy_spec_summary(spec)

@@ -15,7 +15,6 @@ from .base import (
     SlaiPiperClient,
     action_gripper_for_piper,
     bounded_gripper_for_piper,
-    decoded_action_summary,
     hardware_gripper_to_model_raw,
     state_gripper_for_policy,
 )

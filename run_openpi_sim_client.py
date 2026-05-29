@@ -1,170 +1,47 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
 import json
 from pathlib import Path
-import signal
 import time
 from typing import Any
 
 import numpy as np
 
-from hardware.config import load_config, set_by_dotted_path
-from rollout.assets import dataset_asset_info, prepare_train_assets, resolve_prompt
-from rollout.metrics import save_rollout_metrics_summary
+from hardware.config import load_config
+from rollout.assets import prepare_client_assets
 from clients.openpi_sim import (
     SIM_ACTION_NAMES,
     SIM_STATE_NAMES,
     OpenPiSimPiperClient,
     OpenPiSimPolicySpec,
     build_configured_piper_state,
-    decoded_action_summary,
     load_openpi_sim_policy_spec,
-    sim_gripper_to_piper,
     spec_summary,
 )
-from hardware import DualPiperSystem
-from hardware import RealSenseRig
 from rollout.recording import OpenPiRolloutRecorder, RecordingSchema, preview_until_continue, save_frame1_image
-from hardware import DualPiperObservationSource
 from hardware.schemas import RobotSnapshot
-
-DEPLOY_ROOT = Path(__file__).resolve().parent
-INIT_EMBODICHAIN_QPOS = np.array(
-    [
-        -0.31471917033195496,
-        0.9185937643051147,
-        -1.1522988080978394,
-        -0.06913353502750397,
-        0.6181001663208008,
-        -0.0012999551836401224,
-        1.0000096559524536,
-        0.3093342185020447,
-        0.9417879581451416,
-        -1.1448285579681396,
-        -0.12809762358665466,
-        0.6446187496185303,
-        0.13154016435146332,
-        1.0000003576278687,
-    ],
-    dtype=np.float64,
-) # OLD
-
-INIT_EMBODICHAIN_QPOS = np.array(
-    [
-        -0.05918411,
-        0.00076794,
-        -0.12870058,
-        -0.13548991,
-        0.29586821,
-        0.13372713,
-        0.0,
-        0.08932595,
-        0.00970403,
-        -0.21027726,
-        -0.08838347,
-        0.39285615,
-        0.08686504,
-        0.0,
-    ],
-    dtype=np.float64,
+from rollout.execution import (
+    RolloutMetrics,
+    action_sequence,
+    resolve_chunk_size,
+    save_rollout_metrics,
+    sleep_until_next_action,
+    trim_chunk,
+)
+from rollout.support import (
+    apply_runtime_overrides,
+    decoded_action_summary,
+    ignore_record_signal_handlers,
+    install_record_signal_handlers,
+    make_dual_piper_runtime,
+    normalized_prompt,
+    print_rollout_chunk_summary,
+    record_name_prefix,
+    resolve_dual_piper_init_joints,
 )
 
-
-def initial_piper_joints(*, old_gripper: bool = False) -> np.ndarray:
-    qpos = INIT_EMBODICHAIN_QPOS.copy()
-    qpos[[6, 13]] = [
-        sim_gripper_to_piper(qpos[6], old_gripper=old_gripper),
-        sim_gripper_to_piper(qpos[13], old_gripper=old_gripper),
-    ]
-    return qpos
-
-
-@dataclass
-class RolloutMetrics:
-    execution_mode: str = "chunk_sync"
-    executed_steps: int = 0
-    inferred_chunks: int = 0
-    inference_seconds: list[float] = field(default_factory=list)
-    command_period_seconds: list[float] = field(default_factory=list)
-    command_seconds: list[float] = field(default_factory=list)
-    rollout_started_at_s: float = field(default_factory=time.monotonic)
-    interrupted: bool = False
-    stop_reason: str | None = None
-
-    def record_inference(self, seconds: float) -> None:
-        self.inferred_chunks += 1
-        self.inference_seconds.append(float(seconds))
-
-    def record_command(self, *, period_seconds: float | None, command_seconds: float) -> None:
-        self.executed_steps += 1
-        if period_seconds is not None:
-            self.command_period_seconds.append(float(period_seconds))
-        self.command_seconds.append(float(command_seconds))
-
-    def mark_interrupted(self, reason: str | None = None) -> None:
-        self.interrupted = True
-        self.stop_reason = reason or "KeyboardInterrupt"
-
-    @staticmethod
-    def stats(values: list[float]) -> dict[str, float | None]:
-        if not values:
-            return {"mean": None, "p50": None, "p95": None, "max": None}
-        arr = np.asarray(values, dtype=np.float64)
-        return {
-            "mean": float(np.mean(arr)),
-            "p50": float(np.percentile(arr, 50)),
-            "p95": float(np.percentile(arr, 95)),
-            "max": float(np.max(arr)),
-        }
-
-    def summary(self) -> dict[str, Any]:
-        return {
-            "execution_mode": self.execution_mode,
-            "executed_steps": self.executed_steps,
-            "inferred_chunks": self.inferred_chunks,
-            "rollout_wall_seconds": float(time.monotonic() - self.rollout_started_at_s),
-            "inference_seconds": self.stats(self.inference_seconds),
-            "command_period_seconds": self.stats(self.command_period_seconds),
-            "command_seconds": self.stats(self.command_seconds),
-            "interrupted": self.interrupted,
-            "stop_reason": self.stop_reason,
-        }
-
-
-def action_sequence(actions: np.ndarray) -> np.ndarray:
-    actions = np.asarray(actions, dtype=np.float64)
-    if actions.ndim == 1:
-        return actions.reshape(1, -1)
-    if actions.ndim == 2:
-        return actions
-    raise ValueError(f"Expected action vector or action chunk, got shape {actions.shape}")
-
-
-def resolve_chunk_size(spec: OpenPiSimPolicySpec, requested_chunk_size: int | None) -> int | None:
-    if requested_chunk_size is not None:
-        if requested_chunk_size <= 0:
-            raise ValueError("--chunk-size must be positive when provided")
-        return requested_chunk_size
-    if spec.action_horizon is not None and spec.action_horizon > 0:
-        return int(spec.action_horizon)
-    return None
-
-
-def trim_chunk(actions: np.ndarray, chunk_size: int | None) -> np.ndarray:
-    actions = action_sequence(actions)
-    if chunk_size is None:
-        return actions
-    return actions[: min(chunk_size, len(actions))]
-
-
-def sleep_until_next_action(action_start_s: float, fps: float) -> None:
-    if fps <= 0.0:
-        return
-    remaining_s = (1.0 / fps) - (time.monotonic() - action_start_s)
-    if remaining_s > 0.0:
-        time.sleep(remaining_s)
+DEPLOY_ROOT = Path(__file__).resolve().parent
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -240,6 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=str(DEPLOY_ROOT / "configs" / "dual_piper_example.yaml"))
     parser.add_argument("--left-can", default=None)
     parser.add_argument("--right-can", default=None)
+    parser.add_argument(
+        "--init-joints",
+        nargs=14,
+        type=float,
+        default=None,
+        help="Optional 14D dual-Piper initial qpos override: left 7 then right 7.",
+    )
     parser.add_argument("--camera-front-serial", default=None)
     parser.add_argument("--camera-left-serial", default=None)
     parser.add_argument("--camera-right-serial", default=None)
@@ -251,48 +135,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    if args.left_can:
-        set_by_dotted_path(config, "robot.left.can_name", args.left_can)
-    if args.right_can:
-        set_by_dotted_path(config, "robot.right.can_name", args.right_can)
-    if args.camera_front_serial:
-        set_by_dotted_path(config, "cameras.serials.cam_high", args.camera_front_serial)
-    if args.camera_right_serial:
-        set_by_dotted_path(config, "cameras.serials.cam_right_wrist", args.camera_right_serial)
-    if args.camera_left_serial:
-        set_by_dotted_path(config, "cameras.serials.cam_left_wrist", args.camera_left_serial)
-    if args.no_cameras:
-        set_by_dotted_path(config, "cameras.enabled", False)
-    return config
-
-
-def make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[Any, Any, Any]:
-    robot = DualPiperSystem(
-        left_can_name=config["robot"]["left"]["can_name"],
-        right_can_name=config["robot"]["right"]["can_name"],
-        commands_enabled=commands_enabled,
-        name="openpi_sim_piper_client",
-    )
-    cameras = None
-    if config["cameras"]["enabled"]:
-        cameras = RealSenseRig(
-            config["cameras"]["serials"],
-            width=int(config["cameras"]["width"]),
-            height=int(config["cameras"]["height"]),
-            fps=int(config["cameras"]["fps"]),
-            warmup_frames=int(config["cameras"]["warmup_frames"]),
-        )
-    return robot, cameras, DualPiperObservationSource(robot=robot, cameras=cameras)
-
-
-def normalized_prompt(value: str | None) -> str | None:
-    if value is None:
-        return None
-    prompt = value.strip()
-    return prompt or None
-
-
 def make_recording_schema(spec: OpenPiSimPolicySpec) -> RecordingSchema:
     return RecordingSchema(
         camera_names=spec.image_ids,
@@ -300,36 +142,6 @@ def make_recording_schema(spec: OpenPiSimPolicySpec) -> RecordingSchema:
         state_names=SIM_STATE_NAMES,
         used_action_names=frozenset(SIM_ACTION_NAMES),
     )
-
-
-def record_name_prefix(args: argparse.Namespace) -> str:
-    ckpt_name = Path(args.ckpt_dir).name if args.ckpt_dir else args.train_config
-    return f"{ckpt_name}_{args.control_mode}_{args.execution_mode}"
-
-
-def install_record_signal_handlers() -> None:
-    def raise_keyboard_interrupt(signum: int, frame: Any) -> None:
-        raise KeyboardInterrupt(f"received signal {signum}")
-
-    for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
-        signal_value = getattr(signal, signal_name, None)
-        if signal_value is None:
-            continue
-        try:
-            signal.signal(signal_value, raise_keyboard_interrupt)
-        except (OSError, ValueError):
-            pass
-
-
-def ignore_record_signal_handlers() -> None:
-    for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
-        signal_value = getattr(signal, signal_name, None)
-        if signal_value is None:
-            continue
-        try:
-            signal.signal(signal_value, signal.SIG_IGN)
-        except (OSError, ValueError):
-            pass
 
 
 def snapshot_with_grippers(snapshot: RobotSnapshot, grippers: np.ndarray) -> RobotSnapshot:
@@ -353,31 +165,6 @@ def configured_state_after_command(
     return build_configured_piper_state(snapshot, spec, old_gripper=old_gripper)
 
 
-def print_rollout_chunk_summary(
-    *,
-    client: OpenPiSimPiperClient,
-    chunk_index: int,
-    action_count: int,
-    executed_steps: int,
-    rollout_steps: int,
-    first_action: np.ndarray,
-) -> None:
-    target = "unlimited" if rollout_steps == 0 else str(rollout_steps)
-    print(
-        json.dumps(
-            {
-                "rollout_chunk": chunk_index,
-                "actions_in_chunk": action_count,
-                "executed_steps": executed_steps,
-                "target_steps": target,
-                "first_action": decoded_action_summary(client.decode_action(first_action)),
-            },
-            indent=2,
-        ),
-        flush=True,
-    )
-
-
 def run_chunk_sync_rollout(
     *,
     client: OpenPiSimPiperClient,
@@ -394,7 +181,7 @@ def run_chunk_sync_rollout(
     initial_grippers: np.ndarray | None = None,
     old_gripper: bool = False,
 ) -> RolloutMetrics:
-    metrics = RolloutMetrics()
+    metrics = RolloutMetrics(execution_mode="chunk_sync")
     chunk_index = 0
     last_command_start_s: float | None = None
     next_snapshot = initial_snapshot
@@ -466,15 +253,6 @@ def run_chunk_sync_rollout(
     return metrics
 
 
-def save_metrics(metrics_summary: dict[str, Any], *, args: argparse.Namespace, recorder: OpenPiRolloutRecorder | None) -> None:
-    save_rollout_metrics_summary(
-        metrics_summary,
-        metrics_json_path=args.metrics_json,
-        run_dir=recorder.run_dir if recorder is not None else None,
-        record_stem=recorder.record_stem if recorder is not None else None,
-    )
-
-
 def run_once(args: argparse.Namespace) -> None:
     spec = load_openpi_sim_policy_spec(args.train_config)
     print(json.dumps(spec_summary(spec), indent=2), flush=True)
@@ -494,8 +272,14 @@ def run_once(args: argparse.Namespace) -> None:
     if args.execution_mode != "chunk_sync":
         raise NotImplementedError("openpi_sim EmbodiChain runner currently supports --execution-mode chunk_sync only")
 
-    asset_info = dataset_asset_info(args.train_config); record_assets = prepare_train_assets(train_config_name=args.train_config, cli_prompt=cli_prompt) if (args.record or args.window) else None
-    resolved_prompt, prompt_source = (record_assets.prompt, record_assets.prompt_source) if record_assets is not None else resolve_prompt(train_config_name=args.train_config, cli_prompt=cli_prompt, dataset_dir=asset_info.dataset_dir)
+    client_assets = prepare_client_assets(
+        client_kind="openpi_sim",
+        train_config_name=args.train_config,
+        cli_prompt=cli_prompt,
+        need_distribution=args.record or args.window,
+    )
+    resolved_prompt = client_assets.prompt
+    prompt_source = client_assets.prompt_source
 
     if resolved_prompt is None:
         raise RuntimeError(
@@ -531,7 +315,11 @@ def run_once(args: argparse.Namespace) -> None:
     client.gripper_lower, client.gripper_upper = args.gripper_lower, args.gripper_upper
 
     runtime_config = apply_runtime_overrides(load_config(args.config), args)
-    robot, cameras, source = make_runtime(runtime_config, commands_enabled=not args.dry_run)
+    robot, cameras, source = make_dual_piper_runtime(
+        runtime_config,
+        commands_enabled=not args.dry_run,
+        name="openpi_sim_piper_client",
+    )
     recording_schema = make_recording_schema(spec)
     saved_actions: list[np.ndarray] | None = [] if args.record else None
     recorder = (
@@ -571,17 +359,15 @@ def run_once(args: argparse.Namespace) -> None:
             if saved_actions is not None:
                 saved_actions.append(actions[0].copy())
             if recorder is not None:
-                distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
                 frame1_path = save_frame1_image(
                     recorder,
                     first_obs_snapshot,
-                    distribution_image_path=distribution_image_path,
+                    distribution_image_path=client_assets.distribution_image_path,
                 )
                 if frame1_path is not None:
                     print(f"Frame1 image saved to {frame1_path}", flush=True)
             if args.window:
-                distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
-                preview_until_continue(source, distribution_image_path=distribution_image_path)
+                preview_until_continue(source, distribution_image_path=client_assets.distribution_image_path)
             print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2), flush=True)
             return
 
@@ -590,22 +376,20 @@ def run_once(args: argparse.Namespace) -> None:
             print("Warning: Piper arm enable check did not report success; continuing anyway.", flush=True)
 
         chunk_size = resolve_chunk_size(spec, args.chunk_size)
-        initial_joints = initial_piper_joints(old_gripper=args.old_gripper)
+        initial_joints = resolve_dual_piper_init_joints(args.init_joints)
         print(json.dumps({"initial_pose": {"qpos": initial_joints.tolist()}}, indent=2), flush=True)
         robot.move_to_joint_positions(initial_joints, speed_percent=args.joint_speed_percent)
         first_obs_snapshot = snapshot_with_grippers(source.capture_snapshot(), initial_joints[[6, 13]])
         if recorder is not None:
-            distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
             frame1_path = save_frame1_image(
                 recorder,
                 first_obs_snapshot,
-                distribution_image_path=distribution_image_path,
+                distribution_image_path=client_assets.distribution_image_path,
             )
             if frame1_path is not None:
                 print(f"Frame1 image saved to {frame1_path}", flush=True)
         if args.window:
-            distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
-            preview_until_continue(source, distribution_image_path=distribution_image_path)
+            preview_until_continue(source, distribution_image_path=client_assets.distribution_image_path)
         print(
             json.dumps(
                 {
@@ -642,9 +426,15 @@ def run_once(args: argparse.Namespace) -> None:
         )
         if metrics.interrupted:
             print("Interrupted by user; stopping rollout.", flush=True)
-        metrics_summary = metrics.summary()
+        metrics_summary, written_metric_paths = save_rollout_metrics(
+            metrics,
+            metrics_json_path=args.metrics_json,
+            run_dir=recorder.run_dir if recorder is not None else None,
+            record_stem=recorder.record_stem if recorder is not None else None,
+        )
         print(json.dumps({"rollout_metrics": metrics_summary}, indent=2), flush=True)
-        save_metrics(metrics_summary, args=args, recorder=recorder)
+        for metrics_path in written_metric_paths:
+            print(f"Rollout metrics saved to {metrics_path}", flush=True)
     except KeyboardInterrupt:
         print("Interrupted by user; stopping rollout.", flush=True)
     finally:
@@ -676,9 +466,15 @@ def run_once(args: argparse.Namespace) -> None:
                 print(f"Recording saved to {output_path}", flush=True)
                 if frame1_path is None:
                     try:
-                        frame1_path = save_frame1_image(recorder, first_obs_snapshot)
+                        frame1_path = save_frame1_image(
+                            recorder,
+                            first_obs_snapshot,
+                            distribution_image_path=client_assets.distribution_image_path,
+                        )
                         if frame1_path is not None:
                             print(f"Frame1 image saved to {frame1_path}", flush=True)
+                        elif client_assets.skip_reason is not None:
+                            print(f"Skipped train-distribution frame1 image: {client_assets.skip_reason}", flush=True)
                     except Exception as exc:
                         print(f"Failed to save frame1 image: {exc}", flush=True)
 

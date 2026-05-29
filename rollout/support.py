@@ -4,14 +4,17 @@ import argparse
 import json
 from pathlib import Path
 import signal
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
 from clients import slai_piper_policy
-from clients.base import ControlMode, decoded_action_summary, used_action_names
+from clients.specs import decoded_action_summary
 from hardware.config import set_by_dotted_path
-from hardware import DualPiperObservationSource, DualPiperSystem, RealSenseRig
+from hardware.constants import DUAL_PIPER_INIT_JOINTS
+from hardware.piper import DualPiperSystem
+from hardware.realsense import RealSenseRig
+from hardware.runtime import DualPiperObservationSource
 from .recording import RecordingSchema
 
 
@@ -57,13 +60,40 @@ def make_dual_piper_runtime(config: dict[str, Any], *, commands_enabled: bool, n
     return robot, cameras, DualPiperObservationSource(robot=robot, cameras=cameras)
 
 
-def make_slai_recording_schema(spec: Any, control_mode: ControlMode) -> RecordingSchema:
+def used_slai_action_names(spec: Any, control_mode: str) -> frozenset[str]:
+    action_space = slai_piper_policy.space_from_action_config(spec.action_space)
+    names = slai_piper_policy.get_vector_names(spec.action_space)
+    slices = slai_piper_policy.field_slices_from_space(action_space)
+    used_fields = {"gripper"}
+    if control_mode == "joints":
+        used_fields.add("joint")
+    else:
+        used_fields.update(("ee_pos", "ee_rot"))
+
+    used: set[str] = set()
+    for arm in action_space["arms"]:
+        for field in used_fields:
+            field_slice = slices.get(f"{arm}_{field}")
+            if field_slice is None:
+                continue
+            used.update(names[index] for index in range(field_slice.start, field_slice.stop))
+    return frozenset(used)
+
+
+def make_slai_recording_schema(spec: Any, control_mode: str) -> Any:
     return RecordingSchema(
         camera_names=spec.image_ids,
         action_names=tuple(slai_piper_policy.get_vector_names(spec.action_space)),
         state_names=tuple(slai_piper_policy.get_vector_names(spec.state_space)),
-        used_action_names=used_action_names(spec, control_mode),
+        used_action_names=used_slai_action_names(spec, control_mode),
     )
+
+
+def resolve_dual_piper_init_joints(values: Sequence[float] | None) -> np.ndarray:
+    joints = np.asarray(DUAL_PIPER_INIT_JOINTS if values is None else values, dtype=np.float64)
+    if joints.shape != (14,):
+        raise ValueError("--init-joints expects exactly 14 values")
+    return joints.copy()
 
 
 def record_name_prefix(args: argparse.Namespace) -> str:
@@ -74,6 +104,7 @@ def record_name_prefix(args: argparse.Namespace) -> str:
 def install_record_signal_handlers() -> None:
     def raise_keyboard_interrupt(signum: int, frame: Any) -> None:
         raise KeyboardInterrupt(f"received signal {signum}")
+
     for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
         signal_value = getattr(signal, signal_name, None)
         if signal_value is None:

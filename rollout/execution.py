@@ -8,16 +8,14 @@ from typing import Any, Callable, Literal
 
 import numpy as np
 
-from .buffer import StreamActionBuffer
-from clients.openpi import PiperPolicySpec
-from clients.openpi import build_configured_piper_state as default_build_configured_piper_state
-from .metrics import save_rollout_metrics_summary
 from hardware.schemas import RobotSnapshot
+from .buffer import StreamActionBuffer
+from .metrics import save_rollout_metrics_summary
 
 
 ExecutionMode = Literal["streaming", "chunk_sync"]
 ChunkLogger = Callable[[int, int, int, np.ndarray], None]
-ConfiguredStateBuilder = Callable[[RobotSnapshot, Any], np.ndarray]
+ConfiguredStateBuilder = Callable[[Any, Any], np.ndarray]
 
 
 @dataclass
@@ -108,7 +106,7 @@ def action_sequence(actions: np.ndarray) -> np.ndarray:
     raise ValueError(f"Expected action vector or action chunk, got shape {actions.shape}")
 
 
-def resolve_chunk_size(spec: PiperPolicySpec, requested_chunk_size: int | None) -> int | None:
+def resolve_chunk_size(spec: Any, requested_chunk_size: int | None) -> int | None:
     if requested_chunk_size is not None:
         if requested_chunk_size <= 0:
             raise ValueError("--chunk-size must be positive when provided")
@@ -137,9 +135,11 @@ def sleep_until_next_action(action_start_s: float, fps: float) -> None:
 
 def configured_state_after_command(
     robot: Any,
-    spec: PiperPolicySpec,
-    state_builder: ConfiguredStateBuilder,
+    spec: Any,
+    state_builder: ConfiguredStateBuilder | None,
 ) -> np.ndarray:
+    if state_builder is None:
+        raise ValueError("A state_builder is required when recording rollout state")
     snapshot = RobotSnapshot(timestamp_s=time.time(), state=robot.read_state(), images={})
     return state_builder(snapshot, spec)
 
@@ -149,7 +149,7 @@ def run_chunk_sync_rollout(
     client: Any,
     source: Any,
     robot: Any,
-    spec: PiperPolicySpec,
+    spec: Any,
     prompt: str,
     rollout_steps: int,
     chunk_size: int | None,
@@ -158,7 +158,7 @@ def run_chunk_sync_rollout(
     saved_actions: list[np.ndarray] | None = None,
     log_chunk: ChunkLogger | None = None,
     initial_snapshot: Any | None = None,
-    state_builder: ConfiguredStateBuilder = default_build_configured_piper_state,
+    state_builder: ConfiguredStateBuilder | None = None,
 ) -> RolloutMetrics:
     metrics = RolloutMetrics(execution_mode="chunk_sync")
     chunk_index = 0
@@ -217,7 +217,7 @@ def run_temporal_smoothing_rollout(
     client: Any,
     source: Any,
     robot: Any,
-    spec: PiperPolicySpec,
+    spec: Any,
     prompt: str,
     rollout_steps: int,
     chunk_size: int | None,
@@ -231,7 +231,7 @@ def run_temporal_smoothing_rollout(
     log_chunk: ChunkLogger | None = None,
     first_action_timeout_s: float = 15.0,
     initial_snapshot: Any | None = None,
-    state_builder: ConfiguredStateBuilder = default_build_configured_piper_state,
+    state_builder: ConfiguredStateBuilder | None = None,
 ) -> RolloutMetrics:
     metrics = RolloutMetrics(execution_mode="streaming")
     buffer = StreamActionBuffer(

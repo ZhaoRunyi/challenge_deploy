@@ -3,31 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import signal
-from typing import Any
 
 import numpy as np
-from clients import slai_piper_policy
 
-from hardware.config import load_config, set_by_dotted_path
-from rollout.assets import (
-    dataset_asset_info,
-    prepare_train_assets,
-    resolve_prompt,
-)
+from hardware.config import load_config
+from rollout.assets import prepare_client_assets
+from clients.base import build_configured_piper_state
 from clients.openpi import (
-    ControlMode,
     OpenPiPiperClient,
-    PiperPolicySpec,
-    build_configured_piper_state,
-    decoded_action_summary,
     load_piper_policy_spec,
     spec_summary,
 )
-from hardware import DualPiperSystem
-from hardware import RealSenseRig
-from rollout.recording import OpenPiRolloutRecorder, RecordingSchema, preview_until_continue, save_frame1_image
-from hardware import DualPiperObservationSource
+from rollout.recording import OpenPiRolloutRecorder, preview_until_continue, save_frame1_image
 from rollout.execution import (
     action_sequence,
     resolve_chunk_size,
@@ -35,87 +22,21 @@ from rollout.execution import (
     save_rollout_metrics,
     run_temporal_smoothing_rollout,
 )
-
-
-DEPLOY_ROOT = Path(__file__).resolve().parent
-INIT_JOINTS = np.array(
-    [
-        -0.05918411,
-        0.00076794,
-        -0.12870058,
-        -0.13548991,
-        0.29586821,
-        0.13372713,
-        0.0,
-        0.08932595,
-        0.00970403,
-        -0.21027726,
-        -0.08838347,
-        0.39285615,
-        0.08686504,
-        0.0,
-    ],
-    dtype=np.float64,
+from rollout.support import (
+    apply_runtime_overrides,
+    decoded_action_summary,
+    ignore_record_signal_handlers,
+    install_record_signal_handlers,
+    make_dual_piper_runtime,
+    make_slai_recording_schema,
+    normalized_prompt,
+    print_rollout_chunk_summary,
+    record_name_prefix,
+    resolve_dual_piper_init_joints,
 )
 
 
-def used_action_names(spec: PiperPolicySpec, control_mode: ControlMode) -> frozenset[str]:
-    action_space = slai_piper_policy.space_from_action_config(spec.action_space)
-    names = slai_piper_policy.get_vector_names(spec.action_space)
-    slices = slai_piper_policy.field_slices_from_space(action_space)
-    used_fields = {"gripper"}
-    if control_mode == "joints":
-        used_fields.add("joint")
-    else:
-        used_fields.update(("ee_pos", "ee_rot"))
-
-    used: set[str] = set()
-    for arm in action_space["arms"]:
-        for field in used_fields:
-            field_slice = slices.get(f"{arm}_{field}")
-            if field_slice is None:
-                continue
-            used.update(names[index] for index in range(field_slice.start, field_slice.stop))
-    return frozenset(used)
-
-
-def make_recording_schema(spec: PiperPolicySpec, control_mode: ControlMode) -> RecordingSchema:
-    return RecordingSchema(
-        camera_names=spec.image_ids,
-        action_names=tuple(slai_piper_policy.get_vector_names(spec.action_space)),
-        state_names=tuple(slai_piper_policy.get_vector_names(spec.state_space)),
-        used_action_names=used_action_names(spec, control_mode),
-    )
-
-
-def record_name_prefix(args: argparse.Namespace) -> str:
-    ckpt_name = Path(args.ckpt_dir).name if args.ckpt_dir else args.train_config
-    return f"{ckpt_name}_{args.control_mode}_{args.execution_mode}"
-
-
-def install_record_signal_handlers() -> None:
-    def raise_keyboard_interrupt(signum: int, frame: Any) -> None:
-        raise KeyboardInterrupt(f"received signal {signum}")
-
-    for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
-        signal_value = getattr(signal, signal_name, None)
-        if signal_value is None:
-            continue
-        try:
-            signal.signal(signal_value, raise_keyboard_interrupt)
-        except (OSError, ValueError):
-            pass
-
-
-def ignore_record_signal_handlers() -> None:
-    for signal_name in ("SIGINT", "SIGTERM", "SIGHUP"):
-        signal_value = getattr(signal, signal_name, None)
-        if signal_value is None:
-            continue
-        try:
-            signal.signal(signal_value, signal.SIG_IGN)
-        except (OSError, ValueError):
-            pass
+DEPLOY_ROOT = Path(__file__).resolve().parent
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -189,6 +110,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=str(DEPLOY_ROOT / "configs" / "dual_piper_example.yaml"))
     parser.add_argument("--left-can", default=None)
     parser.add_argument("--right-can", default=None)
+    parser.add_argument(
+        "--init-joints",
+        nargs=14,
+        type=float,
+        default=None,
+        help="Optional 14D dual-Piper initial qpos override: left 7 then right 7.",
+    )
     parser.add_argument("--camera-front-serial", default=None)
     parser.add_argument("--camera-left-serial", default=None)
     parser.add_argument("--camera-right-serial", default=None)
@@ -198,74 +126,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spec-only", action="store_true", help="Only print the train-config-derived spaces; no server or hardware.")
     parser.add_argument("--ready-timeout", type=float, default=15.0)
     return parser
-
-
-def apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
-    if args.left_can:
-        set_by_dotted_path(config, "robot.left.can_name", args.left_can)
-    if args.right_can:
-        set_by_dotted_path(config, "robot.right.can_name", args.right_can)
-    if args.camera_front_serial:
-        set_by_dotted_path(config, "cameras.serials.cam_high", args.camera_front_serial)
-    if args.camera_right_serial:
-        set_by_dotted_path(config, "cameras.serials.cam_right_wrist", args.camera_right_serial)
-    if args.camera_left_serial:
-        set_by_dotted_path(config, "cameras.serials.cam_left_wrist", args.camera_left_serial)
-    if args.no_cameras:
-        set_by_dotted_path(config, "cameras.enabled", False)
-    return config
-
-
-def make_runtime(config: dict[str, Any], *, commands_enabled: bool) -> tuple[Any, Any, Any]:
-    robot = DualPiperSystem(
-        left_can_name=config["robot"]["left"]["can_name"],
-        right_can_name=config["robot"]["right"]["can_name"],
-        commands_enabled=commands_enabled,
-        name="openpi_piper_client",
-    )
-    cameras = None
-    if config["cameras"]["enabled"]:
-        cameras = RealSenseRig(
-            config["cameras"]["serials"],
-            width=int(config["cameras"]["width"]),
-            height=int(config["cameras"]["height"]),
-            fps=int(config["cameras"]["fps"]),
-            warmup_frames=int(config["cameras"]["warmup_frames"]),
-        )
-    return robot, cameras, DualPiperObservationSource(robot=robot, cameras=cameras)
-
-
-def normalized_prompt(value: str | None) -> str | None:
-    if value is None:
-        return None
-    prompt = value.strip()
-    return prompt or None
-
-
-def print_rollout_chunk_summary(
-    *,
-    client: OpenPiPiperClient,
-    chunk_index: int,
-    action_count: int,
-    executed_steps: int,
-    rollout_steps: int,
-    first_action: np.ndarray,
-) -> None:
-    summary = decoded_action_summary(client.decode_action(first_action))
-    target = "unlimited" if rollout_steps == 0 else str(rollout_steps)
-    print(
-        json.dumps(
-            {
-                "rollout_chunk": chunk_index,
-                "actions_in_chunk": action_count,
-                "executed_steps": executed_steps,
-                "target_steps": target,
-                "first_action": summary,
-            },
-            indent=2,
-        ),
-        flush=True,
-    )
 
 
 def run_once(args: argparse.Namespace) -> None:
@@ -285,21 +145,14 @@ def run_once(args: argparse.Namespace) -> None:
     if args.inference_rate is not None and args.inference_rate < 0.0:
         raise ValueError("--inference-rate must be non-negative")
 
-    record_assets = None
-    if args.record or args.window:
-        record_assets = prepare_train_assets(
-            train_config_name=args.train_config,
-            cli_prompt=cli_prompt,
-        )
-        resolved_prompt = record_assets.prompt
-        prompt_source = record_assets.prompt_source
-    else:
-        asset_info = dataset_asset_info(args.train_config)
-        resolved_prompt, prompt_source = resolve_prompt(
-            train_config_name=args.train_config,
-            cli_prompt=cli_prompt,
-            dataset_dir=asset_info.dataset_dir,
-        )
+    client_assets = prepare_client_assets(
+        client_kind="openpi",
+        train_config_name=args.train_config,
+        cli_prompt=cli_prompt,
+        need_distribution=args.record or args.window,
+    )
+    resolved_prompt = client_assets.prompt
+    prompt_source = client_assets.prompt_source
 
     if resolved_prompt is None:
         raise RuntimeError(
@@ -327,8 +180,12 @@ def run_once(args: argparse.Namespace) -> None:
         old_gripper=args.old_gripper,
     )
     runtime_config = apply_runtime_overrides(load_config(args.config), args)
-    robot, cameras, source = make_runtime(runtime_config, commands_enabled=not args.dry_run)
-    recording_schema = make_recording_schema(spec, args.control_mode)
+    robot, cameras, source = make_dual_piper_runtime(
+        runtime_config,
+        commands_enabled=not args.dry_run,
+        name="openpi_piper_client",
+    )
+    recording_schema = make_slai_recording_schema(spec, args.control_mode)
     saved_actions: list[np.ndarray] | None = [] if args.record else None
     recorder = (
         OpenPiRolloutRecorder(
@@ -367,17 +224,15 @@ def run_once(args: argparse.Namespace) -> None:
             if saved_actions is not None:
                 saved_actions.append(actions[0].copy())
             if recorder is not None:
-                distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
                 frame1_compare_path = save_frame1_image(
                     recorder,
                     snapshot,
-                    distribution_image_path=distribution_image_path,
+                    distribution_image_path=client_assets.distribution_image_path,
                 )
                 if frame1_compare_path is not None:
                     print(f"Frame1 comparison saved to {frame1_compare_path}", flush=True)
             if args.window:
-                distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
-                preview_until_continue(source, distribution_image_path=distribution_image_path)
+                preview_until_continue(source, distribution_image_path=client_assets.distribution_image_path)
             print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2))
             return
 
@@ -406,21 +261,20 @@ def run_once(args: argparse.Namespace) -> None:
             if args.buffer_max_chunks is not None
             else int(runtime_config["policy"]["buffer_max_chunks"])
         )
-        print(json.dumps({"initial_pose": {"qpos": INIT_JOINTS.tolist()}}, indent=2), flush=True)
-        robot.move_to_joint_positions(INIT_JOINTS, speed_percent=args.joint_speed_percent)
+        initial_joints = resolve_dual_piper_init_joints(args.init_joints)
+        print(json.dumps({"initial_pose": {"qpos": initial_joints.tolist()}}, indent=2), flush=True)
+        robot.move_to_joint_positions(initial_joints, speed_percent=args.joint_speed_percent)
         first_obs_snapshot = source.capture_snapshot()
         if recorder is not None:
-            distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
             frame1_compare_path = save_frame1_image(
                 recorder,
                 first_obs_snapshot,
-                distribution_image_path=distribution_image_path,
+                distribution_image_path=client_assets.distribution_image_path,
             )
             if frame1_compare_path is not None:
                 print(f"Frame1 comparison saved to {frame1_compare_path}", flush=True)
         if args.window:
-            distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
-            preview_until_continue(source, distribution_image_path=distribution_image_path)
+            preview_until_continue(source, distribution_image_path=client_assets.distribution_image_path)
 
         print(
             json.dumps(
@@ -533,16 +387,15 @@ def run_once(args: argparse.Namespace) -> None:
                 print(f"Recording saved to {output_path}", flush=True)
                 try:
                     if frame1_compare_path is None:
-                        distribution_image_path = None if record_assets is None else record_assets.distribution_image_path
                         frame1_compare_path = save_frame1_image(
                             recorder,
                             first_obs_snapshot,
-                            distribution_image_path=distribution_image_path,
+                            distribution_image_path=client_assets.distribution_image_path,
                         )
                     if frame1_compare_path is not None:
                         print(f"Frame1 comparison saved to {frame1_compare_path}", flush=True)
-                    elif record_assets is not None and record_assets.skip_reason is not None:
-                        print(f"Skipped train-distribution frame1 image: {record_assets.skip_reason}", flush=True)
+                    elif client_assets.skip_reason is not None:
+                        print(f"Skipped train-distribution frame1 image: {client_assets.skip_reason}", flush=True)
                 except Exception as exc:
                     print(f"Failed to save frame1 comparison image: {exc}", flush=True)
 
