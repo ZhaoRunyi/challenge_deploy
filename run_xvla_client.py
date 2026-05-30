@@ -4,8 +4,11 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
+
 from clients.xvla import (
     XVLAPiperClient,
+    build_full_piper_state,
     load_piper_policy_spec,
     spec_summary,
 )
@@ -17,12 +20,14 @@ from rollout.execution import (
     run_chunk_sync_rollout,
     save_rollout_metrics,
 )
-from rollout.recording import preview_until_continue
+from rollout.recording import RolloutVideoRecorder, preview_until_continue, save_frame1_image, save_recorded_actions
 from rollout.support import (
     apply_runtime_overrides,
     make_dual_piper_runtime,
+    make_slai_recording_schema,
     normalized_prompt,
     print_rollout_chunk_summary,
+    record_name_prefix,
     resolve_dual_piper_init_joints,
 )
 
@@ -47,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--metrics-json", default=None, help="Optional path to save rollout timing metrics as JSON.")
+    parser.add_argument("--record", action="store_true")
+    parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "xvla_records"))
     parser.add_argument("--config", default=str(DEPLOY_ROOT / "configs" / "dual_piper_example.yaml"))
     parser.add_argument("--left-can", default=None)
     parser.add_argument("--right-can", default=None)
@@ -79,7 +86,7 @@ def main() -> None:
         client_kind="xvla",
         train_config_name=args.train_config,
         cli_prompt=cli_prompt,
-        need_distribution=args.window,
+        need_distribution=args.record or args.window,
         spec=spec,
     )
     resolved_prompt = client_assets.prompt
@@ -116,6 +123,18 @@ def main() -> None:
         commands_enabled=not args.dry_run,
         name="xvla_piper_client",
     )
+    recorder = (
+        RolloutVideoRecorder(
+            output_dir=args.record_dir,
+            schema=make_slai_recording_schema(spec, args.control_mode),
+            fps=args.fps,
+            name_prefix=record_name_prefix(args),
+        )
+        if args.record
+        else None
+    )
+    saved_actions: list[np.ndarray] | None = [] if recorder is not None else None
+    state_builder = lambda snapshot, policy_spec: build_full_piper_state(snapshot, policy_spec, old_gripper=args.old_gripper)
     robot.connect(read_only=args.dry_run)
     try:
         if cameras is not None:
@@ -144,6 +163,14 @@ def main() -> None:
         initial_joints = resolve_dual_piper_init_joints(args.init_joints)
         print(json.dumps({"initial_pose": {"qpos": initial_joints.tolist()}}, indent=2), flush=True)
         robot.move_to_joint_positions(initial_joints, speed_percent=args.joint_speed_percent)
+        if recorder is not None:
+            frame1_path = save_frame1_image(
+                recorder,
+                source.capture_snapshot(),
+                distribution_image_path=client_assets.distribution_image_path,
+            )
+            if frame1_path is not None:
+                print(f"Frame1 comparison saved to {frame1_path}", flush=True)
         if args.window:
             preview_until_continue(source, distribution_image_path=client_assets.distribution_image_path)
             if client_assets.skip_reason is not None:
@@ -168,7 +195,10 @@ def main() -> None:
             rollout_steps=args.rollout_steps,
             chunk_size=chunk_size,
             fps=args.fps,
+            recorder=recorder,
+            saved_actions=saved_actions,
             log_chunk=log_chunk,
+            state_builder=state_builder,
         )
         if metrics.interrupted:
             print("Interrupted by user; stopping rollout.", flush=True)
@@ -177,6 +207,18 @@ def main() -> None:
         for metrics_path in written_metric_paths:
             print(f"Rollout metrics saved to {metrics_path}", flush=True)
     finally:
+        if recorder is not None:
+            try:
+                action_path = save_recorded_actions(recorder, saved_actions, recorder.schema.action_names)
+                print(f"Actions saved to {action_path}", flush=True)
+            except Exception as exc:
+                print(f"Failed to save actions: {exc}", flush=True)
+            try:
+                output_path = recorder.finalize()
+                if output_path is not None:
+                    print(f"Recording saved to {output_path}", flush=True)
+            except Exception as exc:
+                print(f"Failed to finalize recording: {exc}", flush=True)
         if cameras is not None:
             cameras.stop()
         robot.disconnect()

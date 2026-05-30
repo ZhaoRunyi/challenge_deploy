@@ -19,7 +19,7 @@ from clients.openpi_sim import (
     load_openpi_sim_policy_spec,
     spec_summary,
 )
-from rollout.recording import OpenPiRolloutRecorder, RecordingSchema, preview_until_continue, save_frame1_image
+from rollout.recording import RolloutVideoRecorder, RecordingSchema, preview_until_continue, save_frame1_image, save_recorded_actions
 from hardware.schemas import RobotSnapshot
 from rollout.execution import (
     RolloutMetrics,
@@ -175,7 +175,7 @@ def run_chunk_sync_rollout(
     rollout_steps: int,
     chunk_size: int | None,
     fps: float,
-    recorder: OpenPiRolloutRecorder | None = None,
+    recorder: RolloutVideoRecorder | None = None,
     saved_actions: list[np.ndarray] | None = None,
     initial_snapshot: Any | None = None,
     initial_grippers: np.ndarray | None = None,
@@ -323,7 +323,7 @@ def run_once(args: argparse.Namespace) -> None:
     recording_schema = make_recording_schema(spec)
     saved_actions: list[np.ndarray] | None = [] if args.record else None
     recorder = (
-        OpenPiRolloutRecorder(
+        RolloutVideoRecorder(
             output_dir=args.record_dir,
             schema=recording_schema,
             fps=args.fps,
@@ -451,9 +451,7 @@ def run_once(args: argparse.Namespace) -> None:
             print(f"Failed to disconnect robot cleanly: {exc}", flush=True)
         if recorder is not None:
             try:
-                action_path = recorder.run_dir / f"{recorder.record_stem}_actions.npz"
-                action_trajectory = np.stack(saved_actions, axis=0) if saved_actions else np.empty((0, len(recording_schema.action_names)), dtype=np.float64)
-                np.savez_compressed(action_path, action_mean_trajectory=action_trajectory, action_names=np.asarray(recording_schema.action_names))
+                action_path = save_recorded_actions(recorder, saved_actions, recording_schema.action_names)
                 print(f"Actions saved to {action_path}", flush=True)
             except Exception as exc:
                 print(f"Failed to save actions: {exc}", flush=True)

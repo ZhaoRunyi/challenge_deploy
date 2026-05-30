@@ -14,7 +14,7 @@ from clients.openpi import (
     load_piper_policy_spec,
     spec_summary,
 )
-from rollout.recording import OpenPiRolloutRecorder, preview_until_continue, save_frame1_image
+from rollout.recording import RolloutVideoRecorder, preview_until_continue, save_frame1_image, save_recorded_actions
 from rollout.execution import (
     action_sequence,
     resolve_chunk_size,
@@ -188,7 +188,7 @@ def run_once(args: argparse.Namespace) -> None:
     recording_schema = make_slai_recording_schema(spec, args.control_mode)
     saved_actions: list[np.ndarray] | None = [] if args.record else None
     recorder = (
-        OpenPiRolloutRecorder(
+        RolloutVideoRecorder(
             output_dir=args.record_dir,
             schema=recording_schema,
             fps=args.fps,
@@ -372,9 +372,7 @@ def run_once(args: argparse.Namespace) -> None:
             print(f"Failed to disconnect robot cleanly: {exc}", flush=True)
         if recorder is not None:
             try:
-                action_path = recorder.run_dir / f"{recorder.record_stem}_actions.npz"
-                action_trajectory = np.stack(saved_actions, axis=0) if saved_actions else np.empty((0, len(recording_schema.action_names)), dtype=np.float64)
-                np.savez_compressed(action_path, action_mean_trajectory=action_trajectory, action_names=np.asarray(recording_schema.action_names))
+                action_path = save_recorded_actions(recorder, saved_actions, recording_schema.action_names)
                 print(f"Actions saved to {action_path}", flush=True)
             except Exception as exc:
                 print(f"Failed to save actions: {exc}", flush=True)

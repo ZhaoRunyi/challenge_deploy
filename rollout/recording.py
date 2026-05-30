@@ -244,8 +244,18 @@ class RolloutVideoRecorder:
         rects = plot_rects(width=width, height=height, count=len(names), cols=cols)
         return base, final, rects
 
-
-OpenPiRolloutRecorder = RolloutVideoRecorder
+def save_recorded_actions(
+    recorder: RolloutVideoRecorder,
+    saved_actions: list[np.ndarray] | None,
+    action_names: tuple[str, ...],
+) -> Path:
+    action_path = recorder.run_dir / f"{recorder.record_stem}_actions.npz"
+    if saved_actions:
+        action_trajectory = np.stack(saved_actions, axis=0)
+    else:
+        action_trajectory = np.empty((0, len(action_names)), dtype=np.float64)
+    np.savez_compressed(action_path, action_mean_trajectory=action_trajectory, action_names=np.asarray(action_names))
+    return action_path
 
 
 def to_bgr_uint8(image: np.ndarray) -> np.ndarray:
