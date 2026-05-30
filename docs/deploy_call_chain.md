@@ -1,8 +1,9 @@
 # Deploy Call Chain
 
-这个目录现在只保留三条最外层真机部署入口：
+这个目录现在只保留四条最外层部署入口：
 
-- `run_openpi_clients.py`
+- `run_openpi_client.py`
+- `run_xvla_client.py`
 - `run_openpi_sim_client.py`
 - `run_motus_client.py`
 
@@ -20,9 +21,10 @@
 
 ```mermaid
 flowchart TD
-    A[run_openpi_clients.py] --> R
-    B[run_openpi_sim_client.py] --> R
-    C[run_motus_client.py] --> R
+    A[run_openpi_client.py] --> R
+    B[run_xvla_client.py] --> R
+    C[run_openpi_sim_client.py] --> R
+    D[run_motus_client.py] --> R
 
     R[runner: parse args / load config / init runtime] --> CFG[hardware/config.py]
     R --> OBS[hardware/runtime.py<br/>DualPiperObservationSource]
@@ -34,14 +36,17 @@ flowchart TD
     ROBOT --> SNAP
 
     A --> OA[clients/openpi.py]
-    B --> SA[clients/openpi_sim.py]
-    C --> MA[clients/motus.py]
+    B --> XA[clients/xvla.py]
+    C --> SA[clients/openpi_sim.py]
+    D --> MA[clients/motus.py]
 
     OA --> WS1[openpi_client.websocket_client_policy]
+    XA --> WSX[xvla_client.websocket_client_policy]
     SA --> WS1
     MA --> WS2[Motus websocket_client_policy]
 
     WS1 --> S1[OpenPI server]
+    WSX --> SX[X-VLA server]
     WS2 --> S2[Motus server]
 
     A --> ROLL[rollout/execution.py]
@@ -60,8 +65,8 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[run_openpi_clients.py] --> A1[load_piper_policy_spec]
-    A --> A2[prepare_train_assets / resolve_prompt]
+    A[run_openpi_client.py] --> A1[load_piper_policy_spec]
+    A --> A2[prepare_lerobot_assets / resolve_prompt]
     A --> A3[OpenPiPiperClient]
     A --> A4[_make_runtime]
 
@@ -208,7 +213,8 @@ flowchart TD
 
 当前 `challenge_deploy/` 只围绕下面这些文件保留：
 
-- `run_openpi_clients.py`
+- `run_openpi_client.py`
+- `run_xvla_client.py`
 - `run_openpi_sim_client.py`
 - `run_motus_client.py`
 - `configs/dual_piper_example.yaml`

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 from typing import Any, Literal
 
 import cv2
@@ -12,17 +14,54 @@ from . import slai_piper_policy
 from .specs import SlaiPolicySpec, slai_policy_spec_summary
 
 ControlMode = Literal["joints", "ee_pose"]
+PIPER_FULL_OPEN = 0.1
 ACTION_MODE_IDS = {
     "slai_piper": "ee_gripper",
     "slai_piper_ee_gripper": "ee_gripper",
     "slai_piper_joint_gripper": "joint_gripper",
     "slai_piper_all": "all",
 }
-PIPER_FULL_OPEN = 0.1
+PIPER_TASKS = {
+    "Piper_beaker_mixer_0421": "Pick the beaker, place it on the mixer, then flip the toggle switch with the other arm.",
+    "Piper_carry_basket_0426": "Pick the bottle then place it to the basket, carry the basket with the other arm.",
+    "Piper_click_bell_0403": "Click the bell",
+    "Piper_depress_pipette_0421": "Pick the pipette and move it to the center-top of the beaker, use the other arm to depress the plunger.",
+    "Piper_dock_tubes_0421": "Pick up two centrifuge tubes from the table and dock them horizontally.",
+    "Piper_insert_test_tube_0430": "Pick up the test tube, and it to the other arm, and insert it to the rack.",
+    "Piper_items_hand_over_place_0421": "Pick up the pen, hand it over to the other arm and then place it in to the pen holder",
+    "Piper_open_drawer_0421": "Open the drawer, pick the tomato with the other arm then place it in the drawer.",
+    "Piper_open_pan_0421": "Grab the knod on the pan lid, lift it to open the pan, then pick the carrot with the other arm, place it in the pan, then move the lid back to the pan to close it.",
+    "Piper_pour_dual_0427": "Pick the cup and the bottle with the other arm, pour the water from bottle to cup",
+    "Piper_rearr_0421": "Pick the fork and the spoon, place them next to the plate.",
+}
 
 
 class PiperPolicySpec(SlaiPolicySpec):
     pass
+
+
+@dataclass(frozen=True)
+class XVLATrainConfig:
+    name: str
+    action_mode: str
+    space_id: str
+    dataset_names: tuple[str, ...]
+    prompt: str | None = None
+    prompts: tuple[str, ...] = ()
+
+    @property
+    def distribution_name(self) -> str:
+        return self.dataset_names[0] if len(self.dataset_names) == 1 else self.name
+
+    @property
+    def distribution_aliases(self) -> tuple[str, ...]:
+        if len(self.dataset_names) != 1:
+            return (self.name, "Piper_all_tasks", "all_tasks")
+        aliases = [self.name]
+        for dataset_name in self.dataset_names:
+            aliases.append(dataset_name)
+            aliases.append(dataset_name.removeprefix("Piper_"))
+        return tuple(dict.fromkeys(alias for alias in aliases if alias))
 
 
 @dataclass(frozen=True)
@@ -37,6 +76,72 @@ class DecodedArmAction:
 class DecodedPiperAction:
     arms: dict[str, DecodedArmAction]
     control_mode: ControlMode
+
+
+def task_config_name(dataset_name: str) -> str:
+    stem = dataset_name.removeprefix("Piper_").rsplit("_", 1)[0]
+    return f"slai_piper_{stem}_ee20_xvla_pt_bs256_400000"
+
+
+def make_task_config(dataset_name: str) -> XVLATrainConfig:
+    return XVLATrainConfig(
+        name=task_config_name(dataset_name),
+        action_mode="slai_piper",
+        space_id=ACTION_MODE_IDS["slai_piper"],
+        dataset_names=(dataset_name,),
+        prompt=PIPER_TASKS[dataset_name],
+    )
+
+
+def dataset_names_from_metas(metas_path: Any) -> tuple[str, ...]:
+    paths = metas_path if isinstance(metas_path, list) else [metas_path]
+    dataset_names = []
+    for value in paths:
+        path = Path(str(value))
+        if path.name == "info.json" and path.parent.name == "meta":
+            dataset_names.append(path.parent.parent.name)
+    return tuple(dataset_names)
+
+
+def config_from_json(path: Path) -> XVLATrainConfig:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if "configs" in payload:
+        raise ValueError(f"{path} contains multiple train configs; pass a concrete registered train-config name")
+    action_mode = str(payload.get("action_mode", "slai_piper"))
+    if action_mode not in ACTION_MODE_IDS:
+        raise ValueError(f"Unsupported X-VLA action_mode {action_mode!r}")
+    dataset_names = payload.get("dataset_name") or dataset_names_from_metas(payload.get("train_metas_path"))
+    if isinstance(dataset_names, str):
+        dataset_names = (dataset_names,)
+    prompt = payload.get("prompt")
+    prompts = tuple(str(item) for item in payload.get("prompts", ()) if item)
+    return XVLATrainConfig(
+        name=str(payload.get("name") or payload.get("exp_name") or path.stem),
+        action_mode=action_mode,
+        space_id=ACTION_MODE_IDS[action_mode],
+        dataset_names=tuple(str(name) for name in dataset_names),
+        prompt=str(prompt) if prompt else None,
+        prompts=prompts,
+    )
+
+
+XVLA_TRAIN_CONFIGS = {task_config_name(name): make_task_config(name) for name in PIPER_TASKS}
+XVLA_TRAIN_CONFIGS["slai_piper_all_tasks_ee20_xvla_pt_bs256_400000"] = XVLATrainConfig(
+    name="slai_piper_all_tasks_ee20_xvla_pt_bs256_400000",
+    action_mode="slai_piper",
+    space_id=ACTION_MODE_IDS["slai_piper"],
+    dataset_names=tuple(PIPER_TASKS),
+    prompts=tuple(PIPER_TASKS.values()),
+)
+
+
+def load_xvla_train_config(name_or_path: str) -> XVLATrainConfig:
+    path = Path(name_or_path)
+    if path.is_file():
+        return config_from_json(path)
+    if name_or_path not in XVLA_TRAIN_CONFIGS:
+        raise ValueError(f"Unknown X-VLA train config {name_or_path!r}. Available: {sorted(XVLA_TRAIN_CONFIGS)}")
+    return XVLA_TRAIN_CONFIGS[name_or_path]
 
 
 def rpy_to_rotation(rpy: np.ndarray, rotation_format: str) -> np.ndarray:
@@ -81,17 +186,14 @@ def image_to_rgb(image: np.ndarray) -> np.ndarray:
 
 
 def load_piper_policy_spec(train_config_name: str) -> PiperPolicySpec:
-    if train_config_name not in ACTION_MODE_IDS:
-        raise ValueError(
-            f"X-VLA deploy client currently supports {sorted(ACTION_MODE_IDS)}, got {train_config_name!r}"
-        )
-    ids = ACTION_MODE_IDS[train_config_name]
+    train_config = load_xvla_train_config(train_config_name)
+    ids = train_config.space_id
     state_space = slai_piper_policy.StateSpaceConfig(ids=ids)
     action_space = slai_piper_policy.ActionSpaceConfig(ids=ids)
     image_space = slai_piper_policy.ImageSpaceConfig(ids="all")
     return PiperPolicySpec(
-        train_config_name=train_config_name,
-        train_config=None,
+        train_config_name=train_config.name,
+        train_config=train_config,
         state_space=state_space,
         action_space=action_space,
         image_space=image_space,
@@ -135,7 +237,7 @@ def build_policy_payload(
     payload: dict[str, Any] = {
         "observation.state": build_full_piper_state(snapshot, spec, old_gripper=old_gripper),
         "prompt": prompt,
-        "action_mode": spec.train_config_name,
+        "action_mode": spec.train_config.action_mode,
         "domain_id": int(domain_id),
         "steps": int(steps),
     }
@@ -255,4 +357,10 @@ class XVLAPiperClient:
 
 
 def spec_summary(spec: PiperPolicySpec) -> dict[str, Any]:
-    return slai_policy_spec_summary(spec)
+    return slai_policy_spec_summary(
+        spec,
+        extra={
+            "action_mode": spec.train_config.action_mode,
+            "dataset_names": list(spec.train_config.dataset_names),
+        },
+    )

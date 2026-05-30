@@ -9,8 +9,8 @@
 
 ### 真机推理
 
-- `run_openpi_clients.py`
-- `run_xvla_clients.py`
+- `run_openpi_client.py`
+- `run_xvla_client.py`
 - `run_openpi_sim_client.py`
 - `run_motus_client.py`
 
@@ -32,8 +32,8 @@ challenge_deploy/
 ├── hardware/    # Piper, RealSense, runtime source, config, schemas, conversions
 ├── rollout/     # rollout execution, recording, metrics, train assets
 ├── teleop/      # HDF5 teleop collector and episode preview
-├── run_openpi_clients.py
-├── run_xvla_clients.py
+├── run_openpi_client.py
+├── run_xvla_client.py
 ├── run_openpi_sim_client.py
 ├── run_motus_client.py
 ├── run_hdf5_teleop_collect.py
@@ -72,7 +72,6 @@ challenge_deploy/
 cd /workspace/X-VLA
 /workspace/X-VLA/.venv/bin/python -m scripts.serve_policy \
   --model_path /path/to/your/xvla \
-  --processor_path /path/to/your/xvla \
   --port 8000
 ```
 
@@ -80,10 +79,11 @@ cd /workspace/X-VLA
 
 ```bash
 cd /workspace/deploy
-python run_xvla_clients.py \
-  --train-config slai_piper \
+python run_xvla_client.py \
+  --train-config slai_piper_items_hand_over_place_ee20_xvla_pt_bs256_400000 \
   --host 127.0.0.1 \
   --port 8000 \
-  --prompt "hand over the item" \
   --control-mode ee_pose
 ```
+
+`--train-config` 必须是一个真实训练配置名；prompt 和训练分布图按训练配置的数据源匹配。

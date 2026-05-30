@@ -7,11 +7,22 @@ name = "challenge_deploy"
 version = "0.1.0"
 description = "ROS-free Piper deployment and HDF5 teleop data collection utilities for challenge_ws."
 requires-python = ">=3.10"
-dependencies = ["msgpack", "websockets"]
+dependencies = [
+    "imageio",
+    "imageio-ffmpeg",
+    "msgpack",
+    "numpy<2",
+    "opencv-python-headless",
+    "piper_sdk",
+    "pyrealsense2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "PyYAML",
+    "scipy",
+    "websockets",
+]
 
 [project.scripts]
-challenge-deploy-openpi-client = "run_openpi_clients:main"
-challenge-deploy-xvla-client = "run_xvla_clients:main"
+challenge-deploy-openpi-client = "run_openpi_client:main"
+challenge-deploy-xvla-client = "run_xvla_client:main"
 challenge-deploy-openpi-sim-client = "run_openpi_sim_client:main"
 challenge-deploy-motus-client = "run_motus_client:main"
 challenge-deploy-hdf5_teleop-collect = "run_hdf5_teleop_collect:main"
@@ -19,8 +30,8 @@ challenge-deploy-hdf5_teleop-episode-vis = "run_hdf5_teleop_episode_vis:main"
 
 [tool.setuptools]
 py-modules = [
-    "run_openpi_clients",
-    "run_xvla_clients",
+    "run_openpi_client",
+    "run_xvla_client",
     "run_openpi_sim_client",
     "run_motus_client",
     "run_hdf5_teleop_collect",

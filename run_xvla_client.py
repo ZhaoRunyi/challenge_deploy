@@ -31,7 +31,7 @@ DEPLOY_ROOT = Path(__file__).resolve().parent
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="X-VLA SLAI Piper client.")
-    parser.add_argument("--train-config", default="slai_piper")
+    parser.add_argument("--train-config", default="slai_piper_items_hand_over_place_ee20_xvla_pt_bs256_400000")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--prompt", required=False)
@@ -80,11 +80,13 @@ def main() -> None:
         train_config_name=args.train_config,
         cli_prompt=cli_prompt,
         need_distribution=args.window,
+        spec=spec,
     )
     resolved_prompt = client_assets.prompt
     if resolved_prompt is None:
         raise RuntimeError(
-            "No prompt available. Provide --prompt, or add a matching entry to deploy/artifacts/trainconfig_prompts.json."
+            "No prompt available for this train config. Provide --prompt, or add a matching entry to "
+            "deploy/artifacts/trainconfig_prompts.json."
         )
     print(
         json.dumps(
