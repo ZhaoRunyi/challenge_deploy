@@ -44,7 +44,6 @@ def build_parser() -> argparse.ArgumentParser:
         description="OpenPI SLAI Piper client: capture snapshots, infer chunks, and command Piper in a rollout."
     )
     parser.add_argument("--train-config", required=True, help="OpenPI train config name, e.g. pi0_slai_piper_template.")
-    parser.add_argument("--ckpt-dir", default=None, help="Checkpoint directory used only for record video filenames.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--prompt", default=None)
@@ -174,6 +173,8 @@ def run_once(args: argparse.Namespace) -> None:
     )
     client.left_gripper_threshold, client.right_gripper_threshold, client.left_gripper_lower, client.left_gripper_upper, client.right_gripper_lower, client.right_gripper_upper = args.left_gripper_threshold, args.right_gripper_threshold, args.left_gripper_lower, args.left_gripper_upper, args.right_gripper_lower, args.right_gripper_upper
     client.gripper_lower, client.gripper_upper = args.gripper_lower, args.gripper_upper
+    server_metadata = client.get_server_metadata()
+    print(json.dumps({"server_metadata": server_metadata}, indent=2), flush=True)
     state_builder = lambda snapshot, policy_spec: build_configured_piper_state(
         snapshot,
         policy_spec,
@@ -192,7 +193,7 @@ def run_once(args: argparse.Namespace) -> None:
             output_dir=args.record_dir,
             schema=recording_schema,
             fps=args.fps,
-            name_prefix=record_name_prefix(args),
+            name_prefix=record_name_prefix(args, server_metadata),
         )
         if args.record
         else None

@@ -53,7 +53,6 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Motus YAML config path, e.g. baselines/Motus/configs/piper_click_bell_0403_robotwin_like.yaml.",
     )
-    parser.add_argument("--ckpt-dir", default=None, help="Checkpoint directory used only for record video filenames.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--prompt", default=None)
@@ -238,7 +237,7 @@ def run_once(args: argparse.Namespace) -> None:
             output_dir=args.record_dir,
             schema=recording_schema,
             fps=args.fps,
-            name_prefix=record_name_prefix(args),
+            name_prefix=record_name_prefix(args, server_metadata),
         )
         if args.record
         else None

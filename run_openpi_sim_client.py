@@ -25,6 +25,7 @@ from rollout.execution import (
     RolloutMetrics,
     action_sequence,
     resolve_chunk_size,
+    run_temporal_smoothing_rollout,
     save_rollout_metrics,
     sleep_until_next_action,
     trim_chunk,
@@ -49,7 +50,6 @@ def build_parser() -> argparse.ArgumentParser:
         description="OpenPI-sim EmbodiChain dual Piper client: fixed 14D joints+gripper01 action space."
     )
     parser.add_argument("--train-config", required=True, help="OpenPI train config name, e.g. pi0_slai_piper_template.")
-    parser.add_argument("--ckpt-dir", default=None, help="Checkpoint directory used only for record video filenames.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--prompt", default=None)
@@ -165,6 +165,24 @@ def configured_state_after_command(
     return build_configured_piper_state(snapshot, spec, old_gripper=old_gripper)
 
 
+class OpenPiSimStreamingAdapter:
+    def __init__(self, client: OpenPiSimPiperClient, source: Any, initial_grippers: np.ndarray) -> None:
+        self.client = client
+        self.source = source
+        self.last_grippers = np.asarray(initial_grippers, dtype=np.float64)
+
+    def capture_snapshot(self) -> RobotSnapshot:
+        return snapshot_with_grippers(self.source.capture_snapshot(), self.last_grippers)
+
+    def infer_actions(self, snapshot: RobotSnapshot, prompt: str) -> np.ndarray:
+        return self.client.infer_actions(snapshot, prompt=prompt)
+
+    def command_action(self, robot: Any, action: np.ndarray) -> None:
+        decoded = self.client.decode_action(action)
+        self.client.command_action(robot, action)
+        self.last_grippers = np.array([decoded.arms["left"].gripper, decoded.arms["right"].gripper], dtype=np.float64)
+
+
 def run_chunk_sync_rollout(
     *,
     client: OpenPiSimPiperClient,
@@ -269,8 +287,6 @@ def run_once(args: argparse.Namespace) -> None:
         raise ValueError("--gripper_threshold cannot be combined with --gripper_lower/--gripper_upper")
     if args.inference_rate is not None and args.inference_rate < 0.0:
         raise ValueError("--inference-rate must be non-negative")
-    if args.execution_mode != "chunk_sync":
-        raise NotImplementedError("openpi_sim EmbodiChain runner currently supports --execution-mode chunk_sync only")
 
     client_assets = prepare_client_assets(
         client_kind="openpi_sim",
@@ -313,6 +329,8 @@ def run_once(args: argparse.Namespace) -> None:
     )
     client.left_gripper_threshold, client.right_gripper_threshold, client.left_gripper_lower, client.left_gripper_upper, client.right_gripper_lower, client.right_gripper_upper = args.left_gripper_threshold, args.right_gripper_threshold, args.left_gripper_lower, args.left_gripper_upper, args.right_gripper_lower, args.right_gripper_upper
     client.gripper_lower, client.gripper_upper = args.gripper_lower, args.gripper_upper
+    server_metadata = client.get_server_metadata()
+    print(json.dumps({"server_metadata": server_metadata}, indent=2), flush=True)
 
     runtime_config = apply_runtime_overrides(load_config(args.config), args)
     robot, cameras, source = make_dual_piper_runtime(
@@ -327,7 +345,7 @@ def run_once(args: argparse.Namespace) -> None:
             output_dir=args.record_dir,
             schema=recording_schema,
             fps=args.fps,
-            name_prefix=record_name_prefix(args),
+            name_prefix=record_name_prefix(args, server_metadata),
         )
         if args.record
         else None
@@ -390,6 +408,10 @@ def run_once(args: argparse.Namespace) -> None:
                 print(f"Frame1 image saved to {frame1_path}", flush=True)
         if args.window:
             preview_until_continue(source, distribution_image_path=client_assets.distribution_image_path)
+        inference_rate = float(args.inference_rate if args.inference_rate is not None else runtime_config["policy"]["inference_rate"])
+        latency_k = int(args.latency_k if args.latency_k is not None else runtime_config["policy"]["latency_k"])
+        min_smooth_steps = int(args.min_smooth_steps if args.min_smooth_steps is not None else runtime_config["policy"]["min_smooth_steps"])
+        buffer_max_chunks = int(args.buffer_max_chunks if args.buffer_max_chunks is not None else runtime_config["policy"]["buffer_max_chunks"])
         print(
             json.dumps(
                 {
@@ -398,6 +420,10 @@ def run_once(args: argparse.Namespace) -> None:
                         "rollout_steps": args.rollout_steps,
                         "chunk_size": chunk_size,
                         "fps": args.fps,
+                        "inference_rate": inference_rate if args.execution_mode == "streaming" else None,
+                        "latency_k": latency_k if args.execution_mode == "streaming" else None,
+                        "min_smooth_steps": min_smooth_steps if args.execution_mode == "streaming" else None,
+                        "buffer_max_chunks": buffer_max_chunks if args.execution_mode == "streaming" else None,
                         "joint_speed_percent": args.joint_speed_percent,
                         "ee_speed_percent": args.ee_speed_percent,
                         "gripper_threshold": args.gripper_threshold,
@@ -409,21 +435,59 @@ def run_once(args: argparse.Namespace) -> None:
             flush=True,
         )
 
-        metrics = run_chunk_sync_rollout(
-            client=client,
-            source=source,
-            robot=robot,
-            spec=spec,
-            prompt=resolved_prompt,
-            rollout_steps=args.rollout_steps,
-            chunk_size=chunk_size,
-            fps=args.fps,
-            recorder=recorder,
-            saved_actions=saved_actions,
-            initial_snapshot=first_obs_snapshot,
-            initial_grippers=initial_joints[[6, 13]],
-            old_gripper=args.old_gripper,
-        )
+        if args.execution_mode == "streaming":
+            adapter = OpenPiSimStreamingAdapter(client, source, initial_joints[[6, 13]])
+
+            def log_chunk(chunk_index: int, action_count: int, executed_steps: int, first_action: np.ndarray) -> None:
+                print_rollout_chunk_summary(
+                    client=client,
+                    chunk_index=chunk_index,
+                    action_count=action_count,
+                    executed_steps=executed_steps,
+                    rollout_steps=args.rollout_steps,
+                    first_action=first_action,
+                )
+
+            metrics = run_temporal_smoothing_rollout(
+                client=adapter,
+                source=adapter,
+                robot=robot,
+                spec=spec,
+                prompt=resolved_prompt,
+                rollout_steps=args.rollout_steps,
+                chunk_size=chunk_size,
+                fps=args.fps,
+                inference_rate=inference_rate,
+                latency_k=latency_k,
+                min_smooth_steps=min_smooth_steps,
+                buffer_max_chunks=buffer_max_chunks,
+                recorder=recorder,
+                saved_actions=saved_actions,
+                log_chunk=log_chunk,
+                initial_snapshot=first_obs_snapshot,
+                state_builder=lambda snapshot, policy_spec: configured_state_after_command(
+                    robot,
+                    policy_spec,
+                    adapter.last_grippers,
+                    old_gripper=args.old_gripper,
+                ),
+            )
+        else:
+            metrics = run_chunk_sync_rollout(
+                client=client,
+                source=source,
+                robot=robot,
+                spec=spec,
+                prompt=resolved_prompt,
+                rollout_steps=args.rollout_steps,
+                chunk_size=chunk_size,
+                fps=args.fps,
+                recorder=recorder,
+                saved_actions=saved_actions,
+                initial_snapshot=first_obs_snapshot,
+                initial_grippers=initial_joints[[6, 13]],
+                old_gripper=args.old_gripper,
+            )
         if metrics.interrupted:
             print("Interrupted by user; stopping rollout.", flush=True)
         metrics_summary, written_metric_paths = save_rollout_metrics(

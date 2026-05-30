@@ -18,6 +18,7 @@ from rollout.execution import (
     action_sequence,
     resolve_chunk_size,
     run_chunk_sync_rollout,
+    run_temporal_smoothing_rollout,
     save_rollout_metrics,
 )
 from rollout.recording import RolloutVideoRecorder, preview_until_continue, save_frame1_image, save_recorded_actions
@@ -51,6 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-steps", type=int, default=1000)
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument("--execution-mode", choices=["streaming", "chunk_sync"], default="chunk_sync")
+    parser.add_argument("--inference-rate", type=float, default=None)
+    parser.add_argument("--latency-k", type=int, default=None)
+    parser.add_argument("--min-smooth-steps", type=int, default=None)
+    parser.add_argument("--buffer-max-chunks", type=int, default=None)
     parser.add_argument("--metrics-json", default=None, help="Optional path to save rollout timing metrics as JSON.")
     parser.add_argument("--record", action="store_true")
     parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "xvla_records"))
@@ -82,6 +88,8 @@ def main() -> None:
     if args.spec_only:
         return
     cli_prompt = normalized_prompt(args.prompt)
+    if args.inference_rate is not None and args.inference_rate < 0.0:
+        raise ValueError("--inference-rate must be non-negative")
     client_assets = prepare_client_assets(
         client_kind="xvla",
         train_config_name=args.train_config,
@@ -116,6 +124,8 @@ def main() -> None:
         gripper_upper=args.gripper_upper,
         old_gripper=args.old_gripper,
     )
+    server_metadata = client.get_server_metadata()
+    print(json.dumps({"server_metadata": server_metadata}, indent=2), flush=True)
 
     runtime_config = apply_runtime_overrides(load_config(args.config), args)
     robot, cameras, source = make_dual_piper_runtime(
@@ -128,7 +138,7 @@ def main() -> None:
             output_dir=args.record_dir,
             schema=make_slai_recording_schema(spec, args.control_mode),
             fps=args.fps,
-            name_prefix=record_name_prefix(args),
+            name_prefix=record_name_prefix(args, server_metadata),
         )
         if args.record
         else None
@@ -144,6 +154,10 @@ def main() -> None:
         if not args.dry_run and not robot.enable():
             print("Warning: Piper arm enable check did not report success; continuing anyway.", flush=True)
         chunk_size = resolve_chunk_size(spec, args.chunk_size)
+        inference_rate = float(args.inference_rate if args.inference_rate is not None else runtime_config["policy"]["inference_rate"])
+        latency_k = int(args.latency_k if args.latency_k is not None else runtime_config["policy"]["latency_k"])
+        min_smooth_steps = int(args.min_smooth_steps if args.min_smooth_steps is not None else runtime_config["policy"]["min_smooth_steps"])
+        buffer_max_chunks = int(args.buffer_max_chunks if args.buffer_max_chunks is not None else runtime_config["policy"]["buffer_max_chunks"])
         if args.dry_run:
             snapshot = source.capture_snapshot()
             actions = action_sequence(client.infer_actions(snapshot, prompt=resolved_prompt))[:chunk_size]
@@ -163,10 +177,11 @@ def main() -> None:
         initial_joints = resolve_dual_piper_init_joints(args.init_joints)
         print(json.dumps({"initial_pose": {"qpos": initial_joints.tolist()}}, indent=2), flush=True)
         robot.move_to_joint_positions(initial_joints, speed_percent=args.joint_speed_percent)
+        first_obs_snapshot = source.capture_snapshot()
         if recorder is not None:
             frame1_path = save_frame1_image(
                 recorder,
-                source.capture_snapshot(),
+                first_obs_snapshot,
                 distribution_image_path=client_assets.distribution_image_path,
             )
             if frame1_path is not None:
@@ -186,7 +201,7 @@ def main() -> None:
                 first_action=first_action,
             )
 
-        metrics = run_chunk_sync_rollout(
+        rollout_kwargs = dict(
             client=client,
             source=source,
             robot=robot,
@@ -198,11 +213,27 @@ def main() -> None:
             recorder=recorder,
             saved_actions=saved_actions,
             log_chunk=log_chunk,
+            initial_snapshot=first_obs_snapshot,
             state_builder=state_builder,
         )
+        if args.execution_mode == "streaming":
+            metrics = run_temporal_smoothing_rollout(
+                **rollout_kwargs,
+                inference_rate=inference_rate,
+                latency_k=latency_k,
+                min_smooth_steps=min_smooth_steps,
+                buffer_max_chunks=buffer_max_chunks,
+            )
+        else:
+            metrics = run_chunk_sync_rollout(**rollout_kwargs)
         if metrics.interrupted:
             print("Interrupted by user; stopping rollout.", flush=True)
-        metrics_summary, written_metric_paths = save_rollout_metrics(metrics, metrics_json_path=args.metrics_json)
+        metrics_summary, written_metric_paths = save_rollout_metrics(
+            metrics,
+            metrics_json_path=args.metrics_json,
+            run_dir=recorder.run_dir if recorder is not None else None,
+            record_stem=recorder.record_stem if recorder is not None else None,
+        )
         print(json.dumps({"rollout_metrics": metrics_summary}, indent=2), flush=True)
         for metrics_path in written_metric_paths:
             print(f"Rollout metrics saved to {metrics_path}", flush=True)

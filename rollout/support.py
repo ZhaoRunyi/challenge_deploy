@@ -96,9 +96,19 @@ def resolve_dual_piper_init_joints(values: Sequence[float] | None) -> np.ndarray
     return joints.copy()
 
 
-def record_name_prefix(args: argparse.Namespace) -> str:
-    ckpt_name = Path(args.ckpt_dir).name if args.ckpt_dir else Path(args.train_config).stem
-    return f"{ckpt_name}_{args.control_mode}_{args.execution_mode}"
+def server_ckpt_dir(server_metadata: dict[str, Any] | None) -> str | None:
+    for key in ("ckpt_dir", "checkpoint_dir", "model_path"):
+        value = server_metadata.get(key) if server_metadata is not None else None
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def record_name_prefix(args: argparse.Namespace, server_metadata: dict[str, Any] | None = None) -> str:
+    ckpt_dir = server_ckpt_dir(server_metadata)
+    ckpt_name = Path(ckpt_dir).name if ckpt_dir else Path(args.train_config).stem
+    execution_mode = getattr(args, "execution_mode", "chunk_sync")
+    return f"{ckpt_name}_{args.control_mode}_{execution_mode}"
 
 
 def install_record_signal_handlers() -> None:
