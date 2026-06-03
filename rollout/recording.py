@@ -111,6 +111,19 @@ class RolloutVideoRecorder:
         state: np.ndarray,
         timestamp_s: float,
     ) -> None:
+        action_array = np.asarray(action, dtype=np.float64).copy()
+        state_array = np.asarray(state, dtype=np.float64).copy()
+        expected_action_dim = len(self.schema.action_names)
+        expected_state_dim = len(self.schema.state_names)
+        if action_array.ndim != 1 or action_array.shape[0] != expected_action_dim:
+            raise ValueError(
+                f"Recording action dim mismatch: got {action_array.shape}, expected ({expected_action_dim},)"
+            )
+        if state_array.ndim != 1 or state_array.shape[0] != expected_state_dim:
+            raise ValueError(
+                f"Recording state dim mismatch: got {state_array.shape}, expected ({expected_state_dim},)"
+            )
+
         camera_row = self.compose_camera_row(images)
         if self.keep_frames_in_memory:
             self.frame_images.append(camera_row.copy())
@@ -119,8 +132,8 @@ class RolloutVideoRecorder:
             iio.imwrite(frame_path, camera_row[..., ::-1], quality=self.frame_jpeg_quality)
             self.frame_paths.append(frame_path)
 
-        self.actions.append(np.asarray(action, dtype=np.float64).copy())
-        self.states.append(np.asarray(state, dtype=np.float64).copy())
+        self.actions.append(action_array)
+        self.states.append(state_array)
         self.timestamps.append(float(timestamp_s))
 
     def finalize(self) -> Path | None:

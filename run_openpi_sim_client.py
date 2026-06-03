@@ -33,8 +33,8 @@ from rollout.execution import (
 from rollout.support import (
     apply_runtime_overrides,
     decoded_action_summary,
-    ignore_record_signal_handlers,
-    install_record_signal_handlers,
+    ignore_recorder_signal_handlers,
+    install_recorder_signal_handlers,
     make_dual_piper_runtime,
     normalized_prompt,
     print_rollout_chunk_summary,
@@ -124,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional 14D dual-Piper initial qpos override: left 7 then right 7.",
     )
-    parser.add_argument("--camera-front-serial", default=None)
+    parser.add_argument("--camera-high-serial", default=None)
     parser.add_argument("--camera-left-serial", default=None)
     parser.add_argument("--camera-right-serial", default=None)
     parser.add_argument("--no-cameras", action="store_true")
@@ -350,8 +350,7 @@ def run_once(args: argparse.Namespace) -> None:
         if args.record
         else None
     )
-    if recorder is not None:
-        install_record_signal_handlers()
+    install_recorder_signal_handlers(recorder)
 
     first_obs_snapshot = None
     frame1_path = None
@@ -502,8 +501,7 @@ def run_once(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         print("Interrupted by user; stopping rollout.", flush=True)
     finally:
-        if recorder is not None:
-            ignore_record_signal_handlers()
+        ignore_recorder_signal_handlers(recorder)
         if cameras is not None:
             try:
                 cameras.stop()

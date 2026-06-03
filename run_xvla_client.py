@@ -8,7 +8,6 @@ import numpy as np
 
 from clients.xvla import (
     XVLAPiperClient,
-    build_full_piper_state,
     load_piper_policy_spec,
     spec_summary,
 )
@@ -24,6 +23,9 @@ from rollout.execution import (
 from rollout.recording import RolloutVideoRecorder, preview_until_continue, save_frame1_image, save_recorded_actions
 from rollout.support import (
     apply_runtime_overrides,
+    build_slai_recording_state,
+    ignore_recorder_signal_handlers,
+    install_recorder_signal_handlers,
     make_dual_piper_runtime,
     make_slai_recording_schema,
     normalized_prompt,
@@ -70,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional 14D dual-Piper initial qpos override: left 7 then right 7.",
     )
-    parser.add_argument("--camera-front-serial", default=None)
+    parser.add_argument("--camera-high-serial", default=None)
     parser.add_argument("--camera-left-serial", default=None)
     parser.add_argument("--camera-right-serial", default=None)
     parser.add_argument("--no-cameras", action="store_true")
@@ -144,7 +146,12 @@ def main() -> None:
         else None
     )
     saved_actions: list[np.ndarray] | None = [] if recorder is not None else None
-    state_builder = lambda snapshot, policy_spec: build_full_piper_state(snapshot, policy_spec, old_gripper=args.old_gripper)
+    install_recorder_signal_handlers(recorder)
+    state_builder = lambda snapshot, policy_spec: build_slai_recording_state(
+        snapshot,
+        policy_spec,
+        old_gripper=args.old_gripper,
+    )
     robot.connect(read_only=args.dry_run)
     try:
         if cameras is not None:
@@ -238,6 +245,7 @@ def main() -> None:
         for metrics_path in written_metric_paths:
             print(f"Rollout metrics saved to {metrics_path}", flush=True)
     finally:
+        ignore_recorder_signal_handlers(recorder)
         if recorder is not None:
             try:
                 action_path = save_recorded_actions(recorder, saved_actions, recorder.schema.action_names)

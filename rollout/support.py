@@ -9,6 +9,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from clients import slai_piper_policy
+from clients.base import build_configured_piper_state
 from clients.specs import decoded_action_summary
 from hardware.config import set_by_dotted_path
 from hardware.constants import DUAL_PIPER_INIT_JOINTS
@@ -30,8 +31,8 @@ def apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) ->
         set_by_dotted_path(config, "robot.left.can_name", args.left_can)
     if args.right_can:
         set_by_dotted_path(config, "robot.right.can_name", args.right_can)
-    if args.camera_front_serial:
-        set_by_dotted_path(config, "cameras.serials.cam_high", args.camera_front_serial)
+    if args.camera_high_serial:
+        set_by_dotted_path(config, "cameras.serials.cam_high", args.camera_high_serial)
     if args.camera_right_serial:
         set_by_dotted_path(config, "cameras.serials.cam_right_wrist", args.camera_right_serial)
     if args.camera_left_serial:
@@ -89,6 +90,16 @@ def make_slai_recording_schema(spec: Any, control_mode: str) -> Any:
     )
 
 
+def build_slai_recording_state(
+    snapshot: Any,
+    spec: Any,
+    *,
+    old_gripper: bool = False,
+    dtype: Any = np.float64,
+) -> np.ndarray:
+    return build_configured_piper_state(snapshot, spec, old_gripper=old_gripper, dtype=dtype)
+
+
 def resolve_dual_piper_init_joints(values: Sequence[float] | None) -> np.ndarray:
     joints = np.asarray(DUAL_PIPER_INIT_JOINTS if values is None else values, dtype=np.float64)
     if joints.shape != (14,):
@@ -134,6 +145,16 @@ def ignore_record_signal_handlers() -> None:
             signal.signal(signal_value, signal.SIG_IGN)
         except (OSError, ValueError):
             pass
+
+
+def install_recorder_signal_handlers(recorder: Any | None) -> None:
+    if recorder is not None:
+        install_record_signal_handlers()
+
+
+def ignore_recorder_signal_handlers(recorder: Any | None) -> None:
+    if recorder is not None:
+        ignore_record_signal_handlers()
 
 
 def print_rollout_chunk_summary(

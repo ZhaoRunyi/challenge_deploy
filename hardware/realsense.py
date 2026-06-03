@@ -9,9 +9,6 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 
-from .constants import CAMERA_NAMES
-
-
 @dataclass(slots=True)
 class RealSenseDeviceInfo:
     name: str
@@ -79,11 +76,7 @@ class RealSenseRig:
         warmup_frames: int = 30,
         enable_depth: bool = False,
     ) -> None:
-        self.serials = {
-            camera_name: serials[camera_name]
-            for camera_name in CAMERA_NAMES
-            if serials.get(camera_name)
-        }
+        self.serials = {str(camera_name): str(serial) for camera_name, serial in serials.items() if serial}
         self.width = width
         self.height = height
         self.fps = fps

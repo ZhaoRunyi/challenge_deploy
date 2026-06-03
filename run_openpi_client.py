@@ -8,7 +8,6 @@ import numpy as np
 
 from hardware.config import load_config
 from rollout.assets import prepare_client_assets
-from clients.base import build_configured_piper_state
 from clients.openpi import (
     OpenPiPiperClient,
     load_piper_policy_spec,
@@ -24,9 +23,10 @@ from rollout.execution import (
 )
 from rollout.support import (
     apply_runtime_overrides,
+    build_slai_recording_state,
     decoded_action_summary,
-    ignore_record_signal_handlers,
-    install_record_signal_handlers,
+    ignore_recorder_signal_handlers,
+    install_recorder_signal_handlers,
     make_dual_piper_runtime,
     make_slai_recording_schema,
     normalized_prompt,
@@ -116,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional 14D dual-Piper initial qpos override: left 7 then right 7.",
     )
-    parser.add_argument("--camera-front-serial", default=None)
+    parser.add_argument("--camera-high-serial", default=None)
     parser.add_argument("--camera-left-serial", default=None)
     parser.add_argument("--camera-right-serial", default=None)
     parser.add_argument("--no-cameras", action="store_true")
@@ -175,7 +175,7 @@ def run_once(args: argparse.Namespace) -> None:
     client.gripper_lower, client.gripper_upper = args.gripper_lower, args.gripper_upper
     server_metadata = client.get_server_metadata()
     print(json.dumps({"server_metadata": server_metadata}, indent=2), flush=True)
-    state_builder = lambda snapshot, policy_spec: build_configured_piper_state(
+    state_builder = lambda snapshot, policy_spec: build_slai_recording_state(
         snapshot,
         policy_spec,
         old_gripper=args.old_gripper,
@@ -198,8 +198,7 @@ def run_once(args: argparse.Namespace) -> None:
         if args.record
         else None
     )
-    if recorder is not None:
-        install_record_signal_handlers()
+    install_recorder_signal_handlers(recorder)
 
     first_obs_snapshot = None
     frame1_compare_path: Path | None = None
@@ -360,8 +359,7 @@ def run_once(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         print("Interrupted by user; stopping rollout.", flush=True)
     finally:
-        if recorder is not None:
-            ignore_record_signal_handlers()
+        ignore_recorder_signal_handlers(recorder)
         if cameras is not None:
             try:
                 cameras.stop()

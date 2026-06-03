@@ -318,7 +318,7 @@ class HDF5TeleopCollectionSource:
         self.puppet_robot = puppet_robot
         self.cameras = cameras
         self.arm_sample_hz = arm_sample_hz
-        self.camera_names = tuple(CAMERA_NAMES)
+        self.camera_names = tuple(cameras.serials)
         self.color_queues = {camera_name: AsyncSampleQueue(maxlen=queue_maxlen) for camera_name in self.camera_names}
         self.depth_queues = {camera_name: AsyncSampleQueue(maxlen=queue_maxlen) for camera_name in self.camera_names}
         self.arm_joint_queues = {
@@ -733,8 +733,9 @@ def save_hdf5_teleop_record_video(
     if len(frames) < 2:
         return None
 
+    camera_names = tuple(frames[0].images)
     schema = RecordingSchema(
-        camera_names=tuple(CAMERA_NAMES),
+        camera_names=camera_names,
         action_names=HDF5_TELEOP_VECTOR_NAMES,
         state_names=HDF5_TELEOP_VECTOR_NAMES,
         used_action_names=frozenset(HDF5_TELEOP_VECTOR_NAMES),

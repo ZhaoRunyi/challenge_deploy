@@ -55,9 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--right-can", default=None)
     parser.add_argument("--master-left-can", default=None)
     parser.add_argument("--master-right-can", default=None)
-    parser.add_argument("--camera-front-serial", default=None)
+    parser.add_argument("--camera-high-serial", default=None)
     parser.add_argument("--camera-left-serial", default=None)
     parser.add_argument("--camera-right-serial", default=None)
+    parser.add_argument("--extra-camera-names", nargs="*", default=())
+    parser.add_argument("--extra-camera-serials", nargs="*", default=())
     parser.add_argument("--ready-timeout", type=float, default=15.0)
     return parser
 
@@ -71,13 +73,23 @@ def apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) ->
     master_right_can = args.master_right_can or config["robot"]["right"]["can_name"]
     set_by_dotted_path(config, "robot.master_left.can_name", master_left_can)
     set_by_dotted_path(config, "robot.master_right.can_name", master_right_can)
-    if args.camera_front_serial:
-        set_by_dotted_path(config, "cameras.serials.cam_high", args.camera_front_serial)
+    if args.camera_high_serial:
+        set_by_dotted_path(config, "cameras.serials.cam_high", args.camera_high_serial)
     if args.camera_left_serial:
         set_by_dotted_path(config, "cameras.serials.cam_left_wrist", args.camera_left_serial)
     if args.camera_right_serial:
         set_by_dotted_path(config, "cameras.serials.cam_right_wrist", args.camera_right_serial)
+    for camera_name, serial in zip(args.extra_camera_names, args.extra_camera_serials):
+        config["cameras"]["serials"][camera_name] = serial
     return config
+
+
+def camera_names_from_config(config: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        camera_name
+        for camera_name, serial in config["cameras"]["serials"].items()
+        if serial
+    )
 
 
 def make_collection_source(
@@ -144,9 +156,13 @@ def make_teleop_worker(config: dict[str, Any], args: argparse.Namespace) -> Tele
     )
 
 
-def make_data_worker(args: argparse.Namespace, language_instruction: str) -> HDF5TeleopDataWorker:
+def make_data_worker(
+    args: argparse.Namespace,
+    language_instruction: str,
+    camera_names: tuple[str, ...],
+) -> HDF5TeleopDataWorker:
     config = HDF5TeleopSaveConfig(
-        camera_names=CAMERA_NAMES,
+        camera_names=camera_names,
         language_instruction=language_instruction,
         include_depth_images=args.use_depth_image,
         jpeg_quality=DEFAULT_JPEG_QUALITY,
@@ -198,7 +214,25 @@ def print_episode_decision_prompt() -> None:
     print("Episode stopped: press c to save and continue, or d to discard and continue.", flush=True)
 
 
+def validate_camera_name(camera_name: str) -> None:
+    if not camera_name or not all(char.isalnum() or char == "_" for char in camera_name):
+        raise ValueError(
+            f"Camera name {camera_name!r} must be non-empty and contain only letters, digits, or underscores"
+        )
+
+
 def validate_args(args: argparse.Namespace) -> None:
+    if len(args.extra_camera_names) != len(args.extra_camera_serials):
+        raise ValueError("--extra-camera-names and --extra-camera-serials must have the same length")
+    seen_camera_names = set(CAMERA_NAMES)
+    for camera_name in args.extra_camera_names:
+        validate_camera_name(camera_name)
+        if camera_name in seen_camera_names:
+            raise ValueError(f"Extra camera name {camera_name!r} is duplicated or already reserved")
+        seen_camera_names.add(camera_name)
+    for serial in args.extra_camera_serials:
+        if not str(serial).strip():
+            raise ValueError("--extra-camera-serials cannot contain empty values")
     if args.max_timesteps is not None and args.max_timesteps <= 0:
         raise ValueError("--max-timesteps must be positive when set")
     if args.fps <= 0.0:
@@ -220,6 +254,7 @@ def episode_start_payload(
     episode_idx: int,
     episode_path: Path,
     language_instruction: str,
+    camera_names: tuple[str, ...],
 ) -> dict[str, Any]:
     return {
         "dataset_root": str(dataset_root),
@@ -237,6 +272,7 @@ def episode_start_payload(
         "action_from_state": args.action_from_state,
         "skip_idle": args.skip_idle,
         "use_depth_image": args.use_depth_image,
+        "camera_names": list(camera_names),
         "running_sentinel": str(running_sentinel_path(dataset_root, episode_idx)),
     }
 
@@ -271,6 +307,7 @@ def next_episode_path(dataset_root: Path, episode_idx: int) -> Path:
 def run_once(args: argparse.Namespace) -> None:
     validate_args(args)
     runtime_config = apply_runtime_overrides(load_config(args.config), args)
+    camera_names = camera_names_from_config(runtime_config)
     dataset_dir = Path(args.dataset_dir or runtime_config["dataset"]["dataset_dir"]).expanduser().resolve()
     task_name = str(args.task_name or runtime_config["dataset"]["dataset_name"])
     dataset_root = dataset_dir / task_name
@@ -278,7 +315,7 @@ def run_once(args: argparse.Namespace) -> None:
     next_manual_episode = args.episode_idx
 
     teleop_worker = make_teleop_worker(runtime_config, args)
-    data_worker = make_data_worker(args, language_instruction)
+    data_worker = make_data_worker(args, language_instruction, camera_names)
     terminal_settings = termios.tcgetattr(sys.stdin.fileno())
 
     def drain_data_worker(*, repeat_prompt: Callable[[], None] | None = None) -> None:
@@ -315,6 +352,7 @@ def run_once(args: argparse.Namespace) -> None:
                     episode_idx=episode_idx,
                     episode_path=episode_path,
                     language_instruction=language_instruction,
+                    camera_names=camera_names,
                 ),
             )
 
