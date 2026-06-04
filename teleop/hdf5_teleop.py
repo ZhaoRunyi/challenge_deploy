@@ -49,10 +49,10 @@ class HDF5TeleopLoadedEpisode:
     qpos: np.ndarray
     qvel: np.ndarray
     effort: np.ndarray
+    end_pose: np.ndarray
+    state: np.ndarray
     action: np.ndarray
-    base_action: np.ndarray
     eef_quaternion: np.ndarray
-    eef_6d: np.ndarray
     eef_left_time: np.ndarray
     eef_right_time: np.ndarray
     images: dict[str, list[np.ndarray]]
@@ -74,6 +74,12 @@ class AsyncSampleQueue:
             if not self.samples:
                 return None
             return float(self.samples[-1].timestamp_s)
+
+    def latest(self) -> TimestampedValue | None:
+        with self.lock:
+            if not self.samples:
+                return None
+            return self.samples[-1]
 
     def has_sample_at_or_after(self, timestamp_s: float) -> bool:
         with self.lock:
@@ -141,34 +147,6 @@ def arm_eef_quaternion(position: np.ndarray, gripper: float) -> np.ndarray:
     quat = rotation_cls.from_euler("xyz", position[3:6], degrees=False).as_quat().astype(np.float64)
     return np.concatenate((position[:3], quat, np.array([gripper], dtype=np.float64)), axis=0)
 
-
-def arm_eef_6d(position: np.ndarray, gripper: float) -> np.ndarray:
-    rotation_cls = Rotation
-    matrix = rotation_cls.from_euler("xyz", position[3:6], degrees=False).as_matrix()
-    rot6d = rotation_matrix_to_6d(matrix)
-    return np.concatenate((position[:3], rot6d, np.array([gripper], dtype=np.float64)), axis=0)
-
-
-def dual_eef_quaternion(pose_state: DualPiperState, gripper_state: DualPiperState | None = None) -> np.ndarray:
-    grippers = pose_state if gripper_state is None else gripper_state
-    return np.concatenate(
-        (
-            arm_eef_quaternion(np.asarray(pose_state.left.end_pose, dtype=np.float64), float(grippers.left.qpos[6])),
-            arm_eef_quaternion(np.asarray(pose_state.right.end_pose, dtype=np.float64), float(grippers.right.qpos[6])),
-        ),
-        axis=0,
-    )
-
-
-def dual_eef_6d(pose_state: DualPiperState, gripper_state: DualPiperState | None = None) -> np.ndarray:
-    grippers = pose_state if gripper_state is None else gripper_state
-    return np.concatenate(
-        (
-            arm_eef_6d(np.asarray(pose_state.left.end_pose, dtype=np.float64), float(grippers.left.qpos[6])),
-            arm_eef_6d(np.asarray(pose_state.right.end_pose, dtype=np.float64), float(grippers.right.qpos[6])),
-        ),
-        axis=0,
-    )
 
 
 def infer_language_instruction(task_name: str, explicit: str | None = None) -> str:
@@ -282,6 +260,25 @@ def dual_state_vector_32(joint_state: DualPiperState, stable_pose: np.ndarray) -
     ))
 
 
+def dual_arm_array(state: DualPiperState, field_name: str) -> np.ndarray:
+    return np.concatenate(
+        (
+            np.asarray(getattr(state.left, field_name), dtype=np.float64),
+            np.asarray(getattr(state.right, field_name), dtype=np.float64),
+        ),
+        axis=0,
+    )
+
+
+def add_arm_source_timestamps(source_timestamps: dict[str, float], prefix: str, state: PiperArmState) -> None:
+    source_timestamps[f"{prefix}_state_time"] = float(state.timestamp_s)
+    source_timestamps[f"{prefix}_qpos_time"] = float(state.qpos_timestamp_s)
+    source_timestamps[f"{prefix}_qvel_time"] = float(state.qvel_timestamp_s)
+    source_timestamps[f"{prefix}_effort_time"] = float(state.effort_timestamp_s)
+    source_timestamps[f"{prefix}_end_pose_time"] = float(state.end_pose_timestamp_s)
+    source_timestamps[f"{prefix}_command_time"] = float(state.command_timestamp_s)
+
+
 HDF5_TELEOP_VECTOR_NAMES = tuple(
     f"{arm}_{field}"
     for arm in ("left", "right")
@@ -355,16 +352,16 @@ class HDF5TeleopCollectionSource:
             thread.start()
             self.threads.append(thread)
 
-        arm_specs: tuple[tuple[str, SinglePiperArm, bool], ...] = (
-            ("master_left", self.master_robot.left, False),
-            ("master_right", self.master_robot.right, False),
-            ("puppet_left", self.puppet_robot.left, True),
-            ("puppet_right", self.puppet_robot.right, True),
+        arm_specs: tuple[tuple[str, SinglePiperArm, bool, bool], ...] = (
+            ("master_left", self.master_robot.left, False, True),
+            ("master_right", self.master_robot.right, False, True),
+            ("puppet_left", self.puppet_robot.left, True, False),
+            ("puppet_right", self.puppet_robot.right, True, False),
         )
-        for arm_name, arm, sample_pose in arm_specs:
+        for arm_name, arm, sample_pose, prefer_joint_ctrl in arm_specs:
             thread = threading.Thread(
                 target=self.run_arm_sampler,
-                args=(arm_name, arm, sample_pose),
+                args=(arm_name, arm, sample_pose, prefer_joint_ctrl),
                 name=f"hdf5_teleop_arm_{arm_name}",
                 daemon=True,
             )
@@ -396,6 +393,16 @@ class HDF5TeleopCollectionSource:
         with self.trace_lock:
             self.stationary_intervals.append({"start_s": float(start_s), "end_s": float(end_s)})
 
+    def latest_images(self) -> dict[str, np.ndarray] | None:
+        images: dict[str, np.ndarray] = {}
+        for camera_name, queue in self.color_queues.items():
+            sample = queue.latest()
+            if sample is None:
+                return None
+            capture = sample.value
+            images[camera_name] = capture.color_image if hasattr(capture, "color_image") else capture
+        return images
+
     def reset_trace(self) -> None:
         with self.trace_lock:
             self.sample_history.clear()
@@ -406,22 +413,22 @@ class HDF5TeleopCollectionSource:
         while not self.stop_event.is_set():
             try:
                 capture = self.cameras.capture_camera_frame(camera_name)
-                self.append_sample(f"camera_{camera_name}", self.color_queues[camera_name], TimestampedValue(capture.timestamp_s, capture.color_image))
+                self.append_sample(f"camera_{camera_name}", self.color_queues[camera_name], TimestampedValue(capture.timestamp_s, capture))
                 if self.cameras.enable_depth and capture.depth_image is not None:
                     depth_timestamp_s = capture.depth_timestamp_s if capture.depth_timestamp_s is not None else capture.timestamp_s
-                    self.append_sample(f"depth_{camera_name}", self.depth_queues[camera_name], TimestampedValue(depth_timestamp_s, capture.depth_image))
+                    self.append_sample(f"depth_{camera_name}", self.depth_queues[camera_name], TimestampedValue(depth_timestamp_s, capture))
             except Exception as exc:
                 self.last_error = exc
                 time.sleep(0.01)
 
-    def run_arm_sampler(self, arm_name: str, arm: SinglePiperArm, sample_pose: bool) -> None:
+    def run_arm_sampler(self, arm_name: str, arm: SinglePiperArm, sample_pose: bool, prefer_joint_ctrl: bool) -> None:
         last_qpos_timestamp_s = 0.0
         last_pose_timestamp_s = 0.0
         period_s = 1.0 / self.arm_sample_hz if self.arm_sample_hz > 0.0 else 0.0
         while not self.stop_event.is_set():
             loop_start_s = time.monotonic()
             try:
-                state = arm.read_state()
+                state = arm.read_state(prefer_joint_ctrl=prefer_joint_ctrl)
                 qpos_timestamp_s = positive_timestamp(state.qpos_timestamp_s) or positive_timestamp(state.timestamp_s)
                 if qpos_timestamp_s is not None and qpos_timestamp_s > last_qpos_timestamp_s:
                     self.append_sample(f"{arm_name}_joint", self.arm_joint_queues[arm_name], TimestampedValue(qpos_timestamp_s, state))
@@ -524,9 +531,13 @@ class HDF5TeleopCollectionSource:
             right=pose_samples["puppet_right"].value,
         )
         source_timestamps = {f"camera_{name}": sample.timestamp_s for name, sample in color_samples.items()}
+        source_timestamps.update({f"camera_{name}_color_time": sample.timestamp_s for name, sample in color_samples.items()})
         source_timestamps.update({f"depth_{name}": sample.timestamp_s for name, sample in depth_samples.items()})
+        source_timestamps.update({f"camera_{name}_depth_time": sample.timestamp_s for name, sample in depth_samples.items()})
         source_timestamps.update({f"{name}_joint": sample.timestamp_s for name, sample in arm_samples.items()})
         source_timestamps.update({f"{name}_pose": sample.timestamp_s for name, sample in pose_samples.items()})
+        for name, sample in arm_samples.items():
+            add_arm_source_timestamps(source_timestamps, name, sample.value)
         source_timestamps["frame_time"] = frame_time
         with self.trace_lock:
             self.selected_history.append(dict(source_timestamps))
@@ -536,8 +547,8 @@ class HDF5TeleopCollectionSource:
             puppet_state=puppet_state,
             master_state=master_state,
             puppet_pose_state=puppet_pose_state,
-            images={name: sample.value for name, sample in color_samples.items()},
-            depth_images={name: sample.value for name, sample in depth_samples.items()},
+            images={name: sample.value.color_image for name, sample in color_samples.items()},
+            depth_images={name: sample.value.depth_image for name, sample in depth_samples.items() if sample.value.depth_image is not None},
             source_timestamps=source_timestamps,
         )
 
@@ -554,6 +565,8 @@ def collect_hdf5_teleop_episode(
     start_source: bool = True,
     skip_stationary: bool = True,
     stationary_tolerance: float = 0.0005,
+    runtime_window: Any | None = None,
+    action_from_state: bool = False,
 ) -> list[HDF5TeleopCaptureFrame]:
     if max_timesteps is not None and max_timesteps < 1:
         raise ValueError("max_timesteps must be positive when set")
@@ -618,6 +631,20 @@ def collect_hdf5_teleop_episode(
             skipped_stationary = 0
             last_master_state = frame.master_state
             frames.append(frame)
+            if runtime_window is not None:
+                observation_frame = frames[-2] if len(frames) >= 2 else frames[-1]
+                action_frame = frames[-1]
+                puppet_stable_poses = stable_eef_positions([observation_frame.puppet_pose_state, action_frame.puppet_pose_state])
+                master_stable_poses = stable_eef_positions([observation_frame.master_state, action_frame.master_state])
+                runtime_window.record(
+                    images=observation_frame.images,
+                    state=dual_state_vector_32(observation_frame.puppet_state, puppet_stable_poses[0]),
+                    action=dual_state_vector_32(
+                        action_frame.puppet_state if action_from_state else action_frame.master_state,
+                        (puppet_stable_poses if action_from_state else master_stable_poses)[1],
+                    ),
+                    timestamp_s=observation_frame.timestamp_s,
+                )
             print(f"Frame data: {len(frames)}", flush=True)
             time.sleep(1.0 / fps)
     finally:
@@ -678,33 +705,37 @@ def save_hdf5_teleop_episode(
         for name in source_timestamp_names:
             source_timestamps_group.create_dataset(name, (data_size,), dtype=np.float64)
 
-        qpos = observations.create_dataset("qpos", (data_size, 32), dtype=np.float64)
+        qpos = observations.create_dataset("qpos", (data_size, 14), dtype=np.float64)
+        qpos_feedback = observations.create_dataset("qpos_feedback", (data_size, 14), dtype=np.float64)
+        qpos_command = observations.create_dataset("qpos_command", (data_size, 14), dtype=np.float64)
         qvel = observations.create_dataset("qvel", (data_size, 14), dtype=np.float64)
         effort = observations.create_dataset("effort", (data_size, 14), dtype=np.float64)
+        end_pose = observations.create_dataset("end_pose", (data_size, 14), dtype=np.float64)
         eef_quaternion = observations.create_dataset("eef_quaternion", (data_size, 16), dtype=np.float64)
-        eef_6d = observations.create_dataset("eef_6d", (data_size, 20), dtype=np.float64)
         eef_left_time = observations.create_dataset("eef_left_time", (data_size,), dtype=np.float64)
         eef_right_time = observations.create_dataset("eef_right_time", (data_size,), dtype=np.float64)
 
+        state = root.create_dataset("state", (data_size, 32), dtype=np.float64)
         action = root.create_dataset("action", (data_size, 32), dtype=np.float64)
-        base_action = root.create_dataset("base_action", (data_size, 2), dtype=np.float64)
         language = root.create_dataset("language_instruction", (1,), dtype=h5py.special_dtype(vlen=str))
         language[0] = language_instruction
 
         for index in range(data_size):
             observation_frame = frames[index]
             action_frame = frames[index + 1]
-            qpos[index] = dual_state_vector_32(observation_frame.puppet_state, puppet_stable_poses[index])
+            qpos[index] = observation_frame.puppet_state.qpos
+            qpos_feedback[index] = dual_arm_array(observation_frame.puppet_state, "qpos_feedback")
+            qpos_command[index] = dual_arm_array(observation_frame.puppet_state, "qpos_command")
             qvel[index] = observation_frame.puppet_state.qvel
             effort[index] = observation_frame.puppet_state.effort
+            end_pose[index] = dual_arm_array(observation_frame.puppet_pose_state, "end_pose")
             eef_quaternion[index] = dual_eef_quaternion(observation_frame.puppet_pose_state, observation_frame.puppet_state)
-            eef_6d[index] = dual_eef_6d(observation_frame.puppet_pose_state, observation_frame.puppet_state)
             eef_left_time[index] = float(observation_frame.timestamp_s - frame0_time)
             eef_right_time[index] = float(observation_frame.timestamp_s - frame0_time)
+            state[index] = dual_state_vector_32(observation_frame.puppet_state, puppet_stable_poses[index])
             action_state = action_frame.puppet_state if action_from_state else action_frame.master_state
             action_poses = puppet_stable_poses if action_from_state else master_stable_poses
             action[index] = dual_state_vector_32(action_state, action_poses[index + 1])
-            base_action[index] = np.array([0.0, 0.0], dtype=np.float64)
 
             for name in source_timestamp_names:
                 source_timestamps_group[name][index] = float(observation_frame.source_timestamps.get(name, np.nan))
@@ -963,10 +994,10 @@ def load_hdf5_teleop_episode(path: str | Path) -> HDF5TeleopLoadedEpisode:
             qpos=root["/observations/qpos"][()],
             qvel=root["/observations/qvel"][()],
             effort=root["/observations/effort"][()],
+            end_pose=root["/observations/end_pose"][()] if "/observations/end_pose" in root else np.empty((0, 14), dtype=np.float64),
+            state=root["/state"][()] if "/state" in root else root["/observations/qpos"][()],
             action=root["/action"][()],
-            base_action=root["/base_action"][()],
             eef_quaternion=root["/observations/eef_quaternion"][()],
-            eef_6d=root["/observations/eef_6d"][()],
             eef_left_time=root["/observations/eef_left_time"][()],
             eef_right_time=root["/observations/eef_right_time"][()],
             images=images,

@@ -14,8 +14,10 @@ from data.worker import HDF5TeleopDataWorker, HDF5TeleopSaveConfig
 from hardware.config import load_config, set_by_dotted_path
 from hardware.piper import DualPiperSystem
 from hardware.realsense import RealSenseRig
+from rollout.recording import RuntimeExecutionWindow, RecordingSchema
 from teleop.hdf5_teleop import (
     HDF5TeleopCollectionSource,
+    HDF5_TELEOP_VECTOR_NAMES,
     collect_hdf5_teleop_episode,
     episode_base_path,
     infer_language_instruction,
@@ -46,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--countdown-seconds", type=int, default=0)
     parser.add_argument("--alignment-plot-frames", type=int, default=16, help="Number of evenly spaced selected frames to draw in the alignment plot.")
     parser.add_argument("--record", action="store_true", help="Render a Motus/OpenPI-style deploy video from each saved HDF5 episode.")
+    parser.add_argument("--window", nargs="?", const=1, type=int, default=0, help="Show live camera/action-state window; optional value selects display index.")
     parser.add_argument("--action-from-state", action="store_true", help="Save action[t] from puppet state[t+1] instead of master control[t+1].")
     parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "hdf5_teleop_records"))
     parser.add_argument("--skip-idle", action=argparse.BooleanOptionalAction, default=True, help="Skip frames when master arms stay within the idle tolerance. Use --no-skip-idle to keep them.")
@@ -243,6 +246,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--queue-maxlen must be positive")
     if args.alignment_plot_frames <= 0:
         raise ValueError("--alignment-plot-frames must be positive")
+    if args.window < 0:
+        raise ValueError("--window display index must be non-negative")
     if not sys.stdin.isatty():
         raise RuntimeError("Interactive HDF5 teleop collection requires a TTY for c/s/q controls")
 
@@ -287,7 +292,12 @@ def stop_requested() -> bool:
     return False
 
 
-def collect_kwargs(args: argparse.Namespace, dataset_root: Path, episode_idx: int) -> dict[str, Any]:
+def collect_kwargs(
+    args: argparse.Namespace,
+    dataset_root: Path,
+    episode_idx: int,
+    runtime_window: RuntimeExecutionWindow | None,
+) -> dict[str, Any]:
     return {
         "max_timesteps": args.max_timesteps,
         "fps": args.fps,
@@ -297,6 +307,8 @@ def collect_kwargs(args: argparse.Namespace, dataset_root: Path, episode_idx: in
         "stop_requested": stop_requested,
         "start_source": False,
         "skip_stationary": args.skip_idle,
+        "runtime_window": runtime_window,
+        "action_from_state": args.action_from_state,
     }
 
 
@@ -316,6 +328,18 @@ def run_once(args: argparse.Namespace) -> None:
 
     teleop_worker = make_teleop_worker(runtime_config, args)
     data_worker = make_data_worker(args, language_instruction, camera_names)
+    window_schema = RecordingSchema(
+        camera_names=camera_names,
+        action_names=HDF5_TELEOP_VECTOR_NAMES,
+        state_names=HDF5_TELEOP_VECTOR_NAMES,
+        used_action_names=frozenset(HDF5_TELEOP_VECTOR_NAMES),
+    )
+    runtime_window = (
+        RuntimeExecutionWindow(schema=window_schema, display_index=args.window)
+        if args.window
+        else None
+    )
+    last_window_refresh_s = 0.0
     terminal_settings = termios.tcgetattr(sys.stdin.fileno())
 
     def drain_data_worker(*, repeat_prompt: Callable[[], None] | None = None) -> None:
@@ -323,11 +347,25 @@ def run_once(args: argparse.Namespace) -> None:
         if repeat_prompt is not None and completed_count > 0:
             repeat_prompt()
 
+    def refresh_idle_window() -> None:
+        nonlocal last_window_refresh_s
+        if runtime_window is None:
+            return
+        now_s = time.monotonic()
+        if now_s - last_window_refresh_s < 0.1:
+            return
+        images = teleop_worker.source.latest_images()
+        if images is not None:
+            runtime_window.show_images(images)
+        last_window_refresh_s = now_s
+
     def poll_idle_wait() -> None:
         drain_data_worker(repeat_prompt=print_idle_prompt)
+        refresh_idle_window()
 
     def poll_episode_decision_wait() -> None:
         drain_data_worker(repeat_prompt=print_episode_decision_prompt)
+        refresh_idle_window()
 
     try:
         teleop_worker.start()
@@ -335,6 +373,7 @@ def run_once(args: argparse.Namespace) -> None:
         print("Interactive controls: idle c starts an episode, recording s stops it, idle q quits.", flush=True)
         while True:
             drain_data_worker()
+            refresh_idle_window()
             print_idle_prompt()
             key = wait_for_key({"c", "q"}, poll=poll_idle_wait)
             if key == "q":
@@ -356,15 +395,20 @@ def run_once(args: argparse.Namespace) -> None:
                 ),
             )
 
+            if runtime_window is not None:
+                runtime_window.reset()
             episode = teleop_worker.collect_episode(
                 episode_index=episode_idx,
                 episode_path=episode_path,
                 collect_fn=collect_hdf5_teleop_episode,
-                collect_kwargs=collect_kwargs(args, dataset_root, episode_idx),
+                collect_kwargs=collect_kwargs(args, dataset_root, episode_idx, runtime_window),
             )
+            if runtime_window is not None:
+                runtime_window.reset()
             if len(episode.frames) < 2:
                 print(f"Discarded episode {episode_idx}: need at least 2 frames, got {len(episode.frames)}.", flush=True)
                 continue
+            refresh_idle_window()
             print_episode_decision_prompt()
             decision = wait_for_key({"c", "d"}, poll=poll_episode_decision_wait)
             if decision == "d":
@@ -373,6 +417,8 @@ def run_once(args: argparse.Namespace) -> None:
             print_json("hdf5_teleop_collection_queued", data_worker.submit(episode))
     finally:
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, terminal_settings)
+        if runtime_window is not None:
+            runtime_window.close()
         teleop_worker.stop()
         data_worker.stop(on_result=print_save_result, on_error=print_save_error)
 

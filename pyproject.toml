@@ -12,7 +12,7 @@ dependencies = [
     "imageio-ffmpeg",
     "msgpack",
     "numpy<2",
-    "opencv-python-headless",
+    "opencv-python==4.11.0.86",
     "piper_sdk",
     "pyrealsense2; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "PyYAML",

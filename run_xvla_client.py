@@ -20,7 +20,7 @@ from rollout.execution import (
     run_temporal_smoothing_rollout,
     save_rollout_metrics,
 )
-from rollout.recording import RolloutVideoRecorder, preview_until_continue, save_frame1_image, save_recorded_actions
+from rollout.recording import RolloutVideoRecorder, ExecutionRecordSink, RuntimeExecutionWindow, preview_until_continue, save_frame1_image, save_recorded_actions
 from rollout.support import (
     apply_runtime_overrides,
     build_slai_recording_state,
@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-left-serial", default=None)
     parser.add_argument("--camera-right-serial", default=None)
     parser.add_argument("--no-cameras", action="store_true")
-    parser.add_argument("--window", action="store_true")
+    parser.add_argument("--window", nargs="?", const=1, type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--spec-only", action="store_true")
     parser.add_argument("--ready-timeout", type=float, default=15.0)
@@ -135,14 +135,25 @@ def main() -> None:
         commands_enabled=not args.dry_run,
         name="xvla_piper_client",
     )
+    recording_schema = make_slai_recording_schema(spec, args.control_mode)
+    runtime_window = (
+        RuntimeExecutionWindow(schema=recording_schema, display_index=args.window)
+        if args.window
+        else None
+    )
     recorder = (
         RolloutVideoRecorder(
             output_dir=args.record_dir,
-            schema=make_slai_recording_schema(spec, args.control_mode),
+            schema=recording_schema,
             fps=args.fps,
             name_prefix=record_name_prefix(args, server_metadata),
         )
         if args.record
+        else None
+    )
+    record_sink = (
+        ExecutionRecordSink(recorder=recorder, runtime_window=runtime_window)
+        if recorder is not None or runtime_window is not None
         else None
     )
     saved_actions: list[np.ndarray] | None = [] if recorder is not None else None
@@ -217,7 +228,7 @@ def main() -> None:
             rollout_steps=args.rollout_steps,
             chunk_size=chunk_size,
             fps=args.fps,
-            recorder=recorder,
+            recorder=record_sink,
             saved_actions=saved_actions,
             log_chunk=log_chunk,
             initial_snapshot=first_obs_snapshot,
@@ -258,6 +269,8 @@ def main() -> None:
                     print(f"Recording saved to {output_path}", flush=True)
             except Exception as exc:
                 print(f"Failed to finalize recording: {exc}", flush=True)
+        if runtime_window is not None:
+            runtime_window.close()
         if cameras is not None:
             cameras.stop()
         robot.disconnect()

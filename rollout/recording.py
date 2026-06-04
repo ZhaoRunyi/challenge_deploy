@@ -43,6 +43,118 @@ class RecordingSchema:
         return tuple(names)
 
 
+class RuntimeExecutionWindow:
+    def __init__(self, *, schema: RecordingSchema, display_index: int = 1, window_name: str = "execution_window") -> None:
+        self.schema = schema
+        self.display_index = max(1, int(display_index))
+        self.window_name = window_name
+        self.actions: list[np.ndarray] = []
+        self.states: list[np.ndarray] = []
+        self.camera_height: int | None = None
+        self.camera_width: int | None = None
+        self.window_created = False
+        self.window_disabled = False
+
+    def reset(self) -> None:
+        self.actions.clear()
+        self.states.clear()
+        self.camera_height = None
+        self.camera_width = None
+
+    def close(self) -> None:
+        if self.window_created:
+            try:
+                cv2.destroyWindow(self.window_name)
+            except cv2.error:
+                pass
+            self.window_created = False
+
+    def show_frame(self, frame: np.ndarray) -> None:
+        if self.window_disabled:
+            return
+        try:
+            if not self.window_created:
+                cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+                cv2.moveWindow(self.window_name, (self.display_index - 1) * 1920, 0)
+                self.window_created = True
+            cv2.imshow(self.window_name, frame)
+            cv2.waitKey(1)
+        except cv2.error as exc:
+            self.window_disabled = True
+            print(f"Runtime window disabled because OpenCV highgui is unavailable: {exc}", flush=True)
+
+    def compose_camera_row(self, images: Mapping[str, np.ndarray]) -> np.ndarray:
+        panels = []
+        for camera_name in self.schema.camera_names:
+            if camera_name not in images:
+                raise KeyError(f"Runtime window is missing camera image {camera_name!r}")
+            image = to_bgr_uint8(images[camera_name])
+            if self.camera_height is None:
+                self.camera_height = int(image.shape[0])
+            panels.append(resize_to_height(image, self.camera_height))
+        row = np.concatenate(panels, axis=1)
+        if self.camera_width is None:
+            self.camera_width = int(row.shape[1])
+        elif row.shape[1] != self.camera_width:
+            row = cv2.resize(row, (self.camera_width, self.camera_height), interpolation=cv2.INTER_AREA)
+        return row
+
+    def show_images(self, images: Mapping[str, np.ndarray]) -> None:
+        self.show_frame(self.compose_camera_row(images))
+
+    def record(self, *, images: Mapping[str, np.ndarray], action: np.ndarray, state: np.ndarray, timestamp_s: float) -> None:
+        del timestamp_s
+        self.actions.append(np.asarray(action, dtype=np.float64).copy())
+        self.states.append(np.asarray(state, dtype=np.float64).copy())
+        camera_row = self.compose_camera_row(images)
+        actions = np.stack(self.actions, axis=0)
+        states = np.stack(self.states, axis=0)
+        horizon = max(200, int(math.ceil(len(self.actions) / 200.0) * 200))
+        cols = min(4, max(1, len(self.schema.plot_names)))
+        rows = max(1, math.ceil(len(self.schema.plot_names) / cols))
+        plot_row = draw_runtime_plot_canvas(
+            width=camera_row.shape[1],
+            height=rows * 80,
+            cols=cols,
+            names=self.schema.plot_names,
+            schema=self.schema,
+            actions=actions,
+            states=states,
+            x_horizon=horizon,
+        )
+        frame = np.concatenate((camera_row, plot_row), axis=0)
+        self.show_frame(frame)
+
+
+class ExecutionRecordSink:
+    def __init__(self, *, recorder: Any | None = None, runtime_window: RuntimeExecutionWindow | None = None) -> None:
+        self.recorder = recorder
+        self.runtime_window = runtime_window
+
+    def record(
+        self,
+        *,
+        images: Mapping[str, np.ndarray],
+        action: np.ndarray,
+        state: np.ndarray,
+        timestamp_s: float,
+    ) -> None:
+        if self.recorder is not None:
+            self.recorder.record(
+                images=images,
+                action=action,
+                state=state,
+                timestamp_s=timestamp_s,
+            )
+        if self.runtime_window is not None:
+            self.runtime_window.record(
+                images=images,
+                action=action,
+                state=state,
+                timestamp_s=timestamp_s,
+            )
+
+
 class RolloutVideoRecorder:
     def __init__(
         self,
@@ -234,7 +346,7 @@ class RolloutVideoRecorder:
         cols = min(self.plot_cols, max(1, len(names)))
         rows = max(1, math.ceil(len(names) / cols))
         height = rows * self.plot_cell_h
-        base = draw_plot_canvas(
+        base = draw_record_plot_canvas(
             width=width,
             height=height,
             cols=cols,
@@ -244,7 +356,7 @@ class RolloutVideoRecorder:
             states=states,
             draw_curves=False,
         )
-        final = draw_plot_canvas(
+        final = draw_record_plot_canvas(
             width=width,
             height=height,
             cols=cols,
@@ -408,7 +520,7 @@ def put_small_label(image: np.ndarray, text: str, origin: tuple[int, int]) -> No
     cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.27, (40, 40, 40), 1, cv2.LINE_AA)
 
 
-def draw_plot_canvas(
+def draw_record_plot_canvas(
     *,
     width: int,
     height: int,
@@ -460,22 +572,99 @@ def draw_plot_canvas(
             continue
 
         if state_values is not None:
-            state_points = to_plot_points(state_values, rect, y_min, y_max)
+            state_points = to_record_plot_points(state_values, rect, y_min, y_max)
             cv2.polylines(canvas, [state_points], False, STATE_COLOR, 1, cv2.LINE_AA)
         if action_values is not None:
             action_color = USED_ACTION_COLOR if name in schema.used_action_names else ACTION_COLOR
-            action_points = to_plot_points(action_values, rect, y_min, y_max)
+            action_points = to_record_plot_points(action_values, rect, y_min, y_max)
             cv2.polylines(canvas, [action_points], False, action_color, 1, cv2.LINE_AA)
 
     return canvas
 
 
-def to_plot_points(values: np.ndarray, rect: tuple[int, int, int, int], y_min: float, y_max: float) -> np.ndarray:
+def draw_runtime_plot_canvas(
+    *,
+    width: int,
+    height: int,
+    cols: int,
+    names: tuple[str, ...],
+    schema: RecordingSchema,
+    actions: np.ndarray,
+    states: np.ndarray,
+    x_horizon: int,
+) -> np.ndarray:
+    canvas = np.full((height, width, 3), 248, dtype=np.uint8)
+    rows = max(1, math.ceil(max(1, len(names)) / cols))
+    cell_w = width // cols
+    cell_h = height // rows
+    rects = plot_rects(width=width, height=height, count=len(names), cols=cols)
+
+    for index, name in enumerate(names):
+        row = index // cols
+        col = index % cols
+        cell_x = col * cell_w
+        cell_y = row * cell_h
+        rect = rects[index]
+        x0, y0, x1, y1 = rect
+
+        action_values = series_for_name(actions, schema.action_names, name)
+        state_values = series_for_name(states, schema.state_names, name)
+        value_blocks = [values for values in (action_values, state_values) if values is not None and values.size]
+        if value_blocks:
+            values = np.concatenate(value_blocks)
+            y_min = float(np.nanmin(values))
+            y_max = float(np.nanmax(values))
+        else:
+            y_min, y_max = -1.0, 1.0
+        if not np.isfinite(y_min) or not np.isfinite(y_max) or abs(y_max - y_min) < 1e-9:
+            center = 0.0 if not np.isfinite(y_min) else y_min
+            y_min, y_max = center - 1.0, center + 1.0
+        margin = max((y_max - y_min) * 0.08, 1e-6)
+        y_min -= margin
+        y_max += margin
+
+        cv2.rectangle(canvas, (cell_x, cell_y), (cell_x + cell_w - 1, cell_y + cell_h - 1), (220, 220, 220), 1)
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), (138, 138, 138), 1)
+        if y_min <= 0.0 <= y_max:
+            zero_y = int(round(y1 - (0.0 - y_min) / (y_max - y_min) * (y1 - y0)))
+            cv2.line(canvas, (x0, zero_y), (x1, zero_y), (218, 218, 218), 1)
+        put_small_label(canvas, short_label(name), (cell_x + 3, cell_y + 10))
+
+        if state_values is not None:
+            state_points = to_runtime_plot_points(state_values, rect, y_min, y_max, x_horizon)
+            cv2.polylines(canvas, [state_points], False, STATE_COLOR, 1, cv2.LINE_AA)
+        if action_values is not None:
+            action_color = USED_ACTION_COLOR if name in schema.used_action_names else ACTION_COLOR
+            action_points = to_runtime_plot_points(action_values, rect, y_min, y_max, x_horizon)
+            cv2.polylines(canvas, [action_points], False, action_color, 1, cv2.LINE_AA)
+
+    return canvas
+
+
+def to_record_plot_points(values: np.ndarray, rect: tuple[int, int, int, int], y_min: float, y_max: float) -> np.ndarray:
     x0, y0, x1, y1 = rect
     if len(values) == 1:
         xs = np.array([x0], dtype=np.float64)
     else:
         xs = np.linspace(x0, x1 - 1, len(values), dtype=np.float64)
+    ys = y1 - (values - y_min) / (y_max - y_min) * (y1 - y0)
+    ys = np.clip(ys, y0, y1 - 1)
+    return np.stack((xs, ys), axis=1).round().astype(np.int32)
+
+
+def to_runtime_plot_points(
+    values: np.ndarray,
+    rect: tuple[int, int, int, int],
+    y_min: float,
+    y_max: float,
+    x_horizon: int,
+) -> np.ndarray:
+    x0, y0, x1, y1 = rect
+    horizon = max(len(values), int(x_horizon))
+    if horizon <= 1:
+        xs = np.array([x0], dtype=np.float64)
+    else:
+        xs = np.linspace(x0, x1 - 1, horizon, dtype=np.float64)[:len(values)]
     ys = y1 - (values - y_min) / (y_max - y_min) * (y1 - y0)
     ys = np.clip(ys, y0, y1 - 1)
     return np.stack((xs, ys), axis=1).round().astype(np.int32)

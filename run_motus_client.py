@@ -21,7 +21,7 @@ from rollout.execution import (
     save_rollout_metrics,
     run_temporal_smoothing_rollout,
 )
-from rollout.recording import RolloutVideoRecorder, preview_until_continue, save_frame1_image, save_recorded_actions
+from rollout.recording import RolloutVideoRecorder, ExecutionRecordSink, RuntimeExecutionWindow, preview_until_continue, save_frame1_image, save_recorded_actions
 from rollout.support import (
     apply_runtime_overrides,
     build_slai_recording_state,
@@ -145,7 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-left-serial", default=None)
     parser.add_argument("--camera-right-serial", default=None)
     parser.add_argument("--no-cameras", action="store_true")
-    parser.add_argument("--window", action="store_true")
+    parser.add_argument("--window", nargs="?", const=1, type=int, default=0)
     parser.add_argument("--dry-run", action="store_true", help="Infer and decode the first action, but do not command Piper.")
     parser.add_argument("--spec-only", action="store_true", help="Only print the train-config-derived spaces; no server or hardware.")
     parser.add_argument("--ready-timeout", type=float, default=15.0)
@@ -231,6 +231,11 @@ def run_once(args: argparse.Namespace) -> None:
         name="motus_piper_client",
     )
     recording_schema = make_slai_recording_schema(spec, args.control_mode)
+    runtime_window = (
+        RuntimeExecutionWindow(schema=recording_schema, display_index=args.window)
+        if args.window
+        else None
+    )
     saved_actions: list[np.ndarray] | None = [] if args.record else None
     recorder = (
         RolloutVideoRecorder(
@@ -240,6 +245,11 @@ def run_once(args: argparse.Namespace) -> None:
             name_prefix=record_name_prefix(args, server_metadata),
         )
         if args.record
+        else None
+    )
+    record_sink = (
+        ExecutionRecordSink(recorder=recorder, runtime_window=runtime_window)
+        if recorder is not None or runtime_window is not None
         else None
     )
     install_recorder_signal_handlers(recorder)
@@ -262,8 +272,8 @@ def run_once(args: argparse.Namespace) -> None:
             snapshot = source.capture_snapshot()
             first_obs_snapshot = snapshot
             actions = action_sequence(client.infer_actions(snapshot, prompt=resolved_prompt))
-            if recorder is not None:
-                recorder.record(
+            if record_sink is not None:
+                record_sink.record(
                     images=snapshot.images,
                     action=actions[0],
                     state=state_builder(snapshot, spec),
@@ -381,7 +391,7 @@ def run_once(args: argparse.Namespace) -> None:
                 latency_k=latency_k,
                 min_smooth_steps=min_smooth_steps,
                 buffer_max_chunks=buffer_max_chunks,
-                recorder=recorder,
+                recorder=record_sink,
                 saved_actions=saved_actions,
                 log_chunk=log_chunk,
                 initial_snapshot=first_obs_snapshot,
@@ -397,7 +407,7 @@ def run_once(args: argparse.Namespace) -> None:
                 rollout_steps=args.rollout_steps,
                 chunk_size=chunk_size,
                 fps=args.fps,
-                recorder=recorder,
+                recorder=record_sink,
                 saved_actions=saved_actions,
                 log_chunk=log_chunk,
                 initial_snapshot=first_obs_snapshot,
@@ -464,6 +474,8 @@ def run_once(args: argparse.Namespace) -> None:
                         print(f"Skipped train-distribution frame1 image: {distribution_skip_reason}", flush=True)
                 except Exception as exc:
                     print(f"Failed to save frame1 image: {exc}", flush=True)
+        if runtime_window is not None:
+            runtime_window.close()
 
 
 def main() -> None:

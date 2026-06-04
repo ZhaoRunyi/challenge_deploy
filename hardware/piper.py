@@ -334,8 +334,10 @@ class SinglePiperArm:
             dtype=np.float64,
         )
         end_pose = feedback_end_pose
+        effective_end_pose_timestamp_s = end_pose_timestamp_s
         if use_command:
             end_pose = fk_links_to_end_pose(self.interface.GetFK(mode="control"), feedback_end_pose, qpos[6])
+            effective_end_pose_timestamp_s = command_timestamp_s
 
         return PiperArmState(
             name=self.name,
@@ -355,13 +357,13 @@ class SinglePiperArm:
                 qpos_timestamp_s,
                 high_spd_timestamp_s,
                 gripper_feedback_timestamp_s,
-                end_pose_timestamp_s,
+                effective_end_pose_timestamp_s,
                 status_timestamp_s,
             ),
             qpos_timestamp_s=qpos_timestamp_s,
             qvel_timestamp_s=high_spd_timestamp_s,
             effort_timestamp_s=gripper_feedback_timestamp_s,
-            end_pose_timestamp_s=end_pose_timestamp_s,
+            end_pose_timestamp_s=effective_end_pose_timestamp_s,
             command_timestamp_s=command_timestamp_s,
         )
 
