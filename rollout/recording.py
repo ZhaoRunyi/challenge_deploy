@@ -69,16 +69,44 @@ class RuntimeExecutionWindow:
                 pass
             self.window_created = False
 
+    def keep_window_on_top(self) -> None:
+        try:
+            from Xlib import X, display, protocol
+
+            screen = display.Display()
+            root = screen.screen().root
+            pending = [root]
+            target = None
+            while pending and target is None:
+                window = pending.pop()
+                if window.get_wm_name() == self.window_name:
+                    target = window
+                else:
+                    pending.extend(window.query_tree().children)
+            if target is None:
+                return
+            state = screen.intern_atom("_NET_WM_STATE")
+            above = screen.intern_atom("_NET_WM_STATE_ABOVE")
+            event = protocol.event.ClientMessage(window=target, client_type=state, data=(32, [1, above, 0, 1, 0]))
+            root.send_event(event, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask)
+            target.configure(stack_mode=X.Above)
+            screen.flush()
+        except Exception:
+            pass
+
     def show_frame(self, frame: np.ndarray) -> None:
         if self.window_disabled:
             return
         try:
             if not self.window_created:
                 cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+                height, width = frame.shape[:2]
+                cv2.resizeWindow(self.window_name, width, height * 2)
                 cv2.moveWindow(self.window_name, (self.display_index - 1) * 1920, 0)
                 self.window_created = True
             cv2.imshow(self.window_name, frame)
             cv2.waitKey(1)
+            self.keep_window_on_top()
         except cv2.error as exc:
             self.window_disabled = True
             print(f"Runtime window disabled because OpenCV highgui is unavailable: {exc}", flush=True)
@@ -563,9 +591,6 @@ def draw_record_plot_canvas(
 
         cv2.rectangle(canvas, (cell_x, cell_y), (cell_x + cell_w - 1, cell_y + cell_h - 1), (220, 220, 220), 1)
         cv2.rectangle(canvas, (x0, y0), (x1, y1), (138, 138, 138), 1)
-        if y_min <= 0.0 <= y_max:
-            zero_y = int(round(y1 - (0.0 - y_min) / (y_max - y_min) * (y1 - y0)))
-            cv2.line(canvas, (x0, zero_y), (x1, zero_y), (218, 218, 218), 1)
         put_small_label(canvas, short_label(name), (cell_x + 3, cell_y + 10))
 
         if not draw_curves:
@@ -625,9 +650,6 @@ def draw_runtime_plot_canvas(
 
         cv2.rectangle(canvas, (cell_x, cell_y), (cell_x + cell_w - 1, cell_y + cell_h - 1), (220, 220, 220), 1)
         cv2.rectangle(canvas, (x0, y0), (x1, y1), (138, 138, 138), 1)
-        if y_min <= 0.0 <= y_max:
-            zero_y = int(round(y1 - (0.0 - y_min) / (y_max - y_min) * (y1 - y0)))
-            cv2.line(canvas, (x0, zero_y), (x1, zero_y), (218, 218, 218), 1)
         put_small_label(canvas, short_label(name), (cell_x + 3, cell_y + 10))
 
         if state_values is not None:
