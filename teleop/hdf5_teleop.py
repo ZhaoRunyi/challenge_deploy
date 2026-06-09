@@ -11,6 +11,8 @@ from typing import Any, Callable, Sequence
 import cv2
 import h5py
 import imageio
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -147,6 +149,12 @@ def arm_eef_quaternion(position: np.ndarray, gripper: float) -> np.ndarray:
     quat = rotation_cls.from_euler("xyz", position[3:6], degrees=False).as_quat().astype(np.float64)
     return np.concatenate((position[:3], quat, np.array([gripper], dtype=np.float64)), axis=0)
 
+
+def dual_eef_quaternion(pose_state: DualPiperState, joint_state: DualPiperState) -> np.ndarray:
+    return np.concatenate((
+        arm_eef_quaternion(pose_state.left.end_pose, joint_state.left.qpos[6]),
+        arm_eef_quaternion(pose_state.right.end_pose, joint_state.right.qpos[6]),
+    ))
 
 
 def infer_language_instruction(task_name: str, explicit: str | None = None) -> str:
@@ -331,6 +339,7 @@ class HDF5TeleopCollectionSource:
         self.stop_event = threading.Event()
         self.threads: list[threading.Thread] = []
         self.last_error: Exception | None = None
+        self.last_sync_failure = "not checked"
         self.trace_lock = threading.Lock()
         self.sample_history: dict[str, list[float]] = {}
         self.selected_history: list[dict[str, float]] = []
@@ -429,7 +438,7 @@ class HDF5TeleopCollectionSource:
             loop_start_s = time.monotonic()
             try:
                 state = arm.read_state(prefer_joint_ctrl=prefer_joint_ctrl)
-                qpos_timestamp_s = positive_timestamp(state.qpos_timestamp_s) or positive_timestamp(state.timestamp_s)
+                qpos_timestamp_s = time.time() if prefer_joint_ctrl else positive_timestamp(state.qpos_timestamp_s) or positive_timestamp(state.timestamp_s)
                 if qpos_timestamp_s is not None and qpos_timestamp_s > last_qpos_timestamp_s:
                     self.append_sample(f"{arm_name}_joint", self.arm_joint_queues[arm_name], TimestampedValue(qpos_timestamp_s, state))
                     last_qpos_timestamp_s = qpos_timestamp_s
@@ -450,28 +459,34 @@ class HDF5TeleopCollectionSource:
         for camera_name in self.camera_names:
             timestamp_s = self.color_queues[camera_name].latest_timestamp_s()
             if timestamp_s is None:
+                self.last_sync_failure = f"missing camera_{camera_name}"
                 return None
             image_timestamps.append(timestamp_s)
         if self.cameras.enable_depth:
             for camera_name in self.camera_names:
                 timestamp_s = self.depth_queues[camera_name].latest_timestamp_s()
                 if timestamp_s is None:
+                    self.last_sync_failure = f"missing depth_{camera_name}"
                     return None
                 image_timestamps.append(timestamp_s)
         frame_time = min(image_timestamps)
 
-        for queue in self.color_queues.values():
+        for camera_name, queue in self.color_queues.items():
             if not queue.has_sample_at_or_after(frame_time):
+                self.last_sync_failure = f"camera_{camera_name} behind frame_time {frame_time:.6f}"
                 return None
         if self.cameras.enable_depth:
-            for queue in self.depth_queues.values():
+            for camera_name, queue in self.depth_queues.items():
                 if not queue.has_sample_at_or_after(frame_time):
+                    self.last_sync_failure = f"depth_{camera_name} behind frame_time {frame_time:.6f}"
                     return None
-        for queue in self.arm_joint_queues.values():
+        for arm_name, queue in self.arm_joint_queues.items():
             if not queue.has_sample_at_or_after(frame_time):
+                self.last_sync_failure = f"{arm_name}_joint behind frame_time {frame_time:.6f}"
                 return None
-        for queue in self.puppet_pose_queues.values():
+        for arm_name, queue in self.puppet_pose_queues.items():
             if not queue.has_sample_at_or_after(frame_time):
+                self.last_sync_failure = f"{arm_name}_pose behind frame_time {frame_time:.6f}"
                 return None
         return frame_time
 
@@ -593,8 +608,6 @@ def collect_hdf5_teleop_episode(
     skipped_stationary = 0
     stationary_start_s: float | None = None
     stationary_end_s: float | None = None
-    print_sync_failure = True
-
     def close_stationary_interval() -> None:
         nonlocal stationary_start_s, stationary_end_s
         if stationary_start_s is not None and stationary_end_s is not None:
@@ -612,12 +625,9 @@ def collect_hdf5_teleop_episode(
                 break
             frame = source.get_frame()
             if frame is None:
-                if print_sync_failure:
-                    print("syn fail", flush=True)
-                    print_sync_failure = False
+                print(f"syn fail: {source.last_sync_failure}", flush=True)
                 time.sleep(1.0 / fps)
                 continue
-            print_sync_failure = True
             if skip_stationary and last_master_state is not None and not dual_piper_state_moved(frame.master_state, last_master_state, stationary_tolerance):
                 skipped_stationary += 1
                 if stationary_start_s is None:
