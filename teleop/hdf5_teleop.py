@@ -255,9 +255,9 @@ def arm_state_vector_16(arm_state: PiperArmState, stable_pose: np.ndarray) -> np
     matrix = Rotation.from_euler("xyz", stable_pose[3:6], degrees=False).as_matrix()
     return np.concatenate((
         np.asarray(arm_state.qpos[:6], dtype=np.float64),
+        np.array([normalized_gripper_value(arm_state.qpos[6])], dtype=np.float64),
         np.asarray(stable_pose[:3], dtype=np.float64),
         rotation_matrix_to_6d(matrix),
-        np.array([normalized_gripper_value(arm_state.qpos[6])], dtype=np.float64),
     ))
 
 
@@ -292,9 +292,9 @@ HDF5_TELEOP_VECTOR_NAMES = tuple(
     for arm in ("left", "right")
     for field in (
         "joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5",
+        "gripper",
         "ee_pos_x", "ee_pos_y", "ee_pos_z",
         "ee_rot6d_0", "ee_rot6d_1", "ee_rot6d_2", "ee_rot6d_3", "ee_rot6d_4", "ee_rot6d_5",
-        "gripper",
     )
 )
 

@@ -358,8 +358,8 @@ def build_cam_high_first_frame_overlay(dataset_dir: Path, *, repo_id: str | None
     from .task_segmentation import select_relevant_task_masks
 
     info = info_json(dataset_dir)
-    episode_indices = episode_indices(dataset_dir)
-    if not episode_indices:
+    indices = episode_indices(dataset_dir)
+    if not indices:
         raise RuntimeError(f"No episodes found in {dataset_dir}")
     resolved_repo_id = repo_id or dataset_dir.relative_to(lerobot_home()).as_posix()
 
@@ -370,7 +370,7 @@ def build_cam_high_first_frame_overlay(dataset_dir: Path, *, repo_id: str | None
     count = 0
     target_shape: tuple[int, int] | None = None
 
-    for episode_index in episode_indices:
+    for episode_index in indices:
         parquet_path = parquet_path_for_episode(dataset_dir, info, episode_index)
         df = pd.read_parquet(parquet_path)
         if len(df) == 0:
