@@ -31,6 +31,7 @@ class WebsocketClientPolicy:
                     compression=None,
                     max_size=None,
                     additional_headers=headers,
+                    proxy=None,
                 )
                 metadata = msgpack_numpy.unpackb(connection.recv())
                 return connection, metadata
