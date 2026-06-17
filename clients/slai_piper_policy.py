@@ -169,21 +169,18 @@ def field_slices_from_space(space: dict[str, object]) -> dict[str, slice]:
     field_slices: dict[str, slice] = {}
     cursor = 0
     for arm in space["arms"]:
-        if "joint" in space["ids"]:
-            next_cursor = cursor + len(JOINT_NAMES)
-            field_slices[f"{arm}_joint"] = slice(cursor, next_cursor)
-            cursor = next_cursor
-        if "gripper" in space["ids"]:
-            next_cursor = cursor + 1
-            field_slices[f"{arm}_gripper"] = slice(cursor, next_cursor)
-            cursor = next_cursor
-        if "ee_pos" in space["ids"]:
-            next_cursor = cursor + len(EE_POS_NAMES)
-            field_slices[f"{arm}_ee_pos"] = slice(cursor, next_cursor)
-            cursor = next_cursor
-        if "ee_rot" in space["ids"]:
-            next_cursor = cursor + len(EE_ROTATION_NAMES[space["ee_rotation"]])
-            field_slices[f"{arm}_ee_rot"] = slice(cursor, next_cursor)
+        for field in space["ids"]:
+            if field == "joint":
+                next_cursor = cursor + len(JOINT_NAMES)
+            elif field == "gripper":
+                next_cursor = cursor + 1
+            elif field == "ee_pos":
+                next_cursor = cursor + len(EE_POS_NAMES)
+            elif field == "ee_rot":
+                next_cursor = cursor + len(EE_ROTATION_NAMES[space["ee_rotation"]])
+            else:
+                raise ValueError(f"Unsupported field: {field}")
+            field_slices[f"{arm}_{field}"] = slice(cursor, next_cursor)
             cursor = next_cursor
     return field_slices
 
@@ -202,14 +199,17 @@ def names_from_space(space: dict[str, object]) -> list[str]:
     names: list[str] = []
     rotation_names = EE_ROTATION_NAMES[space["ee_rotation"]]
     for arm in space["arms"]:
-        if "joint" in space["ids"]:
-            names.extend(f"{arm}_joint_{joint_name}" for joint_name in JOINT_NAMES)
-        if "gripper" in space["ids"]:
-            names.append(f"{arm}_gripper")
-        if "ee_pos" in space["ids"]:
-            names.extend(f"{arm}_ee_pos_{axis}" for axis in EE_POS_NAMES)
-        if "ee_rot" in space["ids"]:
-            names.extend(f"{arm}_ee_{axis}" for axis in rotation_names)
+        for field in space["ids"]:
+            if field == "joint":
+                names.extend(f"{arm}_joint_{joint_name}" for joint_name in JOINT_NAMES)
+            elif field == "gripper":
+                names.append(f"{arm}_gripper")
+            elif field == "ee_pos":
+                names.extend(f"{arm}_ee_pos_{axis}" for axis in EE_POS_NAMES)
+            elif field == "ee_rot":
+                names.extend(f"{arm}_ee_{axis}" for axis in rotation_names)
+            else:
+                raise ValueError(f"Unsupported field: {field}")
     return names
 
 
