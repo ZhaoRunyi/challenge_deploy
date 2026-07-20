@@ -770,9 +770,10 @@ def save_hdf5_teleop_record_video(
     name_prefix: str,
     action_from_state: bool = False,
     output_path: str | Path | None = None,
-) -> Path | None:
+    save_separate_videos: bool = False,
+) -> tuple[Path | None, list[Path]]:
     if len(frames) < 2:
-        return None
+        return None, []
 
     camera_names = tuple(frames[0].images)
     schema = RecordingSchema(
@@ -788,6 +789,8 @@ def save_hdf5_teleop_record_video(
         name_prefix=name_prefix,
         output_path=output_path,
         keep_frames_in_memory=True,
+        save_separate_videos=save_separate_videos,
+        separate_video_stem=name_prefix,
         video_codec="libx264",
         video_output_params=("-preset", "veryfast", "-crf", "18"),
     )
@@ -805,7 +808,8 @@ def save_hdf5_teleop_record_video(
             ),
             timestamp_s=observation_frame.timestamp_s,
         )
-    return recorder.finalize()
+    output_video_path = recorder.finalize()
+    return output_video_path, recorder.separate_video_paths
 
 
 def offset_summary(values: list[float]) -> dict[str, float | int]:

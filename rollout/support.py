@@ -9,7 +9,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from clients import slai_piper_policy
-from clients.base import build_configured_piper_state
+from clients.base import ACTION_GRIPPER_ENCODINGS, STATE_GRIPPER_ENCODINGS, build_configured_piper_state
 from clients.specs import decoded_action_summary
 from hardware.config import set_by_dotted_path
 from hardware.constants import DUAL_PIPER_INIT_JOINTS
@@ -24,6 +24,34 @@ def normalized_prompt(value: str | None) -> str | None:
         return None
     prompt = value.strip()
     return prompt or None
+
+
+def add_gripper_encoding_args(
+    parser: argparse.ArgumentParser,
+    *,
+    default_state: str = "policy",
+    default_action: str = "policy",
+) -> None:
+    parser.add_argument(
+        "--state-gripper",
+        choices=STATE_GRIPPER_ENCODINGS,
+        default=default_state,
+        help="State gripper encoding passed to the policy: policy, meters, or old.",
+    )
+    parser.add_argument(
+        "--action-gripper",
+        choices=ACTION_GRIPPER_ENCODINGS,
+        default=default_action,
+        help="Action gripper encoding returned by the policy: policy, meters, binary, or old.",
+    )
+
+
+def apply_arm_gripper_overrides(client: Any, args: argparse.Namespace) -> None:
+    for side in ("left", "right"):
+        for field in ("threshold", "lower", "upper"):
+            attr = f"{side}_gripper_{field}"
+            if hasattr(args, attr):
+                setattr(client, attr, getattr(args, attr))
 
 
 def apply_runtime_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -94,10 +122,15 @@ def build_slai_recording_state(
     snapshot: Any,
     spec: Any,
     *,
-    old_gripper: bool = False,
+    state_gripper_encoding: str = "policy",
     dtype: Any = np.float64,
 ) -> np.ndarray:
-    return build_configured_piper_state(snapshot, spec, old_gripper=old_gripper, dtype=dtype)
+    return build_configured_piper_state(
+        snapshot,
+        spec,
+        state_gripper_encoding=state_gripper_encoding,
+        dtype=dtype,
+    )
 
 
 def resolve_dual_piper_init_joints(values: Sequence[float] | None) -> np.ndarray:

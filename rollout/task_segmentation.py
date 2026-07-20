@@ -353,6 +353,13 @@ TASK_OBJECT_SPECS: dict[str, tuple[TaskObjectSpec, ...]] = {
 TASK_OBJECT_SPECS["ZhaoRunyi/Piper_carry_basket_0426"] = TASK_OBJECT_SPECS["ZhaoRunyi/Piper_carry_basket_0421"]
 TASK_OBJECT_SPECS["ZhaoRunyi/Piper_insert_test_tube_0430"] = TASK_OBJECT_SPECS["ZhaoRunyi/Piper_insert_test_tube_0426"]
 TASK_OBJECT_SPECS["ZhaoRunyi/Piper_pour_dual_0427"] = TASK_OBJECT_SPECS["ZhaoRunyi/Piper_pour_dual_0421"]
+for _traffic_light_repo_id in (
+    "ZhaoRunyi/Piper_traffic_light_water_0612",
+    "ZhaoRunyi/Piper_traffic_light_water_0616",
+    "ZhaoRunyi/Piper_traffic_light_water_0624",
+    "ZhaoRunyi/Piper_traffic_light_water_color",
+):
+    TASK_OBJECT_SPECS[_traffic_light_repo_id] = TASK_OBJECT_SPECS["ZhaoRunyi/Piper_traffic_light_water_0609"]
 
 
 def _mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int]:

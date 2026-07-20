@@ -8,8 +8,10 @@ from openpi_client import websocket_client_policy
 from hardware.schemas import RobotSnapshot
 from . import slai_piper_policy
 from .base import (
+    ActionGripperEncoding,
     ControlMode,
     SlaiPiperClient,
+    StateGripperEncoding,
     build_full_piper_state,
     image_to_rgb,
 )
@@ -41,11 +43,21 @@ def load_piper_policy_spec(train_config_name: str) -> PiperPolicySpec:
     )
 
 
-def build_policy_payload(snapshot: RobotSnapshot, *, prompt: str | None, spec: PiperPolicySpec, old_gripper: bool = False) -> dict[str, Any]:
+def build_policy_payload(
+    snapshot: RobotSnapshot,
+    *,
+    prompt: str | None,
+    spec: PiperPolicySpec,
+    state_gripper_encoding: StateGripperEncoding = "policy",
+) -> dict[str, Any]:
     if prompt is None:
         raise ValueError("OpenPI policy payload requires a prompt")
     payload: dict[str, Any] = {
-        "observation.state": build_full_piper_state(snapshot, spec, old_gripper=old_gripper),
+        "observation.state": build_full_piper_state(
+            snapshot,
+            spec,
+            state_gripper_encoding=state_gripper_encoding,
+        ),
         "prompt": prompt,
     }
     for image_id, dataset_key in spec.image_key_map.items():
@@ -69,7 +81,8 @@ class OpenPiPiperClient(SlaiPiperClient):
         gripper_threshold: float | None = None,
         gripper_lower: float | None = None,
         gripper_upper: float | None = None,
-        old_gripper: bool = False,
+        state_gripper_encoding: StateGripperEncoding = "policy",
+        action_gripper_encoding: ActionGripperEncoding = "policy",
     ) -> None:
         spec = load_piper_policy_spec(train_config_name)
         policy_client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
@@ -82,11 +95,18 @@ class OpenPiPiperClient(SlaiPiperClient):
             gripper_threshold=gripper_threshold,
             gripper_lower=gripper_lower,
             gripper_upper=gripper_upper,
-            old_gripper=old_gripper,
+            state_gripper_encoding=state_gripper_encoding,
+            action_gripper_encoding=action_gripper_encoding,
         )
 
     def build_payload(self, snapshot: RobotSnapshot, prompt: str | None = None, **kwargs: Any) -> dict[str, Any]:
-        return build_policy_payload(snapshot, prompt=prompt, spec=self.spec, old_gripper=self.old_gripper)
+        del kwargs
+        return build_policy_payload(
+            snapshot,
+            prompt=prompt,
+            spec=self.spec,
+            state_gripper_encoding=self.state_gripper_encoding,
+        )
 
 
 def spec_summary(spec: PiperPolicySpec) -> dict[str, Any]:

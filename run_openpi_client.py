@@ -7,21 +7,26 @@ from pathlib import Path
 import numpy as np
 
 from hardware.config import load_config
-from rollout.assets import prepare_client_assets
+from rollout.lerobot_assets import prepare_lerobot_assets, repo_id_from_spec
 from clients.openpi import (
     OpenPiPiperClient,
     load_piper_policy_spec,
     spec_summary,
 )
-from rollout.recording import RolloutVideoRecorder, ExecutionRecordSink, RuntimeExecutionWindow, preview_until_continue, save_frame1_image, save_recorded_actions
+from rollout.recording import RolloutVideoRecorder, ExecutionRecordSink, save_frame1_image, save_recorded_actions, set_distribution_overlap
+from rollout.windowing import RuntimeExecutionWindow, preview_until_continue
 from rollout.execution import (
     action_sequence,
     resolve_chunk_size,
+    resolve_policy_steps,
+    resolve_record_steps,
     run_chunk_sync_rollout,
     save_rollout_metrics,
     run_temporal_smoothing_rollout,
 )
 from rollout.support import (
+    add_gripper_encoding_args,
+    apply_arm_gripper_overrides,
     apply_runtime_overrides,
     build_slai_recording_state,
     decoded_action_summary,
@@ -70,16 +75,18 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument(f"--{side}_gripper_upper", type=float, default=None)
     parser.add_argument("--gripper_lower", type=float, default=None)
     parser.add_argument("--gripper_upper", type=float, default=None)
-    parser.add_argument(
-        "--old_gripper",
-        action="store_true",
-        help="Use the historical wrong Piper raw-gripper scaling for models trained before the 2lerobot fix.",
-    )
+    add_gripper_encoding_args(parser)
     parser.add_argument(
         "--rollout-steps",
         type=int,
         default=1000,
         help="Number of action frames to command; 0 means run until Ctrl-C.",
+    )
+    parser.add_argument(
+        "--record-steps",
+        type=int,
+        default=None,
+        help="Total frames to record; default is --rollout-steps. Requires --record or --window when set.",
     )
     parser.add_argument(
         "--chunk-size",
@@ -105,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--buffer-max-chunks", type=int, default=None, help="Action buffer chunk cap; default from config.")
     parser.add_argument("--metrics-json", default=None, help="Optional path to save rollout timing metrics as JSON.")
     parser.add_argument("--record", action="store_true", help="Record cameras, actions, and states into one deploy video.")
+    parser.add_argument("--save-sep", action="store_true", help="Save one raw-camera video per recording camera; requires --record.")
     parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "openpi_records"))
     parser.add_argument("--config", default=str(DEPLOY_ROOT / "configs" / "dual_piper_example.yaml"))
     parser.add_argument("--left-can", default=None)
@@ -121,6 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-right-serial", default=None)
     parser.add_argument("--no-cameras", action="store_true")
     parser.add_argument("--window", nargs="?", const=1, type=int, default=0)
+    parser.add_argument("--dist-overlap", action="store_true", help="Overlay train distribution on cam_high instead of stacking it above.")
     parser.add_argument("--dry-run", action="store_true", help="Infer and decode the first action, but do not command Piper.")
     parser.add_argument("--spec-only", action="store_true", help="Only print the train-config-derived spaces; no server or hardware.")
     parser.add_argument("--ready-timeout", type=float, default=15.0)
@@ -128,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_once(args: argparse.Namespace) -> None:
+    set_distribution_overlap(args.dist_overlap)
+    if args.save_sep and not args.record:
+        raise ValueError("--save-sep requires --record")
+    if args.record_steps is not None and not (args.record or args.window):
+        raise ValueError("--record-steps requires --record or --window")
     spec = load_piper_policy_spec(args.train_config)
     print(json.dumps(spec_summary(spec), indent=2))
     if args.spec_only:
@@ -135,6 +149,8 @@ def run_once(args: argparse.Namespace) -> None:
     cli_prompt = normalized_prompt(args.prompt)
     if args.rollout_steps < 0:
         raise ValueError("--rollout-steps must be non-negative")
+    record_steps = resolve_record_steps(args.rollout_steps, args.record_steps)
+    policy_steps = resolve_policy_steps(args.rollout_steps, record_steps)
     if args.fps < 0.0:
         raise ValueError("--fps must be non-negative")
     if args.gripper_threshold is not None and args.gripper_threshold < 0.0:
@@ -144,11 +160,11 @@ def run_once(args: argparse.Namespace) -> None:
     if args.inference_rate is not None and args.inference_rate < 0.0:
         raise ValueError("--inference-rate must be non-negative")
 
-    client_assets = prepare_client_assets(
-        client_kind="openpi",
+    client_assets = prepare_lerobot_assets(
         train_config_name=args.train_config,
         cli_prompt=cli_prompt,
         need_distribution=args.record or args.window,
+        repo_id=repo_id_from_spec(spec),
     )
     resolved_prompt = client_assets.prompt
     prompt_source = client_assets.prompt_source
@@ -169,16 +185,18 @@ def run_once(args: argparse.Namespace) -> None:
         joint_speed_percent=args.joint_speed_percent,
         ee_speed_percent=args.ee_speed_percent,
         gripper_threshold=args.gripper_threshold,
-        old_gripper=args.old_gripper,
+        gripper_lower=args.gripper_lower,
+        gripper_upper=args.gripper_upper,
+        state_gripper_encoding=args.state_gripper,
+        action_gripper_encoding=args.action_gripper,
     )
-    client.left_gripper_threshold, client.right_gripper_threshold, client.left_gripper_lower, client.left_gripper_upper, client.right_gripper_lower, client.right_gripper_upper = args.left_gripper_threshold, args.right_gripper_threshold, args.left_gripper_lower, args.left_gripper_upper, args.right_gripper_lower, args.right_gripper_upper
-    client.gripper_lower, client.gripper_upper = args.gripper_lower, args.gripper_upper
+    apply_arm_gripper_overrides(client, args)
     server_metadata = client.get_server_metadata()
     print(json.dumps({"server_metadata": server_metadata}, indent=2), flush=True)
     state_builder = lambda snapshot, policy_spec: build_slai_recording_state(
         snapshot,
         policy_spec,
-        old_gripper=args.old_gripper,
+        state_gripper_encoding=args.state_gripper,
     )
     runtime_config = apply_runtime_overrides(load_config(args.config), args)
     robot, cameras, source = make_dual_piper_runtime(
@@ -199,6 +217,7 @@ def run_once(args: argparse.Namespace) -> None:
             schema=recording_schema,
             fps=args.fps,
             name_prefix=record_name_prefix(args, server_metadata),
+            save_separate_videos=args.save_sep,
         )
         if args.record
         else None
@@ -292,6 +311,7 @@ def run_once(args: argparse.Namespace) -> None:
                     "rollout": {
                         "execution_mode": args.execution_mode,
                         "rollout_steps": args.rollout_steps,
+                        "record_steps": record_steps,
                         "chunk_size": chunk_size,
                         "fps": args.fps,
                         "inference_rate": inference_rate if args.execution_mode == "streaming" else None,
@@ -301,7 +321,8 @@ def run_once(args: argparse.Namespace) -> None:
                         "joint_speed_percent": args.joint_speed_percent,
                         "ee_speed_percent": args.ee_speed_percent,
                         "gripper_threshold": args.gripper_threshold,
-                        "old_gripper": args.old_gripper,
+                        "state_gripper": args.state_gripper,
+                        "action_gripper": args.action_gripper,
                     }
                 },
                 indent=2,
@@ -315,7 +336,7 @@ def run_once(args: argparse.Namespace) -> None:
                 chunk_index=chunk_index,
                 action_count=action_count,
                 executed_steps=executed_steps,
-                rollout_steps=args.rollout_steps,
+                rollout_steps=policy_steps,
                 first_action=first_action,
             )
 
@@ -327,6 +348,7 @@ def run_once(args: argparse.Namespace) -> None:
                 spec=spec,
                 prompt=resolved_prompt,
                 rollout_steps=args.rollout_steps,
+                record_steps=record_steps,
                 chunk_size=chunk_size,
                 fps=args.fps,
                 inference_rate=inference_rate,
@@ -347,6 +369,7 @@ def run_once(args: argparse.Namespace) -> None:
                 spec=spec,
                 prompt=resolved_prompt,
                 rollout_steps=args.rollout_steps,
+                record_steps=record_steps,
                 chunk_size=chunk_size,
                 fps=args.fps,
                 recorder=record_sink,
@@ -392,6 +415,8 @@ def run_once(args: argparse.Namespace) -> None:
                 print(f"Failed to finalize recording: {exc}", flush=True)
             if output_path is not None:
                 print(f"Recording saved to {output_path}", flush=True)
+                for separate_video_path in recorder.separate_video_paths:
+                    print(f"Separate camera video saved to {separate_video_path}", flush=True)
                 try:
                     if frame1_compare_path is None:
                         frame1_compare_path = save_frame1_image(

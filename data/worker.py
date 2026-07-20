@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from rollout.recording import safe_filename_part
 from teleop.hdf5_teleop import (
     save_alignment_diagnostics,
     save_hdf5_teleop_episode,
@@ -21,6 +22,7 @@ class HDF5TeleopSaveConfig:
     action_from_state: bool = False
     alignment_plot_frames: int = 16
     record_video: bool = False
+    save_separate_videos: bool = False
     fps: float = 30.0
 
 
@@ -101,20 +103,23 @@ class HDF5TeleopDataWorker(BaseDataWorker):
             plot_frames=self.config.alignment_plot_frames,
         )
         record_video_path = None
+        sep_video_paths = []
         if self.config.record_video:
-            record_video_path = save_hdf5_teleop_record_video(
+            record_video_path, sep_video_paths = save_hdf5_teleop_record_video(
                 frames=item.frames,
                 output_dir=output_path.parent,
                 fps=self.config.fps,
                 name_prefix=f"episode_{item.episode_index}",
                 action_from_state=self.config.action_from_state,
                 output_path=output_path.with_name(f"episode_{item.episode_index}_video.mp4"),
+                save_separate_videos=self.config.save_separate_videos,
             )
         return self.saved_result(
             output_path=output_path,
             alignment_json_path=alignment_json_path,
             alignment_image_path=alignment_image_path,
             record_video_path=record_video_path,
+            sep_video_paths=sep_video_paths,
             frame_count=len(item.frames),
         )
 
@@ -122,13 +127,20 @@ class HDF5TeleopDataWorker(BaseDataWorker):
         data_frames = max(0, len(item.frames) - 1)
         alignment_stem = f"{item.episode_path.name}_alignment_plot{self.config.alignment_plot_frames}_frames{data_frames}"
         record_video_path = None
+        sep_video_paths = []
         if self.config.record_video:
             record_video_path = item.episode_path.with_name(f"episode_{item.episode_index}_video.mp4")
+            if self.config.save_separate_videos:
+                sep_video_paths = [
+                    item.episode_path.with_name(f"episode_{item.episode_index}_{safe_filename_part(camera_name)}.mp4")
+                    for camera_name in self.config.camera_names
+                ]
         return {
             "saved_path": str(item.episode_path.with_suffix(".hdf5")),
             "alignment_json_path": str(item.episode_path.with_name(alignment_stem + ".json")),
             "alignment_image_path": str(item.episode_path.with_name(alignment_stem + ".png")),
             "record_video_path": None if record_video_path is None else str(record_video_path),
+            "sep_video_paths": [str(path) for path in sep_video_paths],
             "record_video_status": None if record_video_path is None else "queued",
             "captured_frames": len(item.frames),
             "saved_steps": data_frames,
@@ -141,6 +153,7 @@ class HDF5TeleopDataWorker(BaseDataWorker):
         alignment_json_path: Path,
         alignment_image_path: Path,
         record_video_path: Path | None,
+        sep_video_paths: list[Path],
         frame_count: int,
     ) -> dict[str, Any]:
         return {
@@ -148,6 +161,7 @@ class HDF5TeleopDataWorker(BaseDataWorker):
             "alignment_json_path": str(alignment_json_path),
             "alignment_image_path": str(alignment_image_path),
             "record_video_path": None if record_video_path is None else str(record_video_path),
+            "sep_video_paths": [str(path) for path in sep_video_paths],
             "record_video_status": None if record_video_path is None else "saved",
             "captured_frames": frame_count,
             "saved_steps": max(0, frame_count - 1),

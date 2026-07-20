@@ -28,14 +28,14 @@ DUAL_PIPER_INIT_JOINTS: tuple[float, ...] = (
     -0.13548991,
     0.29586821,
     0.13372713,
-    0.0,
+    1.0,
     0.08932595,
     0.00970403,
     -0.21027726,
     -0.08838347,
     0.39285615,
     0.08686504,
-    0.0,
+    1.0,
 )
 
 # Keep the original deployment unit conversion constants instead of "fixing" them.

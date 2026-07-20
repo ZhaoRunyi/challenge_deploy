@@ -1,6 +1,6 @@
 # HDF5 teleop Integration Notes
 
-这个接入基于 `/home/edemlab/challenge_ws/data_collection.zip` 中两份核心代码：
+这个接入基于 `<source_archive>/data_collection.zip` 中两份核心代码：
 
 - 原始 ROS collector
 - `episode_vis.py`

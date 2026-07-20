@@ -4,9 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import math
 import re
-import select
 import shutil
-import sys
 import time
 from typing import Any, Mapping
 
@@ -19,6 +17,7 @@ import numpy as np
 ACTION_COLOR = (32, 32, 220)
 USED_ACTION_COLOR = (0, 210, 255)
 STATE_COLOR = (220, 90, 30)
+DISTRIBUTION_OVERLAP = False
 
 
 def safe_filename_part(value: str) -> str:
@@ -43,119 +42,8 @@ class RecordingSchema:
         return tuple(names)
 
 
-class RuntimeExecutionWindow:
-    def __init__(self, *, schema: RecordingSchema, display_index: int = 1, window_name: str = "execution_window") -> None:
-        self.schema = schema
-        self.display_index = max(1, int(display_index))
-        self.window_name = window_name
-        self.actions: list[np.ndarray] = []
-        self.states: list[np.ndarray] = []
-        self.camera_height: int | None = None
-        self.camera_width: int | None = None
-        self.window_created = False
-        self.window_disabled = False
-
-    def reset(self) -> None:
-        self.actions.clear()
-        self.states.clear()
-        self.camera_height = None
-        self.camera_width = None
-
-    def close(self) -> None:
-        if self.window_created:
-            try:
-                cv2.destroyWindow(self.window_name)
-            except cv2.error:
-                pass
-            self.window_created = False
-
-    def keep_window_on_top(self) -> None:
-        try:
-            from Xlib import X, display, protocol
-
-            screen = display.Display()
-            root = screen.screen().root
-            pending = [root]
-            target = None
-            while pending and target is None:
-                window = pending.pop()
-                if window.get_wm_name() == self.window_name:
-                    target = window
-                else:
-                    pending.extend(window.query_tree().children)
-            if target is None:
-                return
-            state = screen.intern_atom("_NET_WM_STATE")
-            above = screen.intern_atom("_NET_WM_STATE_ABOVE")
-            event = protocol.event.ClientMessage(window=target, client_type=state, data=(32, [1, above, 0, 1, 0]))
-            root.send_event(event, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask)
-            target.configure(stack_mode=X.Above)
-            screen.flush()
-        except Exception:
-            pass
-
-    def show_frame(self, frame: np.ndarray) -> None:
-        if self.window_disabled:
-            return
-        try:
-            if not self.window_created:
-                cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-                height, width = frame.shape[:2]
-                cv2.resizeWindow(self.window_name, width, height * 2)
-                cv2.moveWindow(self.window_name, (self.display_index - 1) * 1920, 0)
-                self.window_created = True
-            cv2.imshow(self.window_name, frame)
-            cv2.waitKey(1)
-            self.keep_window_on_top()
-        except cv2.error as exc:
-            self.window_disabled = True
-            print(f"Runtime window disabled because OpenCV highgui is unavailable: {exc}", flush=True)
-
-    def compose_camera_row(self, images: Mapping[str, np.ndarray]) -> np.ndarray:
-        panels = []
-        for camera_name in self.schema.camera_names:
-            if camera_name not in images:
-                raise KeyError(f"Runtime window is missing camera image {camera_name!r}")
-            image = to_bgr_uint8(images[camera_name])
-            if self.camera_height is None:
-                self.camera_height = int(image.shape[0])
-            panels.append(resize_to_height(image, self.camera_height))
-        row = np.concatenate(panels, axis=1)
-        if self.camera_width is None:
-            self.camera_width = int(row.shape[1])
-        elif row.shape[1] != self.camera_width:
-            row = cv2.resize(row, (self.camera_width, self.camera_height), interpolation=cv2.INTER_AREA)
-        return row
-
-    def show_images(self, images: Mapping[str, np.ndarray]) -> None:
-        self.show_frame(self.compose_camera_row(images))
-
-    def record(self, *, images: Mapping[str, np.ndarray], action: np.ndarray, state: np.ndarray, timestamp_s: float) -> None:
-        del timestamp_s
-        self.actions.append(np.asarray(action, dtype=np.float64).copy())
-        self.states.append(np.asarray(state, dtype=np.float64).copy())
-        camera_row = self.compose_camera_row(images)
-        actions = np.stack(self.actions, axis=0)
-        states = np.stack(self.states, axis=0)
-        horizon = max(200, int(math.ceil(len(self.actions) / 200.0) * 200))
-        cols = min(4, max(1, len(self.schema.plot_names)))
-        rows = max(1, math.ceil(len(self.schema.plot_names) / cols))
-        plot_row = draw_runtime_plot_canvas(
-            width=camera_row.shape[1],
-            height=rows * 80,
-            cols=cols,
-            names=self.schema.plot_names,
-            schema=self.schema,
-            actions=actions,
-            states=states,
-            x_horizon=horizon,
-        )
-        frame = np.concatenate((camera_row, plot_row), axis=0)
-        self.show_frame(frame)
-
-
 class ExecutionRecordSink:
-    def __init__(self, *, recorder: Any | None = None, runtime_window: RuntimeExecutionWindow | None = None) -> None:
+    def __init__(self, *, recorder: Any | None = None, runtime_window: Any | None = None) -> None:
         self.recorder = recorder
         self.runtime_window = runtime_window
 
@@ -195,9 +83,11 @@ class RolloutVideoRecorder:
         plot_cols: int = 4,
         plot_cell_h: int = 80,
         keep_frames_in_memory: bool = False,
-        video_codec: str = "mpeg4",
-        video_output_params: tuple[str, ...] = (),
-        frame_jpeg_quality: int = 92,
+        video_codec: str = "libx264",
+        video_output_params: tuple[str, ...] = ("-preset", "veryfast", "-crf", "18"),
+        frame_jpeg_quality: int = 100,
+        save_separate_videos: bool = False,
+        separate_video_stem: str | None = None,
     ) -> None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         self.output_dir = Path(output_dir)
@@ -213,6 +103,8 @@ class RolloutVideoRecorder:
             self.record_stem = self.output_path.stem
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.keep_frames_in_memory = keep_frames_in_memory
+        self.save_separate_videos = save_separate_videos
+        self.separate_video_stem = safe_filename_part(separate_video_stem or self.record_stem) or self.record_stem
         self.frames_dir = self.run_dir / ".frames"
         if not self.keep_frames_in_memory:
             self.frames_dir.mkdir(parents=True, exist_ok=True)
@@ -229,9 +121,15 @@ class RolloutVideoRecorder:
         self.camera_width: int | None = None
         self.finalized = False
         self.frame_images: list[np.ndarray] = []
+        self.separate_frame_images: dict[str, list[np.ndarray]] = {name: [] for name in self.schema.camera_names}
+        self.separate_frame_paths: dict[str, list[Path]] = {name: [] for name in self.schema.camera_names}
+        self.separate_video_paths: list[Path] = []
         self.video_codec = video_codec
         self.video_output_params = tuple(video_output_params)
         self.frame_jpeg_quality = int(frame_jpeg_quality)
+        if self.save_separate_videos and not self.keep_frames_in_memory:
+            for camera_name in self.schema.camera_names:
+                (self.frames_dir / safe_filename_part(camera_name)).mkdir(parents=True, exist_ok=True)
 
     def extra_image_path(self, suffix: str, extension: str = ".png") -> Path:
         clean_suffix = safe_filename_part(suffix)
@@ -265,6 +163,8 @@ class RolloutVideoRecorder:
             )
 
         camera_row = self.compose_camera_row(images)
+        if self.save_separate_videos:
+            self.record_separate_frames(images)
         if self.keep_frames_in_memory:
             self.frame_images.append(camera_row.copy())
         else:
@@ -306,6 +206,8 @@ class RolloutVideoRecorder:
             self.write_video_file(tmp_output, total, camera_h, camera_w, base_plot, final_plot, plot_rects, codec="mpeg4")
 
         tmp_output.replace(self.output_path)
+        if self.save_separate_videos:
+            self.separate_video_paths = self.write_separate_videos(total)
         shutil.rmtree(self.frames_dir, ignore_errors=True)
         return self.output_path
 
@@ -313,6 +215,33 @@ class RolloutVideoRecorder:
         if self.keep_frames_in_memory:
             return self.frame_images[index].copy()
         return iio.imread(self.frame_paths[index])[..., ::-1]
+
+    def record_separate_frames(self, images: Mapping[str, np.ndarray]) -> None:
+        frame_index = len(self.actions)
+        for camera_name in self.schema.camera_names:
+            image = to_bgr_uint8(images[camera_name])
+            if self.keep_frames_in_memory:
+                self.separate_frame_images[camera_name].append(image.copy())
+            else:
+                frame_path = self.frames_dir / safe_filename_part(camera_name) / f"frame_{frame_index:06d}.jpg"
+                iio.imwrite(frame_path, image[..., ::-1], quality=self.frame_jpeg_quality)
+                self.separate_frame_paths[camera_name].append(frame_path)
+
+    def read_separate_frame(self, camera_name: str, index: int) -> np.ndarray:
+        if self.keep_frames_in_memory:
+            return self.separate_frame_images[camera_name][index].copy()
+        return iio.imread(self.separate_frame_paths[camera_name][index])[..., ::-1]
+
+    def video_writer_kwargs(self, codec: str | None = None) -> dict[str, Any]:
+        writer_kwargs: dict[str, Any] = {
+            "fps": self.fps,
+            "codec": codec or self.video_codec,
+            "macro_block_size": 1,
+            "ffmpeg_log_level": "error",
+        }
+        if codec is None and self.video_output_params:
+            writer_kwargs["output_params"] = list(self.video_output_params)
+        return writer_kwargs
 
     def write_video_file(
         self,
@@ -326,15 +255,7 @@ class RolloutVideoRecorder:
         *,
         codec: str | None = None,
     ) -> None:
-        writer_kwargs: dict[str, Any] = {
-            "fps": self.fps,
-            "codec": codec or self.video_codec,
-            "macro_block_size": 1,
-            "ffmpeg_log_level": "error",
-        }
-        if codec is None and self.video_output_params:
-            writer_kwargs["output_params"] = list(self.video_output_params)
-        writer = imageio.get_writer(output_path, **writer_kwargs)
+        writer = imageio.get_writer(output_path, **self.video_writer_kwargs(codec))
         try:
             for index in range(total):
                 camera_row = self.read_recorded_frame(index)
@@ -343,6 +264,43 @@ class RolloutVideoRecorder:
                 ratio = (index + 1) / total
                 plot_row = reveal_plot_frame(base_plot, final_plot, plot_rects, ratio)
                 writer.append_data(np.concatenate((camera_row, plot_row), axis=0)[..., ::-1])
+        finally:
+            writer.close()
+
+    def write_separate_videos(self, total: int) -> list[Path]:
+        output_paths = []
+        for camera_name in self.schema.camera_names:
+            clean_name = safe_filename_part(camera_name)
+            output_path = self.run_dir / f"{self.separate_video_stem}_{clean_name}.mp4"
+            tmp_output = output_path.with_suffix(".tmp.mp4")
+            try:
+                self.write_separate_video_file(camera_name, tmp_output, total)
+            except Exception:
+                if self.video_codec == "mpeg4":
+                    raise
+                tmp_output.unlink(missing_ok=True)
+                self.write_separate_video_file(camera_name, tmp_output, total, codec="mpeg4")
+            tmp_output.replace(output_path)
+            output_paths.append(output_path)
+        return output_paths
+
+    def write_separate_video_file(
+        self,
+        camera_name: str,
+        output_path: Path,
+        total: int,
+        *,
+        codec: str | None = None,
+    ) -> None:
+        first_frame = self.read_separate_frame(camera_name, 0)
+        video_h, video_w = first_frame.shape[:2]
+        writer = imageio.get_writer(output_path, **self.video_writer_kwargs(codec))
+        try:
+            for index in range(total):
+                frame = self.read_separate_frame(camera_name, index)
+                if frame.shape[:2] != (video_h, video_w):
+                    frame = cv2.resize(frame, (video_w, video_h), interpolation=cv2.INTER_AREA)
+                writer.append_data(frame[..., ::-1])
         finally:
             writer.close()
 
@@ -444,11 +402,56 @@ def stack_vertical(top: np.ndarray, bottom: np.ndarray) -> np.ndarray:
     return np.concatenate((top_resized, bottom_resized), axis=0)
 
 
+def set_distribution_overlap(enabled: bool) -> None:
+    global DISTRIBUTION_OVERLAP
+    DISTRIBUTION_OVERLAP = bool(enabled)
+
+
 def load_distribution_image(distribution_image_path: Path | None) -> np.ndarray | None:
     if distribution_image_path is None or not distribution_image_path.exists():
         return None
-    distribution_image = np.asarray(iio.imread(distribution_image_path))[..., :3]
-    return to_bgr_uint8(distribution_image)[..., ::-1].copy()
+    distribution_image = np.asarray(iio.imread(distribution_image_path))
+    if distribution_image.ndim == 2:
+        distribution_image = np.repeat(distribution_image[..., None], 3, axis=2)
+    if distribution_image.ndim != 3 or distribution_image.shape[-1] not in (3, 4):
+        raise ValueError(f"Expected HWC 3/4-channel image, got shape {distribution_image.shape}")
+    if distribution_image.dtype != np.uint8:
+        distribution_image = np.clip(distribution_image, 0, 255).astype(np.uint8)
+    if distribution_image.shape[-1] == 4:
+        return distribution_image[..., [2, 1, 0, 3]].copy()
+    return distribution_image[..., ::-1].copy()
+
+
+def overlay_distribution_image(
+    distribution_image: np.ndarray,
+    frame: np.ndarray,
+    *,
+    alpha: float = 0.45,
+) -> np.ndarray:
+    frame_bgr = to_bgr_uint8(frame).astype(np.float32)
+    distribution = np.asarray(distribution_image)
+    if distribution.shape[:2] != frame_bgr.shape[:2]:
+        distribution = cv2.resize(
+            distribution,
+            (frame_bgr.shape[1], frame_bgr.shape[0]),
+            interpolation=cv2.INTER_AREA,
+        )
+    if distribution.ndim != 3 or distribution.shape[-1] not in (3, 4):
+        raise ValueError(f"Expected HWC 3/4-channel image, got shape {distribution.shape}")
+    distribution_bgr = distribution[..., :3].astype(np.float32)
+    if distribution.shape[-1] == 4:
+        alpha_mask = distribution[..., 3:4].astype(np.float32) / 255.0
+    else:
+        alpha_mask = np.full((*frame_bgr.shape[:2], 1), float(alpha), dtype=np.float32)
+    return np.clip(frame_bgr * (1.0 - alpha_mask) + distribution_bgr * alpha_mask, 0, 255).astype(np.uint8)
+
+
+def combine_distribution_image(distribution_image: np.ndarray | None, frame: np.ndarray) -> np.ndarray:
+    if distribution_image is None:
+        return frame
+    if DISTRIBUTION_OVERLAP:
+        return overlay_distribution_image(distribution_image, frame)
+    return stack_vertical(distribution_image[..., :3], frame)
 
 
 def select_preview_frame(
@@ -460,28 +463,6 @@ def select_preview_frame(
         if frame is not None:
             return image_name, to_bgr_uint8(frame)
     return None
-
-
-def preview_until_continue(
-    source: Any,
-    *,
-    distribution_image_path: Path | None = None,
-    image_name: str = "cam_high",
-    window_name: str = "train_distribution",
-) -> None:
-    distribution_image = load_distribution_image(distribution_image_path)
-    print("Place the object to match the train distribution, then type c and press Enter to continue.", flush=True)
-    while True:
-        images = source.capture_snapshot().images
-        selected = select_preview_frame(images, (image_name,))
-        if selected is None:
-            continue
-        _, frame = selected
-        preview_frame = stack_vertical(distribution_image, frame) if distribution_image is not None else frame
-        cv2.imshow(window_name, preview_frame)
-        cv2.waitKey(1)
-        if select.select([sys.stdin], [], [], 0.05)[0] and sys.stdin.readline().strip().lower() == "c":
-            return
 
 
 def save_frame1_image(
@@ -500,7 +481,7 @@ def save_frame1_image(
     image_name, frame = selected
     distribution_image = load_distribution_image(distribution_image_path)
     if distribution_image is not None and image_name == "cam_high":
-        frame = stack_vertical(distribution_image, frame)
+        frame = combine_distribution_image(distribution_image, frame)
     return recorder.save_extra_image(frame, suffix="frame1")
 
 
@@ -575,11 +556,17 @@ def draw_record_plot_canvas(
 
         action_values = series_for_name(actions, schema.action_names, name)
         state_values = series_for_name(states, schema.state_names, name)
-        value_blocks = [values for values in (action_values, state_values) if values is not None and values.size]
+        value_blocks = []
+        for values in (action_values, state_values):
+            if values is None or not values.size:
+                continue
+            finite_values = values[np.isfinite(values)]
+            if finite_values.size:
+                value_blocks.append(finite_values)
         if value_blocks:
             values = np.concatenate(value_blocks)
-            y_min = float(np.nanmin(values))
-            y_max = float(np.nanmax(values))
+            y_min = float(np.min(values))
+            y_max = float(np.max(values))
         else:
             y_min, y_max = -1.0, 1.0
         if not np.isfinite(y_min) or not np.isfinite(y_max) or abs(y_max - y_min) < 1e-9:
@@ -597,12 +584,10 @@ def draw_record_plot_canvas(
             continue
 
         if state_values is not None:
-            state_points = to_record_plot_points(state_values, rect, y_min, y_max)
-            cv2.polylines(canvas, [state_points], False, STATE_COLOR, 1, cv2.LINE_AA)
+            draw_plot_segments(canvas, to_record_plot_segments(state_values, rect, y_min, y_max), STATE_COLOR)
         if action_values is not None:
             action_color = USED_ACTION_COLOR if name in schema.used_action_names else ACTION_COLOR
-            action_points = to_record_plot_points(action_values, rect, y_min, y_max)
-            cv2.polylines(canvas, [action_points], False, action_color, 1, cv2.LINE_AA)
+            draw_plot_segments(canvas, to_record_plot_segments(action_values, rect, y_min, y_max), action_color)
 
     return canvas
 
@@ -634,11 +619,17 @@ def draw_runtime_plot_canvas(
 
         action_values = series_for_name(actions, schema.action_names, name)
         state_values = series_for_name(states, schema.state_names, name)
-        value_blocks = [values for values in (action_values, state_values) if values is not None and values.size]
+        value_blocks = []
+        for values in (action_values, state_values):
+            if values is None or not values.size:
+                continue
+            finite_values = values[np.isfinite(values)]
+            if finite_values.size:
+                value_blocks.append(finite_values)
         if value_blocks:
             values = np.concatenate(value_blocks)
-            y_min = float(np.nanmin(values))
-            y_max = float(np.nanmax(values))
+            y_min = float(np.min(values))
+            y_max = float(np.max(values))
         else:
             y_min, y_max = -1.0, 1.0
         if not np.isfinite(y_min) or not np.isfinite(y_max) or abs(y_max - y_min) < 1e-9:
@@ -653,43 +644,81 @@ def draw_runtime_plot_canvas(
         put_small_label(canvas, short_label(name), (cell_x + 3, cell_y + 10))
 
         if state_values is not None:
-            state_points = to_runtime_plot_points(state_values, rect, y_min, y_max, x_horizon)
-            cv2.polylines(canvas, [state_points], False, STATE_COLOR, 1, cv2.LINE_AA)
+            segments = to_runtime_plot_segments(state_values, rect, y_min, y_max, x_horizon)
+            draw_plot_segments(canvas, segments, STATE_COLOR)
         if action_values is not None:
             action_color = USED_ACTION_COLOR if name in schema.used_action_names else ACTION_COLOR
-            action_points = to_runtime_plot_points(action_values, rect, y_min, y_max, x_horizon)
-            cv2.polylines(canvas, [action_points], False, action_color, 1, cv2.LINE_AA)
+            segments = to_runtime_plot_segments(action_values, rect, y_min, y_max, x_horizon)
+            draw_plot_segments(canvas, segments, action_color)
 
     return canvas
 
 
-def to_record_plot_points(values: np.ndarray, rect: tuple[int, int, int, int], y_min: float, y_max: float) -> np.ndarray:
-    x0, y0, x1, y1 = rect
+def draw_plot_segments(canvas: np.ndarray, segments: list[np.ndarray], color: tuple[int, int, int]) -> None:
+    for points in segments:
+        if len(points) == 1:
+            cv2.circle(canvas, tuple(points[0]), 1, color, -1, cv2.LINE_AA)
+        elif len(points) > 1:
+            cv2.polylines(canvas, [points], False, color, 1, cv2.LINE_AA)
+
+
+def plot_segments_from_xy(
+    xs: np.ndarray,
+    values: np.ndarray,
+    rect: tuple[int, int, int, int],
+    y_min: float,
+    y_max: float,
+) -> list[np.ndarray]:
+    _x0, y0, _x1, y1 = rect
+    values = np.asarray(values, dtype=np.float64)
+    ys = y1 - (values - y_min) / (y_max - y_min) * (y1 - y0)
+    valid = np.isfinite(values) & np.isfinite(ys)
+    segments: list[np.ndarray] = []
+    start: int | None = None
+    for index, is_valid in enumerate(valid):
+        if is_valid and start is None:
+            start = index
+        if start is None:
+            continue
+        at_end = index == len(valid) - 1
+        if not is_valid or at_end:
+            end = index + 1 if is_valid and at_end else index
+            if end > start:
+                segment_y = np.clip(ys[start:end], y0, y1 - 1)
+                segment = np.stack((xs[start:end], segment_y), axis=1).round().astype(np.int32)
+                segments.append(segment)
+            start = None
+    return segments
+
+
+def to_record_plot_segments(
+    values: np.ndarray,
+    rect: tuple[int, int, int, int],
+    y_min: float,
+    y_max: float,
+) -> list[np.ndarray]:
+    x0, _y0, x1, _y1 = rect
     if len(values) == 1:
         xs = np.array([x0], dtype=np.float64)
     else:
         xs = np.linspace(x0, x1 - 1, len(values), dtype=np.float64)
-    ys = y1 - (values - y_min) / (y_max - y_min) * (y1 - y0)
-    ys = np.clip(ys, y0, y1 - 1)
-    return np.stack((xs, ys), axis=1).round().astype(np.int32)
+    return plot_segments_from_xy(xs, values, rect, y_min, y_max)
 
 
-def to_runtime_plot_points(
+def to_runtime_plot_segments(
     values: np.ndarray,
     rect: tuple[int, int, int, int],
     y_min: float,
     y_max: float,
     x_horizon: int,
-) -> np.ndarray:
-    x0, y0, x1, y1 = rect
+) -> list[np.ndarray]:
+    x0, _y0, x1, _y1 = rect
     horizon = max(len(values), int(x_horizon))
     if horizon <= 1:
         xs = np.array([x0], dtype=np.float64)
     else:
         xs = np.linspace(x0, x1 - 1, horizon, dtype=np.float64)[:len(values)]
-    ys = y1 - (values - y_min) / (y_max - y_min) * (y1 - y0)
-    ys = np.clip(ys, y0, y1 - 1)
-    return np.stack((xs, ys), axis=1).round().astype(np.int32)
+    return plot_segments_from_xy(xs, values, rect, y_min, y_max)
 
 
 def reveal_plot_frame(

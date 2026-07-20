@@ -123,6 +123,20 @@ def trim_chunk(actions: np.ndarray, chunk_size: int | None) -> np.ndarray:
     return actions[: min(chunk_size, len(actions))]
 
 
+def resolve_record_steps(rollout_steps: int, record_steps: int | None) -> int:
+    if record_steps is None:
+        return rollout_steps
+    if record_steps < 0:
+        raise ValueError("--record-steps must be non-negative")
+    return int(record_steps)
+
+
+def resolve_policy_steps(rollout_steps: int, record_steps: int) -> int:
+    if record_steps > 0 and (rollout_steps == 0 or record_steps < rollout_steps):
+        return record_steps
+    return rollout_steps
+
+
 def sleep_until_next_action(action_start_s: float, fps: float) -> None:
     if fps <= 0.0:
         return
@@ -144,6 +158,34 @@ def configured_state_after_command(
     return state_builder(snapshot, spec)
 
 
+def record_no_action_frames(
+    *,
+    source: Any,
+    robot: Any,
+    spec: Any,
+    fps: float,
+    recorder: Any | None,
+    record_steps: int,
+    recorded_steps: int,
+    state_builder: ConfiguredStateBuilder | None,
+    capture_snapshot: Callable[[], Any] | None = None,
+) -> None:
+    if recorder is None:
+        return
+    no_action = np.full(int(spec.action_dim), np.nan, dtype=np.float64)
+    while record_steps == 0 or recorded_steps < record_steps:
+        step_start_s = time.monotonic()
+        snapshot = capture_snapshot() if capture_snapshot is not None else source.capture_snapshot()
+        recorder.record(
+            images=snapshot.images,
+            action=no_action,
+            state=configured_state_after_command(robot, spec, state_builder),
+            timestamp_s=time.time(),
+        )
+        recorded_steps += 1
+        sleep_until_next_action(step_start_s, fps)
+
+
 def run_chunk_sync_rollout(
     *,
     client: Any,
@@ -154,6 +196,7 @@ def run_chunk_sync_rollout(
     rollout_steps: int,
     chunk_size: int | None,
     fps: float,
+    record_steps: int | None = None,
     recorder: Any | None = None,
     saved_actions: list[np.ndarray] | None = None,
     log_chunk: ChunkLogger | None = None,
@@ -161,12 +204,14 @@ def run_chunk_sync_rollout(
     state_builder: ConfiguredStateBuilder | None = None,
 ) -> RolloutMetrics:
     metrics = RolloutMetrics(execution_mode="chunk_sync")
+    total_record_steps = resolve_record_steps(rollout_steps, record_steps)
+    policy_steps = resolve_policy_steps(rollout_steps, total_record_steps)
     chunk_index = 0
     last_command_start_s: float | None = None
     next_snapshot = initial_snapshot
 
     try:
-        while rollout_steps == 0 or metrics.executed_steps < rollout_steps:
+        while policy_steps == 0 or metrics.executed_steps < policy_steps:
             inference_start_s = time.monotonic()
             chunk_snapshot = next_snapshot if next_snapshot is not None else source.capture_snapshot()
             next_snapshot = None
@@ -174,8 +219,8 @@ def run_chunk_sync_rollout(
             metrics.record_inference(time.monotonic() - inference_start_s)
 
             requested_actions = len(actions)
-            if rollout_steps > 0:
-                requested_actions = min(requested_actions, rollout_steps - metrics.executed_steps)
+            if policy_steps > 0:
+                requested_actions = min(requested_actions, policy_steps - metrics.executed_steps)
             if requested_actions <= 0:
                 break
 
@@ -202,12 +247,26 @@ def run_chunk_sync_rollout(
                     period_seconds=period_seconds,
                     command_seconds=time.monotonic() - command_start_s,
                 )
-                if rollout_steps > 0 and metrics.executed_steps >= rollout_steps:
+                if policy_steps > 0 and metrics.executed_steps >= policy_steps:
                     break
                 sleep_until_next_action(action_start_s, fps)
             chunk_index += 1
     except KeyboardInterrupt as exc:
         metrics.mark_interrupted(repr(exc))
+    if not metrics.interrupted:
+        try:
+            record_no_action_frames(
+                source=source,
+                robot=robot,
+                spec=spec,
+                fps=fps,
+                recorder=recorder,
+                record_steps=total_record_steps,
+                recorded_steps=metrics.executed_steps,
+                state_builder=state_builder,
+            )
+        except KeyboardInterrupt as exc:
+            metrics.mark_interrupted(repr(exc))
 
     return metrics
 
@@ -226,6 +285,7 @@ def run_temporal_smoothing_rollout(
     latency_k: int,
     min_smooth_steps: int,
     buffer_max_chunks: int,
+    record_steps: int | None = None,
     recorder: Any | None = None,
     saved_actions: list[np.ndarray] | None = None,
     log_chunk: ChunkLogger | None = None,
@@ -234,6 +294,8 @@ def run_temporal_smoothing_rollout(
     state_builder: ConfiguredStateBuilder | None = None,
 ) -> RolloutMetrics:
     metrics = RolloutMetrics(execution_mode="streaming")
+    total_record_steps = resolve_record_steps(rollout_steps, record_steps)
+    policy_steps = resolve_policy_steps(rollout_steps, total_record_steps)
     buffer = StreamActionBuffer(
         max_chunks=buffer_max_chunks,
         state_dim=spec.action_dim,
@@ -287,7 +349,7 @@ def run_temporal_smoothing_rollout(
     last_command_start_s: float | None = None
 
     try:
-        while rollout_steps == 0 or metrics.executed_steps < rollout_steps:
+        while policy_steps == 0 or metrics.executed_steps < policy_steps:
             action_start_s = time.monotonic()
             action = buffer.pop_next_action()
             if action is None:
@@ -322,7 +384,7 @@ def run_temporal_smoothing_rollout(
                 period_seconds=period_seconds,
                 command_seconds=time.monotonic() - command_start_s,
             )
-            if rollout_steps > 0 and metrics.executed_steps >= rollout_steps:
+            if policy_steps > 0 and metrics.executed_steps >= policy_steps:
                 break
             sleep_until_next_action(action_start_s, fps)
     except KeyboardInterrupt as exc:
@@ -330,5 +392,20 @@ def run_temporal_smoothing_rollout(
     finally:
         stop_event.set()
         inference_thread.join(timeout=1.0)
+    if not metrics.interrupted:
+        try:
+            record_no_action_frames(
+                source=source,
+                robot=robot,
+                spec=spec,
+                fps=fps,
+                recorder=recorder,
+                record_steps=total_record_steps,
+                recorded_steps=metrics.executed_steps,
+                state_builder=state_builder,
+                capture_snapshot=capture_snapshot,
+            )
+        except KeyboardInterrupt as exc:
+            metrics.mark_interrupted(repr(exc))
 
     return metrics

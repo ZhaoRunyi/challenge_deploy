@@ -10,9 +10,11 @@ from openpi_client import image_tools, websocket_client_policy
 from hardware.constants import PIPER_GRIPPER_FULL_OPEN_METERS
 from hardware.schemas import PiperArmState, RobotSnapshot
 from .base import (
+    ActionGripperEncoding,
     DecodedArmAction,
     DecodedPiperAction,
     SlaiPiperClient,
+    StateGripperEncoding,
     action_gripper_for_piper,
     bounded_gripper_for_piper,
     hardware_gripper_to_model_raw,
@@ -60,31 +62,98 @@ def load_openpi_sim_policy_spec(train_config_name: str) -> OpenPiSimPolicySpec:
     )
 
 
-def sim_gripper_to_model_raw(value: float, *, old_gripper: bool) -> float:
-    full_open = hardware_gripper_to_model_raw(SIM_GRIPPER_FULL_OPEN_M, old_gripper=old_gripper)
-    return float(np.clip(float(value), 0.0, 1.0) * full_open)
-
-
-def sim_gripper_to_piper(value: float, threshold: float | None = None, lower: float | None = None, upper: float | None = None, *, old_gripper: bool = False) -> float:
-    return bounded_gripper_for_piper(
-        action_gripper_for_piper(sim_gripper_to_model_raw(value, old_gripper=old_gripper), None, old_gripper=old_gripper),
-        threshold,
-        lower,
-        upper,
+def sim_gripper_to_model_raw(
+    value: float,
+    *,
+    action_gripper_encoding: ActionGripperEncoding = "policy",
+) -> float:
+    value = float(value)
+    if action_gripper_encoding == "meters":
+        return max(0.0, value)
+    if action_gripper_encoding == "binary":
+        return value
+    state_encoding: StateGripperEncoding = "old" if action_gripper_encoding == "old" else "policy"
+    full_open = hardware_gripper_to_model_raw(
+        SIM_GRIPPER_FULL_OPEN_M,
+        state_gripper_encoding=state_encoding,
     )
+    return float(np.clip(value, 0.0, 1.0) * full_open)
 
 
-def piper_gripper_to_sim(value: float, *, old_gripper: bool) -> float:
-    full_open = hardware_gripper_to_model_raw(SIM_GRIPPER_FULL_OPEN_M, old_gripper=old_gripper)
-    return float(np.clip(state_gripper_for_policy(value, None, old_gripper=old_gripper) / full_open, 0.0, 1.0))
+def sim_gripper_to_piper(
+    value: float,
+    threshold: float | None = None,
+    lower: float | None = None,
+    upper: float | None = None,
+    *,
+    action_gripper_encoding: ActionGripperEncoding = "policy",
+) -> tuple[float, bool]:
+    raw_gripper = action_gripper_for_piper(
+        sim_gripper_to_model_raw(value, action_gripper_encoding=action_gripper_encoding),
+        None,
+        action_gripper_encoding=action_gripper_encoding,
+    )
+    bounded_binary = (
+        action_gripper_encoding == "binary"
+        or threshold is not None
+        or (upper is not None and raw_gripper > upper)
+        or (lower is not None and raw_gripper < lower)
+    )
+    return bounded_gripper_for_piper(raw_gripper, threshold, lower, upper), bounded_binary
 
 
-def arm_state_for_openpi_sim(arm: PiperArmState, *, old_gripper: bool) -> np.ndarray:
-    return np.concatenate((arm.qpos[:6], np.array([piper_gripper_to_sim(arm.qpos[6], old_gripper=old_gripper)], dtype=np.float64)), axis=0).astype(np.float64)
+def piper_gripper_to_sim(
+    value: float,
+    *,
+    state_gripper_encoding: StateGripperEncoding = "policy",
+) -> float:
+    if state_gripper_encoding == "meters":
+        return float(value)
+    full_open = hardware_gripper_to_model_raw(
+        SIM_GRIPPER_FULL_OPEN_M,
+        state_gripper_encoding=state_gripper_encoding,
+    )
+    if abs(full_open) < 1e-9:
+        return 0.0
+    encoded = state_gripper_for_policy(
+        value,
+        None,
+        state_gripper_encoding=state_gripper_encoding,
+    )
+    return float(np.clip(encoded / full_open, 0.0, 1.0))
 
 
-def build_configured_piper_state(snapshot: RobotSnapshot, spec: OpenPiSimPolicySpec, *, old_gripper: bool = False) -> np.ndarray:
-    return np.concatenate((arm_state_for_openpi_sim(snapshot.state.left, old_gripper=old_gripper), arm_state_for_openpi_sim(snapshot.state.right, old_gripper=old_gripper)), axis=0)
+def arm_state_for_openpi_sim(
+    arm: PiperArmState,
+    *,
+    state_gripper_encoding: StateGripperEncoding = "policy",
+) -> np.ndarray:
+    return np.concatenate(
+        (
+            arm.qpos[:6],
+            np.array(
+                [piper_gripper_to_sim(arm.qpos[6], state_gripper_encoding=state_gripper_encoding)],
+                dtype=np.float64,
+            ),
+        ),
+        axis=0,
+    ).astype(np.float64)
+
+
+def build_configured_piper_state(
+    snapshot: RobotSnapshot,
+    spec: OpenPiSimPolicySpec,
+    *,
+    state_gripper_encoding: StateGripperEncoding = "policy",
+) -> np.ndarray:
+    del spec
+    return np.concatenate(
+        (
+            arm_state_for_openpi_sim(snapshot.state.left, state_gripper_encoding=state_gripper_encoding),
+            arm_state_for_openpi_sim(snapshot.state.right, state_gripper_encoding=state_gripper_encoding),
+        ),
+        axis=0,
+    )
 
 
 def image_to_embodichain_rgb(image: np.ndarray) -> np.ndarray:
@@ -98,7 +167,13 @@ def image_to_embodichain_rgb(image: np.ndarray) -> np.ndarray:
     return image_tools.convert_to_uint8(image_rgb)
 
 
-def build_policy_payload(snapshot: RobotSnapshot, *, prompt: str | None, spec: OpenPiSimPolicySpec, old_gripper: bool = False) -> dict[str, Any]:
+def build_policy_payload(
+    snapshot: RobotSnapshot,
+    *,
+    prompt: str | None,
+    spec: OpenPiSimPolicySpec,
+    state_gripper_encoding: StateGripperEncoding = "policy",
+) -> dict[str, Any]:
     if prompt is None:
         raise ValueError("OpenPI-sim policy payload requires a prompt")
     missing = [image_id for image_id in spec.image_ids if image_id not in snapshot.images]
@@ -108,7 +183,11 @@ def build_policy_payload(snapshot: RobotSnapshot, *, prompt: str | None, spec: O
         "observation/image": image_to_embodichain_rgb(snapshot.images["cam_high"]),
         "observation/left_wrist_image": image_to_embodichain_rgb(snapshot.images["cam_left_wrist"]),
         "observation/right_wrist_image": image_to_embodichain_rgb(snapshot.images["cam_right_wrist"]),
-        "observation/state": build_configured_piper_state(snapshot, spec, old_gripper=old_gripper),
+        "observation/state": build_configured_piper_state(
+            snapshot,
+            spec,
+            state_gripper_encoding=state_gripper_encoding,
+        ),
         "prompt": prompt,
     }
 
@@ -127,7 +206,8 @@ class OpenPiSimPiperClient(SlaiPiperClient):
         gripper_lower: float | None = None,
         gripper_upper: float | None = None,
         num_steps: int | None = None,
-        old_gripper: bool = False,
+        state_gripper_encoding: StateGripperEncoding = "policy",
+        action_gripper_encoding: ActionGripperEncoding = "policy",
         bad_sim: bool = False,
     ) -> None:
         if control_mode != "joints":
@@ -145,7 +225,8 @@ class OpenPiSimPiperClient(SlaiPiperClient):
             gripper_threshold=gripper_threshold,
             gripper_lower=gripper_lower,
             gripper_upper=gripper_upper,
-            old_gripper=old_gripper,
+            state_gripper_encoding=state_gripper_encoding,
+            action_gripper_encoding=action_gripper_encoding,
         )
 
     def validate_control_mode(self) -> None:
@@ -153,10 +234,32 @@ class OpenPiSimPiperClient(SlaiPiperClient):
             raise ValueError("openpi_sim only supports control_mode='joints'")
 
     def build_payload(self, snapshot: RobotSnapshot, prompt: str | None = None, **kwargs: Any) -> dict[str, Any]:
-        payload = build_policy_payload(snapshot, prompt=prompt, spec=self.spec, old_gripper=self.old_gripper)
+        del kwargs
+        payload = build_policy_payload(
+            snapshot,
+            prompt=prompt,
+            spec=self.spec,
+            state_gripper_encoding=self.state_gripper_encoding,
+        )
         if self.num_steps is not None:
             payload["num_steps"] = self.num_steps
         return payload
+
+    def _action_gripper_value(self, value: float) -> float:
+        value = float(value)
+        return value / 0.05 if self.bad_sim else value
+
+    def _decode_sim_gripper(self, value: float, arm_name: str) -> tuple[float, bool]:
+        arm_threshold = getattr(self, f"{arm_name}_gripper_threshold", None)
+        arm_lower = getattr(self, f"{arm_name}_gripper_lower", None)
+        arm_upper = getattr(self, f"{arm_name}_gripper_upper", None)
+        return sim_gripper_to_piper(
+            self._action_gripper_value(value),
+            arm_threshold if arm_threshold is not None else self.gripper_threshold,
+            arm_lower if arm_lower is not None else self.gripper_lower,
+            arm_upper if arm_upper is not None else self.gripper_upper,
+            action_gripper_encoding=self.action_gripper_encoding,
+        )
 
     def decode_action(self, action: np.ndarray) -> DecodedPiperAction:
         action = np.asarray(action, dtype=np.float64)
@@ -164,38 +267,25 @@ class OpenPiSimPiperClient(SlaiPiperClient):
             raise ValueError(f"Expected one action vector, got shape {action.shape}")
         if action.shape[0] < SIM_ACTION_DIM:
             raise ValueError(f"openpi_sim action dim {action.shape[0]} is smaller than expected {SIM_ACTION_DIM}")
-        left_threshold = getattr(self, "left_gripper_threshold", None)
-        left_lower = getattr(self, "left_gripper_lower", None)
-        left_upper = getattr(self, "left_gripper_upper", None)
-        right_threshold = getattr(self, "right_gripper_threshold", None)
-        right_lower = getattr(self, "right_gripper_lower", None)
-        right_upper = getattr(self, "right_gripper_upper", None)
-        left_gripper = sim_gripper_to_piper(
-            float(action[6]) / 0.05 if self.bad_sim else float(action[6]),
-            left_threshold if left_threshold is not None else self.gripper_threshold,
-            left_lower if left_lower is not None else self.gripper_lower,
-            left_upper if left_upper is not None else self.gripper_upper,
-            old_gripper=self.old_gripper,
-        )
-        right_gripper = sim_gripper_to_piper(
-            float(action[13]) / 0.05 if self.bad_sim else float(action[13]),
-            right_threshold if right_threshold is not None else self.gripper_threshold,
-            right_lower if right_lower is not None else self.gripper_lower,
-            right_upper if right_upper is not None else self.gripper_upper,
-            old_gripper=self.old_gripper,
-        )
+        left_gripper, left_binary = self._decode_sim_gripper(float(action[6]), "left")
+        right_gripper, right_binary = self._decode_sim_gripper(float(action[13]), "right")
         return DecodedPiperAction(
             control_mode="joints",
             arms={
-                "left": DecodedArmAction(joint=np.concatenate((action[:6], np.array([left_gripper])), axis=0), gripper=left_gripper, ee_pose=None),
-                "right": DecodedArmAction(joint=np.concatenate((action[7:13], np.array([right_gripper])), axis=0), gripper=right_gripper, ee_pose=None),
+                "left": DecodedArmAction(
+                    joint=np.concatenate((action[:6], np.array([left_gripper])), axis=0),
+                    gripper=left_gripper,
+                    ee_pose=None,
+                    binary_gripper=left_binary,
+                ),
+                "right": DecodedArmAction(
+                    joint=np.concatenate((action[7:13], np.array([right_gripper])), axis=0),
+                    gripper=right_gripper,
+                    ee_pose=None,
+                    binary_gripper=right_binary,
+                ),
             },
         )
-
-    def command_action(self, robot: Any, action: np.ndarray) -> None:
-        decoded = self.decode_action(action)
-        robot.left.command_joint_positions(decoded.arms["left"].joint, speed_percent=self.joint_speed_percent)
-        robot.right.command_joint_positions(decoded.arms["right"].joint, speed_percent=self.joint_speed_percent)
 
 
 def spec_summary(spec: OpenPiSimPolicySpec) -> dict[str, Any]:
@@ -211,11 +301,11 @@ def spec_summary(spec: OpenPiSimPolicySpec) -> dict[str, Any]:
             "layout": "left_joints6,left_gripper01,right_joints6,right_gripper01",
             "names": list(SIM_STATE_NAMES),
             "gripper_full_open_m": SIM_GRIPPER_FULL_OPEN_M,
-            "gripper_physical_layer": "EmbodiChain gripper01 is adapted through the same raw Piper conversion as openpi_client",
+            "gripper_physical_layer": "EmbodiChain gripper01 defaults to policy encoding; --state-gripper meters/old selects the explicit adapter encoding.",
         },
         "action_space": {
             "layout": "left_joints6,left_gripper01,right_joints6,right_gripper01",
             "names": list(SIM_ACTION_NAMES),
-            "normalization_note": "server-side EmbodiChainOutputs returns executable-scale joints; gripper01=1 maps to the calibrated full-open raw Piper value",
+            "normalization_note": "server-side EmbodiChainOutputs returns executable-scale joints; gripper encoding is selected by --action-gripper.",
         },
     }

@@ -16,12 +16,16 @@ from rollout.assets import prepare_client_assets
 from rollout.execution import (
     action_sequence,
     resolve_chunk_size,
+    resolve_policy_steps,
+    resolve_record_steps,
     run_chunk_sync_rollout,
     run_temporal_smoothing_rollout,
     save_rollout_metrics,
 )
-from rollout.recording import RolloutVideoRecorder, ExecutionRecordSink, RuntimeExecutionWindow, preview_until_continue, save_frame1_image, save_recorded_actions
+from rollout.recording import RolloutVideoRecorder, ExecutionRecordSink, save_frame1_image, save_recorded_actions, set_distribution_overlap
+from rollout.windowing import RuntimeExecutionWindow, preview_until_continue
 from rollout.support import (
+    add_gripper_encoding_args,
     apply_runtime_overrides,
     build_slai_recording_state,
     ignore_recorder_signal_handlers,
@@ -50,8 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gripper_threshold", type=float, default=None)
     parser.add_argument("--gripper_lower", type=float, default=None)
     parser.add_argument("--gripper_upper", type=float, default=None)
-    parser.add_argument("--old_gripper", action="store_true")
+    add_gripper_encoding_args(parser, default_state="meters", default_action="binary")
     parser.add_argument("--rollout-steps", type=int, default=1000)
+    parser.add_argument("--record-steps", type=int, default=None, help="Total frames to record; default is --rollout-steps. Requires --record or --window when set.")
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--execution-mode", choices=["streaming", "chunk_sync"], default="chunk_sync")
@@ -61,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--buffer-max-chunks", type=int, default=None)
     parser.add_argument("--metrics-json", default=None, help="Optional path to save rollout timing metrics as JSON.")
     parser.add_argument("--record", action="store_true")
+    parser.add_argument("--save-sep", action="store_true", help="Save one raw-camera video per recording camera; requires --record.")
     parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "xvla_records"))
     parser.add_argument("--config", default=str(DEPLOY_ROOT / "configs" / "dual_piper_example.yaml"))
     parser.add_argument("--left-can", default=None)
@@ -77,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-right-serial", default=None)
     parser.add_argument("--no-cameras", action="store_true")
     parser.add_argument("--window", nargs="?", const=1, type=int, default=0)
+    parser.add_argument("--dist-overlap", action="store_true", help="Overlay train distribution on cam_high instead of stacking it above.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--spec-only", action="store_true")
     parser.add_argument("--ready-timeout", type=float, default=15.0)
@@ -85,11 +92,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    set_distribution_overlap(args.dist_overlap)
+    if args.save_sep and not args.record:
+        raise ValueError("--save-sep requires --record")
+    if args.record_steps is not None and not (args.record or args.window):
+        raise ValueError("--record-steps requires --record or --window")
     spec = load_piper_policy_spec(args.train_config)
     print(json.dumps(spec_summary(spec), indent=2), flush=True)
     if args.spec_only:
         return
     cli_prompt = normalized_prompt(args.prompt)
+    if args.rollout_steps < 0:
+        raise ValueError("--rollout-steps must be non-negative")
+    record_steps = resolve_record_steps(args.rollout_steps, args.record_steps)
+    policy_steps = resolve_policy_steps(args.rollout_steps, record_steps)
+    if args.fps < 0.0:
+        raise ValueError("--fps must be non-negative")
     if args.inference_rate is not None and args.inference_rate < 0.0:
         raise ValueError("--inference-rate must be non-negative")
     client_assets = prepare_client_assets(
@@ -124,7 +142,8 @@ def main() -> None:
         gripper_threshold=args.gripper_threshold,
         gripper_lower=args.gripper_lower,
         gripper_upper=args.gripper_upper,
-        old_gripper=args.old_gripper,
+        state_gripper_encoding=args.state_gripper,
+        action_gripper_encoding=args.action_gripper,
     )
     server_metadata = client.get_server_metadata()
     print(json.dumps({"server_metadata": server_metadata}, indent=2), flush=True)
@@ -147,6 +166,7 @@ def main() -> None:
             schema=recording_schema,
             fps=args.fps,
             name_prefix=record_name_prefix(args, server_metadata),
+            save_separate_videos=args.save_sep,
         )
         if args.record
         else None
@@ -161,7 +181,7 @@ def main() -> None:
     state_builder = lambda snapshot, policy_spec: build_slai_recording_state(
         snapshot,
         policy_spec,
-        old_gripper=args.old_gripper,
+        state_gripper_encoding=args.state_gripper,
     )
     robot.connect(read_only=args.dry_run)
     try:
@@ -184,7 +204,7 @@ def main() -> None:
                 chunk_index=0,
                 action_count=len(actions),
                 executed_steps=0,
-                rollout_steps=args.rollout_steps,
+                rollout_steps=policy_steps,
                 first_action=actions[0],
             )
             if args.window:
@@ -209,13 +229,35 @@ def main() -> None:
             if client_assets.skip_reason is not None:
                 print(f"Skipped train-distribution frame1 image: {client_assets.skip_reason}", flush=True)
 
+        print(
+            json.dumps(
+                {
+                    "rollout": {
+                        "execution_mode": args.execution_mode,
+                        "rollout_steps": args.rollout_steps,
+                        "record_steps": record_steps,
+                        "chunk_size": chunk_size,
+                        "fps": args.fps,
+                        "inference_rate": inference_rate if args.execution_mode == "streaming" else None,
+                        "latency_k": latency_k if args.execution_mode == "streaming" else None,
+                        "min_smooth_steps": min_smooth_steps if args.execution_mode == "streaming" else None,
+                        "buffer_max_chunks": buffer_max_chunks if args.execution_mode == "streaming" else None,
+                        "state_gripper": args.state_gripper,
+                        "action_gripper": args.action_gripper,
+                    }
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
+
         def log_chunk(chunk_index: int, action_count: int, executed_steps: int, first_action) -> None:
             print_rollout_chunk_summary(
                 client=client,
                 chunk_index=chunk_index,
                 action_count=action_count,
                 executed_steps=executed_steps,
-                rollout_steps=args.rollout_steps,
+                rollout_steps=policy_steps,
                 first_action=first_action,
             )
 
@@ -226,6 +268,7 @@ def main() -> None:
             spec=spec,
             prompt=resolved_prompt,
             rollout_steps=args.rollout_steps,
+            record_steps=record_steps,
             chunk_size=chunk_size,
             fps=args.fps,
             recorder=record_sink,
@@ -267,6 +310,8 @@ def main() -> None:
                 output_path = recorder.finalize()
                 if output_path is not None:
                     print(f"Recording saved to {output_path}", flush=True)
+                    for separate_video_path in recorder.separate_video_paths:
+                        print(f"Separate camera video saved to {separate_video_path}", flush=True)
             except Exception as exc:
                 print(f"Failed to finalize recording: {exc}", flush=True)
         if runtime_window is not None:

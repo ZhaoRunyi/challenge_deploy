@@ -14,7 +14,8 @@ from data.worker import HDF5TeleopDataWorker, HDF5TeleopSaveConfig
 from hardware.config import load_config, set_by_dotted_path
 from hardware.piper import DualPiperSystem
 from hardware.realsense import RealSenseRig
-from rollout.recording import RuntimeExecutionWindow, RecordingSchema
+from rollout.recording import RecordingSchema
+from rollout.windowing import RuntimeExecutionWindow
 from teleop.hdf5_teleop import (
     HDF5TeleopCollectionSource,
     HDF5_TELEOP_VECTOR_NAMES,
@@ -48,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--countdown-seconds", type=int, default=0)
     parser.add_argument("--alignment-plot-frames", type=int, default=16, help="Number of evenly spaced selected frames to draw in the alignment plot.")
     parser.add_argument("--record", action="store_true", help="Render a Motus/OpenPI-style deploy video from each saved HDF5 episode.")
+    parser.add_argument("--save-sep", action="store_true", help="Save one raw-camera video per recording camera; requires --record.")
     parser.add_argument("--window", nargs="?", const=1, type=int, default=0, help="Show live camera/action-state window; optional value selects display index.")
     parser.add_argument("--action-from-state", action="store_true", help="Save action[t] from puppet state[t+1] instead of master control[t+1].")
     parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "hdf5_teleop_records"))
@@ -172,6 +174,7 @@ def make_data_worker(
         action_from_state=args.action_from_state,
         alignment_plot_frames=args.alignment_plot_frames,
         record_video=args.record,
+        save_separate_videos=args.save_sep,
         fps=args.fps,
     )
     return HDF5TeleopDataWorker(config=config)
@@ -248,6 +251,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--alignment-plot-frames must be positive")
     if args.window < 0:
         raise ValueError("--window display index must be non-negative")
+    if args.save_sep and not args.record:
+        raise ValueError("--save-sep requires --record")
     if not sys.stdin.isatty():
         raise RuntimeError("Interactive HDF5 teleop collection requires a TTY for c/s/q controls")
 

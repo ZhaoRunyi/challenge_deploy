@@ -13,6 +13,7 @@
 - `run_xvla_client.py`
 - `run_openpi_sim_client.py`
 - `run_motus_client.py`
+- `run_dreamzero_client.py`
 
 ### HDF5 teleop 数采
 
@@ -28,7 +29,7 @@
 
 ```text
 challenge_deploy/
-├── clients/     # policy client abstraction and concrete OpenPI/Motus clients
+├── clients/     # policy client abstraction and concrete OpenPI/X-VLA/OpenPI-sim/Motus/DreamZero clients
 ├── hardware/    # Piper, RealSense, runtime source, config, schemas, conversions
 ├── rollout/     # rollout execution, recording, metrics, train assets
 ├── teleop/      # HDF5 teleop collector and episode preview
@@ -36,9 +37,19 @@ challenge_deploy/
 ├── run_xvla_client.py
 ├── run_openpi_sim_client.py
 ├── run_motus_client.py
+├── run_dreamzero_client.py
 ├── run_hdf5_teleop_collect.py
 └── run_hdf5_teleop_episode_vis.py
 ```
+
+## Gripper 编码
+
+五个推理入口都使用显式 gripper 编码参数：
+
+- `--state-gripper {policy,meters,old}` 控制送入 policy 的 state gripper 表示。
+- `--action-gripper {policy,meters,binary,old}` 控制 policy action gripper 到 Piper 硬件开口的解释方式。
+- X-VLA 默认 `--state-gripper meters --action-gripper binary`；其他入口默认 `policy/policy`。
+- 历史 gripper 数据兼容方式是同时传 `--state-gripper old --action-gripper old`；`--old_gripper` 不再提供。
 
 ## HDF5 teleop 接入原则
 
@@ -69,8 +80,8 @@ challenge_deploy/
 先在 X-VLA 环境中启动 websocket policy server：
 
 ```bash
-cd /workspace/X-VLA
-/workspace/X-VLA/.venv/bin/python -m scripts.serve_policy \
+cd <xvla_repo>
+<xvla_repo>/.venv/bin/python -m scripts.serve_policy \
   --model_path /path/to/your/xvla \
   --port 8000
 ```
@@ -78,7 +89,7 @@ cd /workspace/X-VLA
 再在 deploy 环境中运行独立 X-VLA client：
 
 ```bash
-cd /workspace/deploy
+cd <challenge_deploy_repo>
 python run_xvla_client.py \
   --train-config slai_piper_items_hand_over_place_ee20_xvla_pt_bs256_400000 \
   --host 127.0.0.1 \

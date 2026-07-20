@@ -1,11 +1,12 @@
 # Deploy Call Chain
 
-这个目录现在只保留四条最外层部署入口：
+这个目录现在只保留五条最外层部署入口：
 
 - `run_openpi_client.py`
 - `run_xvla_client.py`
 - `run_openpi_sim_client.py`
 - `run_motus_client.py`
+- `run_dreamzero_client.py`
 
 它们共享同一套真机运行时骨架：
 
@@ -25,6 +26,7 @@ flowchart TD
     B[run_xvla_client.py] --> R
     C[run_openpi_sim_client.py] --> R
     D[run_motus_client.py] --> R
+    E[run_dreamzero_client.py] --> R
 
     R[runner: parse args / load config / init runtime] --> CFG[hardware/config.py]
     R --> OBS[hardware/runtime.py<br/>DualPiperObservationSource]
@@ -39,19 +41,24 @@ flowchart TD
     B --> XA[clients/xvla.py]
     C --> SA[clients/openpi_sim.py]
     D --> MA[clients/motus.py]
+    E --> DA[clients/dreamzero.py]
 
     OA --> WS1[openpi_client.websocket_client_policy]
     XA --> WSX[xvla_client.websocket_client_policy]
     SA --> WS1
     MA --> WS2[Motus websocket_client_policy]
+    DA --> WSD[DreamZero websocket_client_policy]
 
     WS1 --> S1[OpenPI server]
     WSX --> SX[X-VLA server]
     WS2 --> S2[Motus server]
+    WSD --> SD[DreamZero server]
 
     A --> ROLL[rollout/execution.py]
-    C --> ROLL
-    B --> SIMROLL[run_openpi_sim_client.py internal rollout]
+    B --> ROLL
+    D --> ROLL
+    E --> ROLL
+    C --> SIMROLL[run_openpi_sim_client.py internal rollout]
 
     ROLL --> CMD[client.decode_action / client.command_action]
     SIMROLL --> CMD
@@ -169,15 +176,55 @@ flowchart TD
     C20 --> C21[client denormalize actions]
     C21 --> C22[MotusPiperClient.decode_action]
     C22 --> C23{binary gripper transition?}
-    C23 -->|yes| C24[_command_transition_step]
-    C23 -->|no| C25[_command_decoded]
+    C23 -->|yes| C24[SlaiPiperClient.command_transition_step]
+    C23 -->|no| C25[SlaiPiperClient.command_decoded]
 
     C24 --> C26[arm.command_joint_positions / command_end_pose]
     C25 --> C26
     C26 --> C27[piper_sdk JointCtrl or EndPoseCtrl + GripperCtrl]
 ```
 
-## 5. 共享硬件层
+
+## 5. DreamZero 真机链
+
+```mermaid
+flowchart TD
+    D[run_dreamzero_client.py] --> D1[load_dreamzero_policy_spec]
+    D --> D2[DreamZeroPiperClient]
+    D --> D3[get_server_metadata / resolve prompt]
+    D --> D4[make_dual_piper_runtime]
+
+    D4 --> D5[DualPiperSystem]
+    D4 --> D6[RealSenseRig]
+    D4 --> D7[DualPiperObservationSource]
+
+    D --> D8[robot.enable]
+    D --> D9[robot.move_to_joint_positions resolved init joints]
+    D --> D10{execution_mode}
+    D10 -->|chunk_sync| D11[rollout/execution.run_chunk_sync_rollout]
+    D10 -->|streaming| D12[rollout/execution.run_temporal_smoothing_rollout]
+
+    D11 --> D13[source.capture_snapshot]
+    D12 --> D13
+    D13 --> D14[DreamZeroPiperClient.build_payload]
+    D14 --> D15[build_full_piper_state]
+    D14 --> D16[three RGB images]
+    D16 --> D17[DreamZero websocket client]
+    D17 --> D18[DreamZero server]
+    D18 --> D19[action chunk]
+
+    D19 --> D20[SlaiPiperClient.decode_action]
+    D20 --> D21{binary gripper transition?}
+    D21 -->|yes| D22[SlaiPiperClient.command_transition_step]
+    D21 -->|no| D23[SlaiPiperClient.command_decoded]
+    D22 --> D24[arm.command_joint_positions / command_end_pose]
+    D23 --> D24
+    D24 --> D25[piper_sdk JointCtrl or EndPoseCtrl + GripperCtrl]
+```
+
+所有推理入口都使用 `--state-gripper` / `--action-gripper` 显式选择 gripper 编码。旧 gripper 数据兼容写法是 `--state-gripper old --action-gripper old`；`--old_gripper` 已移除。X-VLA 默认 `meters/binary`，其他入口默认 `policy/policy`。
+
+## 6. 共享硬件层
 
 ```mermaid
 flowchart TD
@@ -209,7 +256,7 @@ flowchart TD
     Q2 --> QC6[GripperCtrl]
 ```
 
-## 6. 当前保留范围
+## 7. 当前保留范围
 
 当前 `challenge_deploy/` 只围绕下面这些文件保留：
 
@@ -217,6 +264,7 @@ flowchart TD
 - `run_xvla_client.py`
 - `run_openpi_sim_client.py`
 - `run_motus_client.py`
+- `run_dreamzero_client.py`
 - `configs/dual_piper_example.yaml`
 - `docs/deploy_call_chain.md`
 - `rollout/buffer.py`
@@ -224,10 +272,13 @@ flowchart TD
 - `hardware/constants.py`
 - `hardware/conversions.py`
 - `rollout/assets.py`
+- `clients/base.py`
 - `clients/motus.py`
+- `clients/dreamzero.py`
 - `clients/openpi.py`
 - `rollout/execution.py`
 - `clients/openpi_sim.py`
+- `clients/xvla.py`
 - `hardware/piper.py`
 - `hardware/realsense.py`
 - `rollout/recording.py`

@@ -15,12 +15,11 @@ from hardware.schemas import RobotSnapshot
 from . import slai_piper_policy
 from . import websocket_client_policy
 from .base import (
+    ActionGripperEncoding,
     ControlMode,
-    DecodedArmAction,
-    DecodedPiperAction,
     SlaiPiperClient,
+    StateGripperEncoding,
     action_array_from_response,
-    action_gripper_for_piper,
     build_configured_piper_state as build_slai_configured_piper_state,
     image_to_rgb,
 )
@@ -212,8 +211,18 @@ def denormalize_actions(actions: np.ndarray, action_min: np.ndarray, action_max:
     return actions * (action_max - action_min) + action_min
 
 
-def build_configured_piper_state(snapshot: RobotSnapshot, spec: MotusPolicySpec, *, old_gripper: bool = False) -> np.ndarray:
-    return build_slai_configured_piper_state(snapshot, spec, old_gripper=old_gripper, dtype=np.float32)
+def build_configured_piper_state(
+    snapshot: RobotSnapshot,
+    spec: MotusPolicySpec,
+    *,
+    state_gripper_encoding: StateGripperEncoding = "policy",
+) -> np.ndarray:
+    return build_slai_configured_piper_state(
+        snapshot,
+        spec,
+        state_gripper_encoding=state_gripper_encoding,
+        dtype=np.float32,
+    )
 
 
 def resolve_per_task_gripper_threshold(spec: MotusPolicySpec, prompt: str | None) -> float | None:
@@ -232,12 +241,22 @@ def resolve_per_task_gripper_threshold(spec: MotusPolicySpec, prompt: str | None
     return None
 
 
-def build_normalized_policy_state(snapshot: RobotSnapshot, spec: MotusPolicySpec, *, prompt: str | None = None, old_gripper: bool = False) -> np.ndarray:
+def build_normalized_policy_state(
+    snapshot: RobotSnapshot,
+    spec: MotusPolicySpec,
+    *,
+    prompt: str | None = None,
+    state_gripper_encoding: StateGripperEncoding = "policy",
+) -> np.ndarray:
     threshold = resolve_per_task_gripper_threshold(spec, prompt)
     if threshold is not None and spec.state_space.gripper is not None:
         gripper = replace(spec.state_space.gripper, threshold=threshold)
         spec = replace(spec, state_space=replace(spec.state_space, gripper=gripper))
-    configured = build_configured_piper_state(snapshot, spec, old_gripper=old_gripper)
+    configured = build_configured_piper_state(
+        snapshot,
+        spec,
+        state_gripper_encoding=state_gripper_encoding,
+    )
     return normalize_actions(configured, spec.action_min, spec.action_max).astype(np.float32)
 
 
@@ -297,11 +316,16 @@ def build_policy_payload(
     session_id: str | None = None,
     t5_embeds: np.ndarray | None = None,
     num_inference_timesteps: int | None = None,
-    old_gripper: bool = False,
+    state_gripper_encoding: StateGripperEncoding = "policy",
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "image": build_policy_frame(snapshot, spec),
-        "state": build_normalized_policy_state(snapshot, spec, prompt=prompt, old_gripper=old_gripper),
+        "state": build_normalized_policy_state(
+            snapshot,
+            spec,
+            prompt=prompt,
+            state_gripper_encoding=state_gripper_encoding,
+        ),
     }
     if prompt is not None:
         payload["prompt"] = prompt
@@ -325,27 +349,19 @@ class MotusPiperClient(SlaiPiperClient):
         api_key: str | None = None,
         joint_speed_percent: int = 50,
         ee_speed_percent: int = 50,
-        gripper_effort: int = 1000,
+        gripper_effort: int | None = None,
         gripper_action_frames: int = 5,
         gripper_threshold: float | None = None,
         gripper_lower: float | None = None,
         gripper_upper: float | None = None,
         num_inference_timesteps: int | None = None,
-        old_gripper: bool = False,
+        state_gripper_encoding: StateGripperEncoding = "policy",
+        action_gripper_encoding: ActionGripperEncoding = "policy",
     ) -> None:
-        if not 0 <= gripper_effort <= 5000:
-            raise ValueError("gripper_effort must be in [0, 5000]")
-        if gripper_action_frames <= 0:
-            raise ValueError("gripper_action_frames must be positive")
         for name, value in (("gripper_threshold", gripper_threshold), ("gripper_lower", gripper_lower), ("gripper_upper", gripper_upper)):
             if value is not None and value < 0.0:
                 raise ValueError(f"{name} must be non-negative")
-        self.gripper_effort = gripper_effort
-        self.gripper_action_frames = gripper_action_frames
         self.num_inference_timesteps = num_inference_timesteps
-        self.default_session_id: str | None = None
-        self.last_commanded: DecodedPiperAction | None = None
-        self.gripper_transition: tuple[DecodedPiperAction, DecodedPiperAction, int] | None = None
         spec = load_motus_policy_spec(config_path)
         policy_client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
         super().__init__(
@@ -357,7 +373,10 @@ class MotusPiperClient(SlaiPiperClient):
             gripper_threshold=gripper_threshold,
             gripper_lower=gripper_lower,
             gripper_upper=gripper_upper,
-            old_gripper=old_gripper,
+            state_gripper_encoding=state_gripper_encoding,
+            action_gripper_encoding=action_gripper_encoding,
+            gripper_effort=gripper_effort,
+            gripper_action_frames=gripper_action_frames,
         )
         self.validate_server_metadata()
 
@@ -377,9 +396,6 @@ class MotusPiperClient(SlaiPiperClient):
         if action_chunk_size is not None and int(action_chunk_size) != self.spec.action_horizon:
             raise ValueError(f"Motus server action_chunk_size={action_chunk_size}, local config action_horizon={self.spec.action_horizon}")
 
-    def set_default_session_id(self, session_id: str | None) -> None:
-        self.default_session_id = session_id
-
     def build_payload(
         self,
         snapshot: RobotSnapshot,
@@ -398,7 +414,7 @@ class MotusPiperClient(SlaiPiperClient):
             session_id=session_id,
             t5_embeds=t5_embeds,
             num_inference_timesteps=self.num_inference_timesteps,
-            old_gripper=self.old_gripper,
+            state_gripper_encoding=self.state_gripper_encoding,
         )
 
     def infer(
@@ -428,106 +444,6 @@ class MotusPiperClient(SlaiPiperClient):
     ) -> np.ndarray:
         return np.asarray(self.infer(snapshot, prompt, session_id=session_id, t5_embeds=t5_embeds)["actions"], dtype=np.float64)
 
-    def get_predicted_video(self, session_id: str) -> dict[str, Any]:
-        return dict(self.client.infer({"_request": "get_predicted_video", "session_id": session_id}))
-
-    def save_predicted_video(self, *, session_id: str, output_dir: str | Path, file_stem: str) -> Path | None:
-        response = self.get_predicted_video(session_id)
-        video_bytes = response.get("predicted_video_bytes")
-        if video_bytes is None:
-            return None
-        output_root = Path(output_dir)
-        output_root.mkdir(parents=True, exist_ok=True)
-        output_path = output_root / f"{file_stem}_predicted_video.mp4"
-        output_path.write_bytes(video_bytes)
-        return output_path
-
-    def decode_gripper_for_piper(self, value: float, arm_name: str) -> tuple[float, bool]:
-        arm_threshold = getattr(self, f"{arm_name}_gripper_threshold", None)
-        arm_lower = getattr(self, f"{arm_name}_gripper_lower", None)
-        arm_upper = getattr(self, f"{arm_name}_gripper_upper", None)
-        threshold = arm_threshold if arm_threshold is not None else self.gripper_threshold
-        lower = arm_lower if arm_lower is not None else self.gripper_lower
-        upper = arm_upper if arm_upper is not None else self.gripper_upper
-        gripper_config = self.spec.action_space.gripper
-        value = action_gripper_for_piper(value, gripper_config, old_gripper=self.old_gripper)
-        binary_gripper = bool(gripper_config is not None and getattr(gripper_config, "type", None) == "01")
-        if threshold is not None:
-            return (PIPER_GRIPPER_FULL_OPEN_METERS if value >= threshold else 0.0), True
-        if upper is not None and value > upper:
-            return PIPER_GRIPPER_FULL_OPEN_METERS, True
-        if lower is not None and value < lower:
-            return 0.0, True
-        return value, binary_gripper
-
-    def command_decoded(self, robot: Any, decoded: DecodedPiperAction) -> None:
-        for arm_name, arm_action in decoded.arms.items():
-            arm = robot.left if arm_name == "left" else robot.right
-            if decoded.control_mode == "joints":
-                if arm_action.joint is None:
-                    raise ValueError(f"Decoded action for {arm_name} has no joint block")
-                arm.command_joint_positions(arm_action.joint, speed_percent=self.joint_speed_percent, gripper_effort=self.gripper_effort)
-            else:
-                if arm_action.ee_pose is None:
-                    raise ValueError(f"Decoded action for {arm_name} has no ee_pose block")
-                arm.command_end_pose(arm_action.ee_pose, speed_percent=self.ee_speed_percent, gripper_effort=self.gripper_effort)
-
-    def current_decoded_from_robot(self, robot: Any) -> DecodedPiperAction:
-        state = robot.read_state()
-        arms = {
-            "left": DecodedArmAction(
-                joint=np.asarray(state.left.qpos, dtype=np.float64).copy() if self.control_mode == "joints" else None,
-                gripper=float(state.left.qpos[6]),
-                ee_pose=None if self.control_mode == "joints" else np.asarray(state.left.end_pose, dtype=np.float64).copy(),
-            ),
-            "right": DecodedArmAction(
-                joint=np.asarray(state.right.qpos, dtype=np.float64).copy() if self.control_mode == "joints" else None,
-                gripper=float(state.right.qpos[6]),
-                ee_pose=None if self.control_mode == "joints" else np.asarray(state.right.end_pose, dtype=np.float64).copy(),
-            ),
-        }
-        return DecodedPiperAction(arms=arms, control_mode=self.control_mode)
-
-    def command_transition_step(self, robot: Any, start: DecodedPiperAction, target: DecodedPiperAction, step: int) -> None:
-        ratio = float(step) / float(self.gripper_action_frames)
-        arms: dict[str, DecodedArmAction] = {}
-        for arm_name, start_arm in start.arms.items():
-            target_arm = target.arms[arm_name]
-            gripper = start_arm.gripper
-            if target_arm.binary_gripper:
-                gripper = start_arm.gripper + (target_arm.gripper - start_arm.gripper) * ratio
-            if self.control_mode == "joints":
-                if start_arm.joint is None:
-                    raise ValueError(f"Transition start for {arm_name} has no joint block")
-                arms[arm_name] = DecodedArmAction(joint=np.concatenate((start_arm.joint[:6], np.array([gripper], dtype=np.float64))), gripper=gripper, ee_pose=None, binary_gripper=target_arm.binary_gripper)
-            else:
-                if start_arm.ee_pose is None:
-                    raise ValueError(f"Transition start for {arm_name} has no ee_pose block")
-                arms[arm_name] = DecodedArmAction(joint=None, gripper=gripper, ee_pose=np.concatenate((start_arm.ee_pose[:6], np.array([gripper], dtype=np.float64))), binary_gripper=target_arm.binary_gripper)
-        decoded = DecodedPiperAction(arms=arms, control_mode=self.control_mode)
-        self.command_decoded(robot, decoded)
-        self.last_commanded = decoded
-
-    def command_action(self, robot: Any, action: np.ndarray) -> None:
-        if self.gripper_transition is not None:
-            start, target, step = self.gripper_transition
-            self.command_transition_step(robot, start, target, step)
-            self.gripper_transition = None if step >= self.gripper_action_frames else (start, target, step + 1)
-            return
-        decoded = self.decode_action(action)
-        if self.last_commanded is None:
-            self.last_commanded = self.current_decoded_from_robot(robot)
-        if (
-            self.last_commanded is not None
-            and self.gripper_action_frames > 1
-            and any(arm.binary_gripper and not np.isclose(arm.gripper, self.last_commanded.arms[name].gripper, atol=1e-6) for name, arm in decoded.arms.items())
-        ):
-            start = self.last_commanded
-            self.command_transition_step(robot, start, decoded, 1)
-            self.gripper_transition = (start, decoded, 2)
-            return
-        self.command_decoded(robot, decoded)
-        self.last_commanded = decoded
 
 
 def spec_summary(spec: MotusPolicySpec) -> dict[str, Any]:
