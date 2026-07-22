@@ -1,12 +1,13 @@
 # Deploy Call Chain
 
-这个目录现在只保留五条最外层部署入口：
+这个目录现在只保留六条最外层部署入口：
 
 - `run_openpi_client.py`
 - `run_xvla_client.py`
 - `run_openpi_sim_client.py`
 - `run_motus_client.py`
 - `run_dreamzero_client.py`
+- `run_fastwam_client.py`
 
 它们共享同一套真机运行时骨架：
 
@@ -27,6 +28,7 @@ flowchart TD
     C[run_openpi_sim_client.py] --> R
     D[run_motus_client.py] --> R
     E[run_dreamzero_client.py] --> R
+    F[run_fastwam_client.py] --> R
 
     R[runner: parse args / load config / init runtime] --> CFG[hardware/config.py]
     R --> OBS[hardware/runtime.py<br/>DualPiperObservationSource]
@@ -42,22 +44,26 @@ flowchart TD
     C --> SA[clients/openpi_sim.py]
     D --> MA[clients/motus.py]
     E --> DA[clients/dreamzero.py]
+    F --> FA[clients/fastwam.py]
 
     OA --> WS1[openpi_client.websocket_client_policy]
     XA --> WSX[xvla_client.websocket_client_policy]
     SA --> WS1
     MA --> WS2[Motus websocket_client_policy]
     DA --> WSD[DreamZero websocket_client_policy]
+    FA --> HTTP[FastWAMHTTPPolicyClient]
 
     WS1 --> S1[OpenPI server]
     WSX --> SX[X-VLA server]
     WS2 --> S2[Motus server]
     WSD --> SD[DreamZero server]
+    HTTP --> SF[FastWAM HTTP server /infer]
 
     A --> ROLL[rollout/execution.py]
     B --> ROLL
     D --> ROLL
     E --> ROLL
+    F --> ROLL
     C --> SIMROLL[run_openpi_sim_client.py internal rollout]
 
     ROLL --> CMD[client.decode_action / client.command_action]
@@ -222,9 +228,50 @@ flowchart TD
     D24 --> D25[piper_sdk JointCtrl or EndPoseCtrl + GripperCtrl]
 ```
 
-所有推理入口都使用 `--state-gripper` / `--action-gripper` 显式选择 gripper 编码。旧 gripper 数据兼容写法是 `--state-gripper old --action-gripper old`；`--old_gripper` 已移除。X-VLA 默认 `meters/binary`，其他入口默认 `policy/policy`。
 
-## 6. 共享硬件层
+## 6. FastWAM 真机链
+
+```mermaid
+flowchart TD
+    F[run_fastwam_client.py] --> F1[load_fastwam_policy_spec]
+    F --> F2[FastWAMPiperClient]
+    F --> F3[HTTP /infer server metadata is empty]
+    F --> F4[make_dual_piper_runtime]
+
+    F4 --> F5[DualPiperSystem]
+    F4 --> F6[RealSenseRig]
+    F4 --> F7[DualPiperObservationSource]
+
+    F --> F8[robot.enable]
+    F --> F9[robot.move_to_joint_positions resolved init joints]
+    F --> F10{execution_mode}
+    F10 -->|chunk_sync| F11[rollout/execution.run_chunk_sync_rollout]
+    F10 -->|streaming| F12[rollout/execution.run_temporal_smoothing_rollout]
+
+    F11 --> F13[source.capture_snapshot]
+    F12 --> F13
+    F13 --> F14[FastWAMPiperClient.build_payload]
+    F14 --> F15[build_fastwam_proprio 32D all-state rot6d]
+    F14 --> F16[base64 PNG images cam_high / left wrist / right wrist]
+    F14 --> F17[instruction + action_horizon + optional denoising args]
+    F17 --> F18[FastWAMHTTPPolicyClient POST /infer]
+    F18 --> F19[FastWAM server]
+    F19 --> F20[action chunk 14D joints rad + gripper 0-1]
+
+    F20 --> F21[SlaiPiperClient.decode_action]
+    F21 --> F22{binary gripper transition?}
+    F22 -->|yes| F23[SlaiPiperClient.command_transition_step]
+    F22 -->|no| F24[SlaiPiperClient.command_decoded]
+    F23 --> F25[left/right arm.command_joint_positions]
+    F24 --> F25
+    F25 --> F26[piper_sdk JointCtrl + GripperCtrl]
+```
+
+FastWAM 的 server 端由 `baselines/fastwam/scripts/server.py` 管理模型加载和归一化。deploy client 发送当前帧三路 RGB、32D raw Piper proprio、`instruction`，并按响应中的 14D joint-radian + gripper 0-1 action chunk 控制真机。开启 `--record` 时会记录本地相机视频、逐帧 action/state/time 和 frame1，并在 finalize 后像 Motus/DreamZero 一样尝试拉取 server 缓存的 predicted video；FastWAM server 默认不生成 predicted video，只有以 `--save-video-pred` 启动时才进入 `infer_joint` 视频生成分支。推理始终发送三路当前帧图像作为观测。默认 `--state-gripper policy --action-gripper policy` 对齐训练侧 0-1 gripper 开度，并在硬件层与米制开口互转。
+
+所有推理入口都使用 `--state-gripper` / `--action-gripper` 显式选择 gripper 编码。旧 gripper 数据兼容写法是 `--state-gripper old --action-gripper old`；`--old_gripper` 已移除。X-VLA 默认 `meters/binary`，FastWAM 默认 `policy/policy`，其他入口默认 `policy/policy`。
+
+## 7. 共享硬件层
 
 ```mermaid
 flowchart TD
@@ -256,7 +303,7 @@ flowchart TD
     Q2 --> QC6[GripperCtrl]
 ```
 
-## 7. 当前保留范围
+## 8. 当前保留范围
 
 当前 `challenge_deploy/` 只围绕下面这些文件保留：
 
@@ -265,6 +312,7 @@ flowchart TD
 - `run_openpi_sim_client.py`
 - `run_motus_client.py`
 - `run_dreamzero_client.py`
+- `run_fastwam_client.py`
 - `configs/dual_piper_example.yaml`
 - `docs/deploy_call_chain.md`
 - `rollout/buffer.py`
@@ -275,6 +323,7 @@ flowchart TD
 - `clients/base.py`
 - `clients/motus.py`
 - `clients/dreamzero.py`
+- `clients/fastwam.py`
 - `clients/openpi.py`
 - `rollout/execution.py`
 - `clients/openpi_sim.py`

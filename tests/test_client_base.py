@@ -264,6 +264,7 @@ class ClientBaseTest(unittest.TestCase):
             "run_xvla_client.py",
             "run_motus_client.py",
             "run_dreamzero_client.py",
+            "run_fastwam_client.py",
         )
         for entrypoint in entrypoints:
             source = (DEPLOY_ROOT / entrypoint).read_text(encoding="utf-8")

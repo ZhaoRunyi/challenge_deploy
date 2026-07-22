@@ -127,11 +127,12 @@ def distribution_image_search_terms(repo_id: str, aliases: tuple[str, ...] = ())
     return terms
 
 
-def distribution_image_score(path: Path, terms: list[str]) -> tuple[int, int, str]:
+def distribution_image_score(path: Path, terms: list[str]) -> tuple[int, int, int, str]:
     name = path.name.lower()
     score = sum(1 for term in terms if term.lower() in name)
     longest = max((len(term) for term in terms if term.lower() in name), default=0)
-    return score, longest, path.name
+    source_priority = 0 if name.startswith("embodichain_sim_data") else 1
+    return score, source_priority, longest, path.name
 
 
 def find_distribution_image_path(repo_id: str | None, *, artifacts_root: Path = ARTIFACTS_ROOT, aliases: tuple[str, ...] = ()) -> Path | None:
@@ -334,5 +335,19 @@ def prepare_client_assets(
             need_distribution=need_distribution,
             aliases=distribution_aliases,
             default_prompt=default_prompt,
+        )
+    if client_kind == "fastwam":
+        if spec is None:
+            raise ValueError("FastWAM assets require a loaded policy spec")
+        distribution_name = getattr(spec, "distribution_name", None) or train_config_name
+        distribution_aliases = getattr(spec, "distribution_aliases", ())
+        if not isinstance(distribution_aliases, tuple):
+            distribution_aliases = tuple(distribution_aliases)
+        return prepare_named_artifact_assets(
+            train_config_name=str(distribution_name),
+            cli_prompt=cli_prompt,
+            need_distribution=need_distribution,
+            aliases=tuple(str(alias) for alias in distribution_aliases),
+            default_prompt=getattr(spec, "prompt", None),
         )
     raise ValueError(f"Unsupported client_kind: {client_kind}")

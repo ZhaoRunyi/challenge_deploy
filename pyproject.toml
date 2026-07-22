@@ -26,6 +26,7 @@ challenge-deploy-xvla-client = "run_xvla_client:main"
 challenge-deploy-openpi-sim-client = "run_openpi_sim_client:main"
 challenge-deploy-motus-client = "run_motus_client:main"
 challenge-deploy-dreamzero-client = "run_dreamzero_client:main"
+challenge-deploy-fastwam-client = "run_fastwam_client:main"
 challenge-deploy-hdf5_teleop-collect = "run_hdf5_teleop_collect:main"
 challenge-deploy-hdf5_teleop-episode-vis = "run_hdf5_teleop_episode_vis:main"
 
@@ -36,6 +37,7 @@ py-modules = [
     "run_openpi_sim_client",
     "run_motus_client",
     "run_dreamzero_client",
+    "run_fastwam_client",
     "run_hdf5_teleop_collect",
     "run_hdf5_teleop_episode_vis",
 ]

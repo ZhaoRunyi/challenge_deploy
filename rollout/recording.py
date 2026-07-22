@@ -360,12 +360,18 @@ def save_recorded_actions(
     saved_actions: list[np.ndarray] | None,
     action_names: tuple[str, ...],
 ) -> Path:
+    del saved_actions, action_names
     action_path = recorder.run_dir / f"{recorder.record_stem}_actions.npz"
-    if saved_actions:
-        action_trajectory = np.stack(saved_actions, axis=0)
+    if recorder.actions:
+        actions = np.stack(recorder.actions, axis=0)
     else:
-        action_trajectory = np.empty((0, len(action_names)), dtype=np.float64)
-    np.savez_compressed(action_path, action_mean_trajectory=action_trajectory, action_names=np.asarray(action_names))
+        actions = np.empty((0, len(recorder.schema.action_names)), dtype=np.float64)
+    if recorder.states:
+        states = np.stack(recorder.states, axis=0)
+    else:
+        states = np.empty((0, len(recorder.schema.state_names)), dtype=np.float64)
+    timestamps_s = np.asarray(recorder.timestamps, dtype=np.float64)
+    np.savez_compressed(action_path, actions=actions, states=states, timestamps_s=timestamps_s)
     return action_path
 
 
