@@ -1,14 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 import numpy as np
-from openpi.training import config as openpi_config
-from openpi_client import image_tools, websocket_client_policy
+
+try:
+    from openpi.training import config as openpi_config
+except ModuleNotFoundError as error:
+    openpi_config = None
+    OPENPI_IMPORT_ERROR = error
+else:
+    OPENPI_IMPORT_ERROR = None
+
+try:
+    from openpi_client import image_tools
+except ModuleNotFoundError as error:
+    image_tools = None
+    OPENPI_CLIENT_IMPORT_ERROR = error
+else:
+    OPENPI_CLIENT_IMPORT_ERROR = None
 
 from hardware.constants import PIPER_GRIPPER_FULL_OPEN_METERS
 from hardware.schemas import PiperArmState, RobotSnapshot
+from . import websocket_client_policy
 from .base import (
     ActionGripperEncoding,
     DecodedArmAction,
@@ -18,6 +33,7 @@ from .base import (
     action_gripper_for_piper,
     bounded_gripper_for_piper,
     hardware_gripper_to_model_raw,
+    quiet_close_policy_transport_on_construction_error,
     state_gripper_for_policy,
 )
 
@@ -46,6 +62,11 @@ class OpenPiSimPolicySpec:
 
 
 def load_openpi_sim_policy_spec(train_config_name: str) -> OpenPiSimPolicySpec:
+    if openpi_config is None:
+        raise RuntimeError(
+            "OpenPI-sim train-config support requires the OpenPI source package "
+            "in this environment"
+        ) from OPENPI_IMPORT_ERROR
     train_config = openpi_config.get_config(train_config_name)
     data_config_name = type(train_config.data).__name__
     if "EmbodiChain" not in data_config_name:
@@ -87,11 +108,13 @@ def sim_gripper_to_piper(
     upper: float | None = None,
     *,
     action_gripper_encoding: ActionGripperEncoding = "policy",
+    full_open_value: float = PIPER_GRIPPER_FULL_OPEN_METERS,
 ) -> tuple[float, bool]:
     raw_gripper = action_gripper_for_piper(
         sim_gripper_to_model_raw(value, action_gripper_encoding=action_gripper_encoding),
         None,
         action_gripper_encoding=action_gripper_encoding,
+        full_open_value=full_open_value,
     )
     bounded_binary = (
         action_gripper_encoding == "binary"
@@ -99,7 +122,16 @@ def sim_gripper_to_piper(
         or (upper is not None and raw_gripper > upper)
         or (lower is not None and raw_gripper < lower)
     )
-    return bounded_gripper_for_piper(raw_gripper, threshold, lower, upper), bounded_binary
+    return (
+        bounded_gripper_for_piper(
+            raw_gripper,
+            threshold,
+            lower,
+            upper,
+            full_open_value=full_open_value,
+        ),
+        bounded_binary,
+    )
 
 
 def piper_gripper_to_sim(
@@ -157,6 +189,10 @@ def build_configured_piper_state(
 
 
 def image_to_embodichain_rgb(image: np.ndarray) -> np.ndarray:
+    if image_tools is None:
+        raise RuntimeError(
+            "OpenPI-sim image preprocessing requires the openpi-client package"
+        ) from OPENPI_CLIENT_IMPORT_ERROR
     image = np.asarray(image)
     if image.ndim != 3 or image.shape[-1] != 3:
         raise ValueError(f"Expected HWC 3-channel image, got shape {image.shape}")
@@ -216,18 +252,22 @@ class OpenPiSimPiperClient(SlaiPiperClient):
         self.bad_sim = bad_sim
         spec = load_openpi_sim_policy_spec(train_config_name)
         policy_client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
-        super().__init__(
-            spec=spec,
-            policy_client=policy_client,
-            control_mode=control_mode,
-            joint_speed_percent=joint_speed_percent,
-            ee_speed_percent=0,
-            gripper_threshold=gripper_threshold,
-            gripper_lower=gripper_lower,
-            gripper_upper=gripper_upper,
-            state_gripper_encoding=state_gripper_encoding,
-            action_gripper_encoding=action_gripper_encoding,
-        )
+        try:
+            super().__init__(
+                spec=spec,
+                policy_client=policy_client,
+                control_mode=control_mode,
+                joint_speed_percent=joint_speed_percent,
+                ee_speed_percent=0,
+                gripper_threshold=gripper_threshold,
+                gripper_lower=gripper_lower,
+                gripper_upper=gripper_upper,
+                state_gripper_encoding=state_gripper_encoding,
+                action_gripper_encoding=action_gripper_encoding,
+            )
+        except BaseException:
+            quiet_close_policy_transport_on_construction_error(policy_client)
+            raise
 
     def validate_control_mode(self) -> None:
         if self.control_mode != "joints":
@@ -249,7 +289,13 @@ class OpenPiSimPiperClient(SlaiPiperClient):
         value = float(value)
         return value / 0.05 if self.bad_sim else value
 
-    def _decode_sim_gripper(self, value: float, arm_name: str) -> tuple[float, bool]:
+    def _decode_sim_gripper(
+        self,
+        value: float,
+        arm_name: str,
+        *,
+        full_open_value: float = PIPER_GRIPPER_FULL_OPEN_METERS,
+    ) -> tuple[float, bool]:
         arm_threshold = getattr(self, f"{arm_name}_gripper_threshold", None)
         arm_lower = getattr(self, f"{arm_name}_gripper_lower", None)
         arm_upper = getattr(self, f"{arm_name}_gripper_upper", None)
@@ -259,16 +305,34 @@ class OpenPiSimPiperClient(SlaiPiperClient):
             arm_lower if arm_lower is not None else self.gripper_lower,
             arm_upper if arm_upper is not None else self.gripper_upper,
             action_gripper_encoding=self.action_gripper_encoding,
+            full_open_value=full_open_value,
         )
 
-    def decode_action(self, action: np.ndarray) -> DecodedPiperAction:
+    def decode_action(
+        self,
+        action: np.ndarray,
+        *,
+        gripper_full_openings: Mapping[str, float] | None = None,
+    ) -> DecodedPiperAction:
         action = np.asarray(action, dtype=np.float64)
         if action.ndim != 1:
             raise ValueError(f"Expected one action vector, got shape {action.shape}")
         if action.shape[0] < SIM_ACTION_DIM:
             raise ValueError(f"openpi_sim action dim {action.shape[0]} is smaller than expected {SIM_ACTION_DIM}")
-        left_gripper, left_binary = self._decode_sim_gripper(float(action[6]), "left")
-        right_gripper, right_binary = self._decode_sim_gripper(float(action[13]), "right")
+        full_openings = gripper_full_openings or {
+            "left": PIPER_GRIPPER_FULL_OPEN_METERS,
+            "right": PIPER_GRIPPER_FULL_OPEN_METERS,
+        }
+        left_gripper, left_binary = self._decode_sim_gripper(
+            float(action[6]),
+            "left",
+            full_open_value=float(full_openings["left"]),
+        )
+        right_gripper, right_binary = self._decode_sim_gripper(
+            float(action[13]),
+            "right",
+            full_open_value=float(full_openings["right"]),
+        )
         return DecodedPiperAction(
             control_mode="joints",
             arms={

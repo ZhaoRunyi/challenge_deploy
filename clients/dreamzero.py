@@ -13,11 +13,13 @@ from . import slai_piper_policy
 from .base import (
     ActionGripperEncoding,
     ControlMode,
+    PolicySessionCapability,
     SlaiPiperClient,
     StateGripperEncoding,
     action_array_from_response,
     build_full_piper_state,
     image_to_rgb,
+    quiet_close_policy_transport_on_construction_error,
 )
 from .specs import space_summary
 
@@ -149,6 +151,8 @@ def build_policy_payload(
 
 
 class DreamZeroPiperClient(SlaiPiperClient):
+    SESSION_CAPABILITY = PolicySessionCapability.SESSION_ID
+
     def __init__(
         self,
         config_path: str | Path,
@@ -174,21 +178,25 @@ class DreamZeroPiperClient(SlaiPiperClient):
         self.num_inference_timesteps = num_inference_timesteps
         spec = load_dreamzero_policy_spec(config_path)
         policy_client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
-        super().__init__(
-            spec=spec,
-            policy_client=policy_client,
-            control_mode=control_mode,
-            joint_speed_percent=joint_speed_percent,
-            ee_speed_percent=ee_speed_percent,
-            gripper_threshold=gripper_threshold,
-            gripper_lower=gripper_lower,
-            gripper_upper=gripper_upper,
-            state_gripper_encoding=state_gripper_encoding,
-            action_gripper_encoding=action_gripper_encoding,
-            gripper_effort=gripper_effort,
-            gripper_action_frames=gripper_action_frames,
-        )
-        self.validate_server_metadata()
+        try:
+            super().__init__(
+                spec=spec,
+                policy_client=policy_client,
+                control_mode=control_mode,
+                joint_speed_percent=joint_speed_percent,
+                ee_speed_percent=ee_speed_percent,
+                gripper_threshold=gripper_threshold,
+                gripper_lower=gripper_lower,
+                gripper_upper=gripper_upper,
+                state_gripper_encoding=state_gripper_encoding,
+                action_gripper_encoding=action_gripper_encoding,
+                gripper_effort=gripper_effort,
+                gripper_action_frames=gripper_action_frames,
+            )
+            self.validate_server_metadata()
+        except BaseException:
+            quiet_close_policy_transport_on_construction_error(policy_client)
+            raise
 
     def validate_server_metadata(self) -> None:
         metadata = self.get_server_metadata()
@@ -220,8 +228,13 @@ class DreamZeroPiperClient(SlaiPiperClient):
         )
 
     def infer(self, snapshot: RobotSnapshot, prompt: str | None = None, **kwargs: Any) -> dict[str, Any]:
-        response = dict(self.client.infer(self.build_payload(snapshot, prompt, **kwargs)))
-        response["actions"] = action_array_from_response(response, keys=("actions", "action")).astype(np.float64)
+        raw_response = self.client.infer(self.build_payload(snapshot, prompt, **kwargs))
+        actions = action_array_from_response(
+            raw_response,
+            keys=("actions", "action"),
+        )
+        response = dict(raw_response)
+        response["actions"] = actions.astype(np.float64)
         return response
 
     def infer_actions(self, snapshot: RobotSnapshot, prompt: str | None = None, **kwargs: Any) -> np.ndarray:

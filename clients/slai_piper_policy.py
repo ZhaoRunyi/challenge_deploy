@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
-import torch
 
 FIELD_NAMES = ("joint", "gripper", "ee_pos", "ee_rot")
 IDS_MAP = {
@@ -278,13 +277,3 @@ def extract_state_action_inputs(
     if actions is not None:
         inputs["actions"] = extract_vec(np.asarray(actions), space_from_action_config(action_space), action_space.gripper)
     return inputs
-
-
-def select_state_action_vector(value: object, config: StateSpaceConfig | ActionSpaceConfig | None = None) -> torch.Tensor:
-    config = config or StateSpaceConfig()
-    array = np.asarray(value)
-    if is_state_space_config(config):
-        selected = extract_vec(array, space_from_state_config(config), config.gripper)
-    else:
-        selected = extract_vec(array, space_from_action_config(config), config.gripper)
-    return torch.as_tensor(selected).float()

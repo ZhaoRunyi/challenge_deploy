@@ -2,114 +2,76 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
-
-import numpy as np
 
 from clients.xvla import (
+    XVLA_TRAIN_CONFIGS,
     XVLAPiperClient,
     load_piper_policy_spec,
     spec_summary,
 )
 from hardware.config import load_config
 from rollout.assets import prepare_client_assets
-from rollout.execution import (
-    action_sequence,
-    resolve_chunk_size,
-    resolve_policy_steps,
-    resolve_record_steps,
-    run_chunk_sync_rollout,
-    run_temporal_smoothing_rollout,
-    save_rollout_metrics,
-)
-from rollout.recording import RolloutVideoRecorder, ExecutionRecordSink, save_frame1_image, save_recorded_actions, set_distribution_overlap
-from rollout.windowing import RuntimeExecutionWindow, preview_until_continue
+from rollout.dry_run import run_deferred_policy_dry_run_plan
+from rollout.runner import RolloutRuntimePlan, run_configured_rollout_runtime
 from rollout.support import (
+    add_gripper_bound_args,
     add_gripper_encoding_args,
+    add_standard_rollout_args,
+    add_websocket_policy_args,
     apply_runtime_overrides,
     build_slai_recording_state,
-    ignore_recorder_signal_handlers,
-    install_recorder_signal_handlers,
-    make_dual_piper_runtime,
+    close_policy_transport,
+    make_recording_state_builder,
+    make_rollout_argument_parser,
     make_slai_recording_schema,
     normalized_prompt,
-    print_rollout_chunk_summary,
-    record_name_prefix,
-    resolve_dual_piper_init_joints,
+    prepare_rollout_runtime,
+    print_resolved_prompt,
+    print_server_metadata,
+    validate_standard_rollout_args,
 )
-
-DEPLOY_ROOT = Path(__file__).resolve().parent
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="X-VLA SLAI Piper client.")
-    parser.add_argument("--train-config", default="slai_piper_items_hand_over_place_ee20_xvla_pt_bs256_400000")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--prompt", required=False)
-    parser.add_argument("--control-mode", choices=["joints", "ee_pose"], default="ee_pose")
-    parser.add_argument("--api-key", default=None)
-    parser.add_argument("--joint-speed-percent", type=int, default=50)
-    parser.add_argument("--ee-speed-percent", type=int, default=50)
-    parser.add_argument("--gripper_threshold", type=float, default=None)
-    parser.add_argument("--gripper_lower", type=float, default=None)
-    parser.add_argument("--gripper_upper", type=float, default=None)
-    add_gripper_encoding_args(parser, default_state="meters", default_action="binary")
-    parser.add_argument("--rollout-steps", type=int, default=1000)
-    parser.add_argument("--record-steps", type=int, default=None, help="Total frames to record; default is --rollout-steps. Requires --record or --window when set.")
-    parser.add_argument("--chunk-size", type=int, default=None)
-    parser.add_argument("--fps", type=float, default=10.0)
-    parser.add_argument("--execution-mode", choices=["streaming", "chunk_sync"], default="chunk_sync")
-    parser.add_argument("--inference-rate", type=float, default=None)
-    parser.add_argument("--latency-k", type=int, default=None)
-    parser.add_argument("--min-smooth-steps", type=int, default=None)
-    parser.add_argument("--buffer-max-chunks", type=int, default=None)
-    parser.add_argument("--metrics-json", default=None, help="Optional path to save rollout timing metrics as JSON.")
-    parser.add_argument("--record", action="store_true")
-    parser.add_argument("--save-sep", action="store_true", help="Save one raw-camera video per recording camera; requires --record.")
-    parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "xvla_records"))
-    parser.add_argument("--config", default=str(DEPLOY_ROOT / "configs" / "dual_piper_example.yaml"))
-    parser.add_argument("--left-can", default=None)
-    parser.add_argument("--right-can", default=None)
+    parser = make_rollout_argument_parser("X-VLA SLAI Piper")
     parser.add_argument(
-        "--init-joints",
-        nargs=14,
-        type=float,
-        default=None,
-        help="Optional 14D dual-Piper initial qpos override: left 7 then right 7.",
+        "--train-config",
+        default="slai_piper_items_hand_over_place_ee20_xvla_pt_bs256_400000",
     )
-    parser.add_argument("--camera-high-serial", default=None)
-    parser.add_argument("--camera-left-serial", default=None)
-    parser.add_argument("--camera-right-serial", default=None)
-    parser.add_argument("--no-cameras", action="store_true")
-    parser.add_argument("--window", nargs="?", const=1, type=int, default=0)
-    parser.add_argument("--dist-overlap", action="store_true", help="Overlay train distribution on cam_high instead of stacking it above.")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--spec-only", action="store_true")
-    parser.add_argument("--ready-timeout", type=float, default=15.0)
+    add_websocket_policy_args(parser, default_control_mode="ee_pose")
+    add_gripper_bound_args(parser, per_arm=False)
+    add_gripper_encoding_args(parser, default_state="meters", default_action="binary")
+    add_standard_rollout_args(parser, record_directory_name="xvla_records")
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-    set_distribution_overlap(args.dist_overlap)
-    if args.save_sep and not args.record:
-        raise ValueError("--save-sep requires --record")
-    if args.record_steps is not None and not (args.record or args.window):
-        raise ValueError("--record-steps requires --record or --window")
-    spec = load_piper_policy_spec(args.train_config)
-    print(json.dumps(spec_summary(spec), indent=2), flush=True)
-    if args.spec_only:
-        return
+def run_once(args: argparse.Namespace) -> None:
+    validate_standard_rollout_args(args)
+    defer_external_config = args.dry_run and args.train_config not in XVLA_TRAIN_CONFIGS
+    if not defer_external_config:
+        spec = load_piper_policy_spec(args.train_config)
+        policy_spec_summary = spec_summary(spec)
+        if args.spec_only:
+            print(json.dumps(policy_spec_summary, indent=2), flush=True)
+            return
     cli_prompt = normalized_prompt(args.prompt)
-    if args.rollout_steps < 0:
-        raise ValueError("--rollout-steps must be non-negative")
-    record_steps = resolve_record_steps(args.rollout_steps, args.record_steps)
-    policy_steps = resolve_policy_steps(args.rollout_steps, record_steps)
-    if args.fps < 0.0:
-        raise ValueError("--fps must be non-negative")
-    if args.inference_rate is not None and args.inference_rate < 0.0:
-        raise ValueError("--inference-rate must be non-negative")
+    runtime_config = apply_runtime_overrides(load_config(args.config), args)
+    if defer_external_config:
+        run_deferred_policy_dry_run_plan(
+            args=args,
+            runner_name="run_xvla_client",
+            policy_transport_name="XVLAPiperClient",
+            runtime_config=runtime_config,
+            configuration_kind="external X-VLA deployment JSON or registry name",
+        )
+        return
+    initial_joints, runtime_event_callback = prepare_rollout_runtime(
+        args=args,
+        spec=spec,
+        runtime_config=runtime_config,
+        runner_name="run_xvla_client",
+    )
+    print(json.dumps(policy_spec_summary, indent=2), flush=True)
     client_assets = prepare_client_assets(
         client_kind="xvla",
         train_config_name=args.train_config,
@@ -120,16 +82,10 @@ def main() -> None:
     resolved_prompt = client_assets.prompt
     if resolved_prompt is None:
         raise RuntimeError(
-            "No prompt available for this train config. Provide --prompt, or add a matching entry to "
-            "deploy/artifacts/trainconfig_prompts.json."
+            "No prompt available for this train config. Provide --prompt, or "
+            "add a matching prompt entry."
         )
-    print(
-        json.dumps(
-            {"prompt": {"value": resolved_prompt, "source": client_assets.prompt_source}},
-            indent=2,
-        ),
-        flush=True,
-    )
+    print_resolved_prompt(resolved_prompt, client_assets.prompt_source)
 
     client = XVLAPiperClient(
         args.train_config,
@@ -145,180 +101,35 @@ def main() -> None:
         state_gripper_encoding=args.state_gripper,
         action_gripper_encoding=args.action_gripper,
     )
-    server_metadata = client.get_server_metadata()
-    print(json.dumps({"server_metadata": server_metadata}, indent=2), flush=True)
-
-    runtime_config = apply_runtime_overrides(load_config(args.config), args)
-    robot, cameras, source = make_dual_piper_runtime(
-        runtime_config,
-        commands_enabled=not args.dry_run,
-        name="xvla_piper_client",
-    )
-    recording_schema = make_slai_recording_schema(spec, args.control_mode)
-    runtime_window = (
-        RuntimeExecutionWindow(schema=recording_schema, display_index=args.window)
-        if args.window
-        else None
-    )
-    recorder = (
-        RolloutVideoRecorder(
-            output_dir=args.record_dir,
-            schema=recording_schema,
-            fps=args.fps,
-            name_prefix=record_name_prefix(args, server_metadata),
-            save_separate_videos=args.save_sep,
-        )
-        if args.record
-        else None
-    )
-    record_sink = (
-        ExecutionRecordSink(recorder=recorder, runtime_window=runtime_window)
-        if recorder is not None or runtime_window is not None
-        else None
-    )
-    saved_actions: list[np.ndarray] | None = [] if recorder is not None else None
-    install_recorder_signal_handlers(recorder)
-    state_builder = lambda snapshot, policy_spec: build_slai_recording_state(
-        snapshot,
-        policy_spec,
-        state_gripper_encoding=args.state_gripper,
-    )
-    robot.connect(read_only=args.dry_run)
     try:
-        if cameras is not None:
-            cameras.start()
-        if not source.wait_until_ready(timeout_s=args.ready_timeout):
-            raise RuntimeError("Timed out waiting for Piper/RealSense data")
-        if not args.dry_run and not robot.enable():
-            print("Warning: Piper arm enable check did not report success; continuing anyway.", flush=True)
-        chunk_size = resolve_chunk_size(spec, args.chunk_size)
-        inference_rate = float(args.inference_rate if args.inference_rate is not None else runtime_config["policy"]["inference_rate"])
-        latency_k = int(args.latency_k if args.latency_k is not None else runtime_config["policy"]["latency_k"])
-        min_smooth_steps = int(args.min_smooth_steps if args.min_smooth_steps is not None else runtime_config["policy"]["min_smooth_steps"])
-        buffer_max_chunks = int(args.buffer_max_chunks if args.buffer_max_chunks is not None else runtime_config["policy"]["buffer_max_chunks"])
-        if args.dry_run:
-            snapshot = source.capture_snapshot()
-            actions = action_sequence(client.infer_actions(snapshot, prompt=resolved_prompt))[:chunk_size]
-            print_rollout_chunk_summary(
-                client=client,
-                chunk_index=0,
-                action_count=len(actions),
-                executed_steps=0,
-                rollout_steps=policy_steps,
-                first_action=actions[0],
-            )
-            if args.window:
-                preview_until_continue(source, distribution_image_path=client_assets.distribution_image_path)
-                if client_assets.skip_reason is not None:
-                    print(f"Skipped train-distribution frame1 image: {client_assets.skip_reason}", flush=True)
-            return
-        initial_joints = resolve_dual_piper_init_joints(args.init_joints)
-        print(json.dumps({"initial_pose": {"qpos": initial_joints.tolist()}}, indent=2), flush=True)
-        robot.move_to_joint_positions(initial_joints, speed_percent=args.joint_speed_percent)
-        first_obs_snapshot = source.capture_snapshot()
-        if recorder is not None:
-            frame1_path = save_frame1_image(
-                recorder,
-                first_obs_snapshot,
-                distribution_image_path=client_assets.distribution_image_path,
-            )
-            if frame1_path is not None:
-                print(f"Frame1 comparison saved to {frame1_path}", flush=True)
-        if args.window:
-            preview_until_continue(source, distribution_image_path=client_assets.distribution_image_path)
-            if client_assets.skip_reason is not None:
-                print(f"Skipped train-distribution frame1 image: {client_assets.skip_reason}", flush=True)
-
-        print(
-            json.dumps(
-                {
-                    "rollout": {
-                        "execution_mode": args.execution_mode,
-                        "rollout_steps": args.rollout_steps,
-                        "record_steps": record_steps,
-                        "chunk_size": chunk_size,
-                        "fps": args.fps,
-                        "inference_rate": inference_rate if args.execution_mode == "streaming" else None,
-                        "latency_k": latency_k if args.execution_mode == "streaming" else None,
-                        "min_smooth_steps": min_smooth_steps if args.execution_mode == "streaming" else None,
-                        "buffer_max_chunks": buffer_max_chunks if args.execution_mode == "streaming" else None,
-                        "state_gripper": args.state_gripper,
-                        "action_gripper": args.action_gripper,
-                    }
-                },
-                indent=2,
-            ),
-            flush=True,
-        )
-
-        def log_chunk(chunk_index: int, action_count: int, executed_steps: int, first_action) -> None:
-            print_rollout_chunk_summary(
-                client=client,
-                chunk_index=chunk_index,
-                action_count=action_count,
-                executed_steps=executed_steps,
-                rollout_steps=policy_steps,
-                first_action=first_action,
-            )
-
-        rollout_kwargs = dict(
+        server_metadata = client.get_server_metadata()
+        print_server_metadata(server_metadata)
+        run_configured_rollout_runtime(
+            args=args,
             client=client,
-            source=source,
-            robot=robot,
             spec=spec,
-            prompt=resolved_prompt,
-            rollout_steps=args.rollout_steps,
-            record_steps=record_steps,
-            chunk_size=chunk_size,
-            fps=args.fps,
-            recorder=record_sink,
-            saved_actions=saved_actions,
-            log_chunk=log_chunk,
-            initial_snapshot=first_obs_snapshot,
-            state_builder=state_builder,
+            runtime_config=runtime_config,
+            plan=RolloutRuntimePlan(
+                hardware_name="xvla_piper_client",
+                prompt=resolved_prompt,
+                initial_joints=initial_joints,
+                recording_schema=make_slai_recording_schema(spec, args.control_mode),
+                state_builder=make_recording_state_builder(
+                    build_slai_recording_state,
+                    args.state_gripper,
+                ),
+                server_metadata=server_metadata,
+                runtime_event_callback=runtime_event_callback,
+                distribution_image_path=client_assets.distribution_image_path,
+                distribution_skip_reason=client_assets.skip_reason,
+            ),
         )
-        if args.execution_mode == "streaming":
-            metrics = run_temporal_smoothing_rollout(
-                **rollout_kwargs,
-                inference_rate=inference_rate,
-                latency_k=latency_k,
-                min_smooth_steps=min_smooth_steps,
-                buffer_max_chunks=buffer_max_chunks,
-            )
-        else:
-            metrics = run_chunk_sync_rollout(**rollout_kwargs)
-        if metrics.interrupted:
-            print("Interrupted by user; stopping rollout.", flush=True)
-        metrics_summary, written_metric_paths = save_rollout_metrics(
-            metrics,
-            metrics_json_path=args.metrics_json,
-            run_dir=recorder.run_dir if recorder is not None else None,
-            record_stem=recorder.record_stem if recorder is not None else None,
-        )
-        print(json.dumps({"rollout_metrics": metrics_summary}, indent=2), flush=True)
-        for metrics_path in written_metric_paths:
-            print(f"Rollout metrics saved to {metrics_path}", flush=True)
     finally:
-        ignore_recorder_signal_handlers(recorder)
-        if recorder is not None:
-            try:
-                action_path = save_recorded_actions(recorder, saved_actions, recorder.schema.action_names)
-                print(f"Actions saved to {action_path}", flush=True)
-            except Exception as exc:
-                print(f"Failed to save actions: {exc}", flush=True)
-            try:
-                output_path = recorder.finalize()
-                if output_path is not None:
-                    print(f"Recording saved to {output_path}", flush=True)
-                    for separate_video_path in recorder.separate_video_paths:
-                        print(f"Separate camera video saved to {separate_video_path}", flush=True)
-            except Exception as exc:
-                print(f"Failed to finalize recording: {exc}", flush=True)
-        if runtime_window is not None:
-            runtime_window.close()
-        if cameras is not None:
-            cameras.stop()
-        robot.disconnect()
+        close_policy_transport(client)
+
+
+def main() -> None:
+    run_once(build_parser().parse_args())
 
 
 if __name__ == "__main__":

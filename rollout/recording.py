@@ -357,10 +357,7 @@ class RolloutVideoRecorder:
 
 def save_recorded_actions(
     recorder: RolloutVideoRecorder,
-    saved_actions: list[np.ndarray] | None,
-    action_names: tuple[str, ...],
 ) -> Path:
-    del saved_actions, action_names
     action_path = recorder.run_dir / f"{recorder.record_stem}_actions.npz"
     if recorder.actions:
         actions = np.stack(recorder.actions, axis=0)

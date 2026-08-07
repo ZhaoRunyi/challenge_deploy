@@ -6,15 +6,19 @@ build-backend = "setuptools.build_meta"
 name = "challenge_deploy"
 version = "0.1.0"
 description = "ROS-free Piper deployment and HDF5 teleop data collection utilities for challenge_ws."
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
+    "h5py",
     "imageio",
     "imageio-ffmpeg",
+    "matplotlib",
     "msgpack",
     "numpy<2",
     "opencv-python==4.11.0.86",
-    "piper_sdk",
+    "Pillow",
+    "piper_sdk==0.6.1",
     "pyrealsense2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "python-can",
     "PyYAML",
     "scipy",
     "websockets",
@@ -44,4 +48,7 @@ py-modules = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["clients*", "hardware*", "rollout*", "teleop*"]
+include = ["clients*", "configs*", "data*", "hardware*", "rollout*", "teleop*"]
+
+[tool.setuptools.package-data]
+configs = ["*.yaml"]

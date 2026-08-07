@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import cv2
 import imageio.v3 as iio
 import numpy as np
 
@@ -180,7 +179,12 @@ def record_dataset_name_for_motus_prompt(spec: Any, prompt: str | None) -> str |
     return None
 
 
-def resolve_motus_distribution_image(spec: Any, prompt: str | None = None) -> tuple[Path | None, str | None]:
+def resolve_motus_distribution_image(
+    spec: Any,
+    prompt: str | None = None,
+    *,
+    artifacts_root: Path = ARTIFACTS_ROOT,
+) -> tuple[Path | None, str | None]:
     repo_id = record_repo_id_for_motus_distribution(spec)
     aliases: list[str] = []
     matched_task = record_dataset_name_for_motus_prompt(spec, prompt)
@@ -192,10 +196,14 @@ def resolve_motus_distribution_image(spec: Any, prompt: str | None = None) -> tu
             repo_id = f"{Path(str(dataset_root)).name}/{matched_task.removeprefix('Motus_')}"
     if repo_id is None:
         return None, "train config does not define dataset.params.repo_id"
-    distribution_image_path = find_distribution_image_path(repo_id, aliases=tuple(aliases))
+    distribution_image_path = find_distribution_image_path(
+        repo_id,
+        artifacts_root=artifacts_root,
+        aliases=tuple(aliases),
+    )
     if distribution_image_path is not None:
         return distribution_image_path, None
-    exact_path = repo_id_distribution_image_path(repo_id)
+    exact_path = repo_id_distribution_image_path(repo_id, artifacts_root=artifacts_root)
     return None, f"train distribution image not found for repo_id={repo_id!r}; exact path would be {exact_path}"
 
 
@@ -275,6 +283,7 @@ def prepare_motus_client_assets(
     need_distribution: bool,
     spec: Any,
     server_metadata: dict[str, Any] | None,
+    artifacts_root: Path = ARTIFACTS_ROOT,
 ) -> PreparedTrainAssets:
     server_metadata = server_metadata or {}
     task_names = spec.config.get("dataset", {}).get("task_name") or []
@@ -296,7 +305,11 @@ def prepare_motus_client_assets(
     distribution_image_path = None
     distribution_skip_reason = None
     if need_distribution:
-        distribution_image_path, distribution_skip_reason = resolve_motus_distribution_image(spec, prompt)
+        distribution_image_path, distribution_skip_reason = resolve_motus_distribution_image(
+            spec,
+            prompt,
+            artifacts_root=artifacts_root,
+        )
     return PreparedTrainAssets(
         prompt=prompt,
         prompt_source=prompt_source,
@@ -314,6 +327,7 @@ def prepare_client_assets(
     need_distribution: bool = False,
     spec: Any | None = None,
     server_metadata: dict[str, Any] | None = None,
+    artifacts_root: Path = ARTIFACTS_ROOT,
 ) -> PreparedTrainAssets:
     if client_kind == "motus":
         if spec is None:
@@ -324,6 +338,7 @@ def prepare_client_assets(
             need_distribution=need_distribution,
             spec=spec,
             server_metadata=server_metadata,
+            artifacts_root=artifacts_root,
         )
     if client_kind == "xvla":
         if spec is None:
@@ -335,6 +350,7 @@ def prepare_client_assets(
             need_distribution=need_distribution,
             aliases=distribution_aliases,
             default_prompt=default_prompt,
+            artifacts_root=artifacts_root,
         )
     if client_kind == "fastwam":
         if spec is None:
@@ -349,5 +365,6 @@ def prepare_client_assets(
             need_distribution=need_distribution,
             aliases=tuple(str(alias) for alias in distribution_aliases),
             default_prompt=getattr(spec, "prompt", None),
+            artifacts_root=artifacts_root,
         )
     raise ValueError(f"Unsupported client_kind: {client_kind}")

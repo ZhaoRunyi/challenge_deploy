@@ -1,6 +1,6 @@
 # Deploy Call Chain
 
-这个目录现在只保留六条最外层部署入口：
+六个真机入口保留原文件名和调用方式，但共享同一条 topology-aware rollout 骨架：
 
 - `run_openpi_client.py`
 - `run_xvla_client.py`
@@ -9,328 +9,235 @@
 - `run_dreamzero_client.py`
 - `run_fastwam_client.py`
 
-它们共享同一套真机运行时骨架：
+master 固定指搭载示教器、由操作者拖动的臂；slave 固定指搭载夹爪、执行目标的
+臂。公共 runtime 的 `robot.left/right` 始终是逻辑 slave。
 
-- `hardware/config.py`
-- `hardware/runtime.py`
-- `hardware/piper.py`
-- `hardware/realsense.py`
-- `hardware/schemas.py`
-- `hardware/conversions.py`
-- `hardware/constants.py`
-
-## 1. 总体调用链
+## 1. 公共入口链
 
 ```mermaid
 flowchart TD
-    A[run_openpi_client.py] --> R
-    B[run_xvla_client.py] --> R
-    C[run_openpi_sim_client.py] --> R
-    D[run_motus_client.py] --> R
-    E[run_dreamzero_client.py] --> R
-    F[run_fastwam_client.py] --> R
-
-    R[runner: parse args / load config / init runtime] --> CFG[hardware/config.py]
-    R --> OBS[hardware/runtime.py<br/>DualPiperObservationSource]
-    R --> ROBOT[hardware/piper.py<br/>DualPiperSystem]
-    R --> CAM[hardware/realsense.py<br/>RealSenseRig]
-
-    OBS --> SNAP[RobotSnapshot]
-    CAM --> SNAP
-    ROBOT --> SNAP
-
-    A --> OA[clients/openpi.py]
-    B --> XA[clients/xvla.py]
-    C --> SA[clients/openpi_sim.py]
-    D --> MA[clients/motus.py]
-    E --> DA[clients/dreamzero.py]
-    F --> FA[clients/fastwam.py]
-
-    OA --> WS1[openpi_client.websocket_client_policy]
-    XA --> WSX[xvla_client.websocket_client_policy]
-    SA --> WS1
-    MA --> WS2[Motus websocket_client_policy]
-    DA --> WSD[DreamZero websocket_client_policy]
-    FA --> HTTP[FastWAMHTTPPolicyClient]
-
-    WS1 --> S1[OpenPI server]
-    WSX --> SX[X-VLA server]
-    WS2 --> S2[Motus server]
-    WSD --> SD[DreamZero server]
-    HTTP --> SF[FastWAM HTTP server /infer]
-
-    A --> ROLL[rollout/execution.py]
-    B --> ROLL
-    D --> ROLL
-    E --> ROLL
-    F --> ROLL
-    C --> SIMROLL[run_openpi_sim_client.py internal rollout]
-
-    ROLL --> CMD[client.decode_action / client.command_action]
-    SIMROLL --> CMD
-
-    CMD --> ARM[SinglePiperArm.command_joint_positions<br/>or command_end_pose]
-    ARM --> SDK[piper_sdk.C_PiperInterface]
-    SDK --> CAN[CAN bus / Piper hardware]
+    R[六个 run_* runner] --> ARG[argparse / policy spec]
+    ARG --> CFG[hardware/config.py<br/>load + CLI overrides]
+    CFG --> PURE[validate_rollout_runtime_preflight<br/>schema / topology / required arm IDs]
+    PURE --> DRY{--dry-run?}
+    DRY -->|yes| PLAN[打印零 I/O JSON plan]
+    DRY -->|no| CLIENT[构造对应 client transport]
+    CLIENT --> RT[rollout/support.make_dual_piper_runtime]
+    RT --> FACTORY[hardware/factory.build_hardware]
+    FACTORY --> BACKEND{can_topology + --intervention}
+    BACKEND --> SHARED[shared backend]
+    BACKEND --> SLAVE[isolated slave-only backend]
+    BACKEND --> FOUR[isolated four-arm backend + gateway]
+    RT --> CAM[hardware/realsense.RealSenseRig]
+    RT --> SOURCE[hardware/runtime.DualPiperObservationSource]
+    SOURCE --> SESSION[rollout/support.run_interactive_configured_rollout]
+    SESSION --> CTRL[rollout/hardware_control<br/>authority adapter]
+    SESSION --> COORD[rollout/coordinator.DynamicRolloutCoordinator]
+    SESSION --> UI[rollout/interactive + rollout/session]
+    COORD --> STATE[rollout/authority state machine]
+    COORD --> INFER[async inference lane + epoch fence]
+    COORD --> CMD[clients/base.decode + command_decoded]
+    CMD --> ROBOT[shared/isolated robot facade]
+    SESSION --> OUT{requested outputs}
+    OUT --> REC[--record/--recording diagnostics]
+    OUT --> HDF[--save rollout/hdf5.py]
+    SESSION --> EVENT[JSONL runtime events]
 ```
 
-## 2. OpenPI 真机链
+`--dry-run` 在模型 server、CAN、相机、record window 和 HDF5 构造前返回。真实
+运行先做纯配置 preflight，再通过 factory 选择一次 backend；runner 和具体 client
+不散布 topology 分支。
+
+## 2. Topology factory
+
+| 配置 | 必需物理臂 | backend | gateway | 动态切换 |
+|---|---:|---|---|---|
+| `shared` | 当前两侧 shared CAN | `DualPiperSystem` | 无 | 不支持 |
+| `isolated`，无 `--intervention` | `slave_left/right` | `IsolatedSlaveSystem` | 无 | 不支持 |
+| `isolated --intervention` | 四臂 | `IsolatedFourArmSystem` | 双侧 semantic gateway | 支持 |
+
+shared 与 `--intervention` 的组合会在构造 CAN 和相机前拒绝。isolated 普通
+rollout 只验证、打开和控制两台 slave；master CAN 可以不存在。只有启用
+`--intervention` 才要求四个 CAN 名与 USB serial 唯一，并构造四臂。
+
+### shared golden path
+
+```mermaid
+flowchart LR
+    IPC[IPC] --> UL[USB-to-CAN left]
+    IPC --> UR[USB-to-CAN right]
+    UL --> LB[left shared CAN]
+    UR --> RB[right shared CAN]
+    LB --- ML[master_left FA]
+    LB --- SL[slave_left FC]
+    RB --- MR[master_right FA]
+    RB --- SR[slave_right FC]
+    ML -->|0x151 / 0x155-0x157 / 0x159| SL
+    MR -->|0x151 / 0x155-0x157 / 0x159| SR
+```
+
+同侧 master/slave 使用同一个 CAN 名。`piper_sdk.C_PiperInterface` 按 CAN 名
+单例，因此静态遥操的 master-control 与 slave-feedback reader 是同一接收线程和
+缓存上的两个逻辑视图。该分支保持已有连接、命令和断开顺序，不做 serial gate、
+角色判断、`0x470` 写入或 host relay。
+
+### isolated slave-only rollout
+
+```mermaid
+flowchart LR
+    IPC[IPC + coordinator] --> CSL[USB-to-CAN piper_sl]
+    IPC --> CSR[USB-to-CAN piper_sr]
+    CSL --> SL[slave_left FC]
+    CSR --> SR[slave_right FC]
+```
+
+模型目标只下发到两台 slave。公共 observation 和 client 仍读取
+`robot.left/right`，不会构造 master placeholder。
+
+### isolated four-arm dynamic runtime
+
+```mermaid
+flowchart LR
+    IPC[IPC + single command supervisor] --> CML[piper_ml]
+    IPC --> CMR[piper_mr]
+    IPC --> CSL[piper_sl]
+    IPC --> CSR[piper_sr]
+    CML --> ML[master_left]
+    CMR --> MR[master_right]
+    CSL --> SL[slave_left]
+    CSR --> SR[slave_right]
+    ML --> GL[left semantic decoder]
+    MR --> GR[right semantic decoder]
+    GL --> SUP[command supervisor]
+    GR --> SUP
+    SUP --> SL
+    SUP --> SR
+```
+
+ROLLOUT 中四台臂为 FC，`IsolatedFourArmSystem` 将同一个 canonical 双臂目标并发
+提交给对应 master 和 slave，client observation 仍只使用 slave。INTERVENE 中
+master 切到 FA，gateway 只发布完整、新鲜、skew 合格的控制帧组，由唯一
+supervisor 提交到 FC slave。每个 generation 的首次成对提交还会以 slave seed
+执行 7D no-jump gate（6 个关节和夹爪），失败会在任何 slave CAN 写入前同时
+fault 两侧。角色先观察后设置；`0x470` 只在角色错误或不确定时按事务写入，
+不周期刷新。切换不写 MIT PD、末端负载、安装方向、设零或 reset。
+
+## 3. ROLLOUT↔INTERVENE 状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> STARTING
+    STARTING --> IDLE
+    IDLE --> TO_ROLLOUT: c / start episode
+    TO_ROLLOUT --> ROLLOUT_REACQUIRE: hold/role transaction + resync
+    ROLLOUT_REACQUIRE --> ROLLOUT_ACTIVE: fresh post-switch chunk
+    ROLLOUT_ACTIVE --> TO_INTERVENE: i
+    TO_INTERVENE --> INTERVENE_ACTIVE: align + FC→FA + gateway ready
+    INTERVENE_ACTIVE --> TO_ROLLOUT: r
+    ROLLOUT_ACTIVE --> EPISODE_PAUSED: s or step limit
+    INTERVENE_ACTIVE --> EPISODE_PAUSED: s or step limit
+    EPISODE_PAUSED --> TO_ROLLOUT: x from ROLLOUT
+    EPISODE_PAUSED --> TO_INTERVENE: x from INTERVENE
+    EPISODE_PAUSED --> IDLE: stop episode
+    STARTING --> FAULT
+    ROLLOUT_REACQUIRE --> FAULT
+    ROLLOUT_ACTIVE --> FAULT
+    TO_INTERVENE --> FAULT
+    INTERVENE_ACTIVE --> FAULT
+    TO_ROLLOUT --> FAULT
+```
+
+状态机是唯一命令授权者。每次 episode 或控制权切换都会提升 epoch，并清空 action
+buffer、旧 gripper transition、EE unwrap 和 client session 状态。推理 request、
+response、pop 和 dispatch 都携带并复核 epoch/request/session；切换前仍在途的结果
+即使晚到也不能提交，新 epoch 的首个 chunk 不与旧 chunk 平滑。
+
+进入 INTERVENE 前 slave 先按 fresh feedback hold，master 在 FC 下通过现有路径
+对齐，再事务性切到 FA；完整 master 帧族准备好后才开始转发。返回 ROLLOUT 时
+先在帧组边界停止 gateway，slave hold，再将 master 切回 FC、对齐到 slave，最后
+创建新 session 并等待切换后的 fresh observation。host 不设置 qpos/qvel、初始差值、
+settle 或镜像误差阈值；机械运动限制由 Piper SDK/固件负责。
+
+`streaming` 与 `chunk_sync` 都使用异步 inference worker，因此 `i/r/s/q` 不会被
+网络调用阻塞：
+
+- `streaming` 按配置 cadence 请求，对重叠 chunk 做 latency trim 和 temporal
+  smoothing；
+- `chunk_sync` 等现有 buffer 耗尽后再接收下一 chunk，不跨 chunk smoothing。
+
+推理 timeout、断连或空 chunk 会在 `ROLLOUT_REACQUIRE` 中 hold 并重试；NaN、
+Inf 或维度错误进入 latched `FAULT`。
+
+## 4. Client 适配与命令提交
+
+| runner | adapter | transport | action 特点 |
+|---|---|---|---|
+| OpenPI | `clients/openpi.py` | 本地 `clients.websocket_client_policy.WebsocketClientPolicy` | joints 或 EE |
+| X-VLA | `clients/xvla.py` | 同一本地 websocket transport | 默认 EE |
+| OpenPI-sim | `clients/openpi_sim.py` | 同一本地 websocket transport | 固定 14D joints+gripper01 |
+| Motus | `clients/motus.py` | 同一本地 websocket transport | 归一化 chunk，joints 或 EE |
+| DreamZero | `clients/dreamzero.py` | 同一本地 websocket transport | joints 或 EE |
+| FastWAM | `clients/fastwam.py` | HTTP `POST /infer` | 14D joints+gripper action chunk |
+
+六个 adapter 都进入同一个 coordinator，不再有 OpenPI-sim 私有 rollout loop，也不
+从 runner 直接调用 legacy `rollout/execution.run_*_rollout`。
 
 ```mermaid
 flowchart TD
-    A[run_openpi_client.py] --> A1[load_piper_policy_spec]
-    A --> A2[prepare_lerobot_assets / resolve_prompt]
-    A --> A3[OpenPiPiperClient]
-    A --> A4[_make_runtime]
-
-    A4 --> A5[DualPiperSystem]
-    A4 --> A6[RealSenseRig]
-    A4 --> A7[DualPiperObservationSource]
-
-    A --> A8[robot.connect]
-    A --> A9[cameras.start]
-    A --> A10[wait_until_ready]
-    A --> A11[robot.enable]
-    A --> A12[robot.move_to_joint_positions resolved init joints]
-    A --> A13[first_obs_snapshot = source.capture_snapshot]
-
-    A13 --> A14{execution_mode}
-    A14 -->|chunk_sync| A15[openpi_rollout.run_chunk_sync_rollout]
-    A14 -->|streaming| A16[openpi_rollout.run_temporal_smoothing_rollout]
-
-    A15 --> A17[source.capture_snapshot]
-    A16 --> A17
-    A17 --> A18[OpenPiPiperClient.build_payload]
-    A18 --> A19[build_full_piper_state]
-    A18 --> A20[build_policy_payload]
-    A20 --> A21[OpenPI websocket client]
-    A21 --> A22[OpenPI serve_policy.py]
-    A22 --> A23[SLAIPiperInputs]
-    A23 --> A24[policy outputs action chunk]
-
-    A24 --> A25[OpenPiPiperClient.decode_action]
-    A25 --> A26{control_mode}
-    A26 -->|joints| A27[left/right arm.command_joint_positions]
-    A26 -->|ee_pose| A28[left/right arm.command_end_pose]
-
-    A27 --> A29[piper_sdk JointCtrl + GripperCtrl]
-    A28 --> A30[piper_sdk EndPoseCtrl + GripperCtrl]
+    SNAP[DualPiperObservationSource.capture_snapshot] --> BUILD[client.build_payload]
+    BUILD --> SERVER[websocket or HTTP inference server]
+    SERVER --> CHUNK[action chunk]
+    CHUNK --> FENCE[epoch/request/session validation]
+    FENCE --> DECODE[client.decode_action]
+    DECODE --> VALIDATE[validate_decoded_action_for_robot]
+    VALIDATE --> COMMAND[clients/base.command_decoded]
+    COMMAND --> BI{robot has bimanual batch API?}
+    BI -->|yes| BATCH[command_bimanual_joint_positions<br/>or command_bimanual_end_poses]
+    BI -->|no| SIDE[left/right SinglePiperArm commands]
+    BATCH --> SDK[piper_sdk MotionCtrl_2 + Joint/EndPoseCtrl + GripperCtrl]
+    SIDE --> SDK
 ```
 
-## 3. OpenPI Sim 真机链
+isolated facade 用 bimanual API 并发提交两侧或四臂，避免 runner/client 自行拆分
+拓扑。shared `DualPiperSystem` 沿用原左右 command 路径。
 
-```mermaid
-flowchart TD
-    B[run_openpi_sim_client.py] --> B1[load_openpi_sim_policy_spec]
-    B --> B2[resolve_prompt]
-    B --> B3[OpenPiSimPiperClient]
-    B --> B4[_make_runtime]
+## 5. 交互、HDF5 与诊断输出
 
-    B4 --> B5[DualPiperSystem]
-    B4 --> B6[RealSenseRig]
-    B4 --> B7[DualPiperObservationSource]
+硬件、相机和模型 client 在多 episode session 中只连接一次：
 
-    B --> B8[robot.enable]
-    B --> B9[robot.move_to_joint_positions initial_joints]
-    B --> B10[first_obs_snapshot with gripper backfill]
-    B --> B11[run_openpi_sim_client.run_chunk_sync_rollout]
+- idle：`c` 开始，`q` 退出；有 writer 时 `k` 终止最老 writer；
+- active：`s` 停止；动态模式下 `i`→INTERVENE、`r`→ROLLOUT；
+- 达到步数上限：`x` 增加 `ceil(initial / 2)`，或 `s` 停止；`0` 为无限；
+- `--save` 的正常 episode 停止后：`c` 保存 HDF5，`d` 丢弃 HDF5。
 
-    B11 --> B12[source.capture_snapshot]
-    B12 --> B13[_snapshot_with_grippers]
-    B13 --> B14[OpenPiSimPiperClient.build_payload]
-    B14 --> B15[build_configured_piper_state fixed 14D]
-    B14 --> B16[224x224 resized three-view images]
-    B16 --> B17[OpenPI websocket client]
-    B17 --> B18[OpenPI sim server]
-    B18 --> B19[EmbodiChain action chunk]
+`--record/--recording` 是诊断视频、动作/状态 NPZ、frame1 和指标；`--save` 是训练
+HDF5，两者独立。`--record-steps` 只限制诊断捕获，不停止控制或 HDF5。
 
-    B19 --> B20[OpenPiSimPiperClient.decode_action]
-    B20 --> B21[sim_gripper_to_piper]
-    B21 --> B22[left/right arm.command_joint_positions]
-    B22 --> B23[piper_sdk JointCtrl + GripperCtrl]
-```
+rollout HDF5 只记录成功提交的 `ROLLOUT_ACTIVE`/`INTERVENE_ACTIVE` tick，
+`/action` 是实际 canonical 目标，`/is_intervention` 与同一 action 对齐。writer pool
+最多两个 `spawn` 进程，没有第三条等待队列；每个 writer 先写同目录唯一 `.tmp`，
+成功后无覆盖地原子发布。
 
-## 4. Motus 真机链
+## 6. Fault 与物理安全边界
 
-```mermaid
-flowchart TD
-    C[run_motus_client.py] --> C1[load_motus_policy_spec]
-    C --> C2[MotusPiperClient]
-    C --> C3[get_server_metadata / resolve prompt]
-    C --> C4[_make_runtime]
+任一侧硬件故障或持续镜像误差会让整个 runtime 进入 `FAULT`，停止新模型命令、
+gateway 和 pending action，不做单侧降级。仍可通信的 FC 臂会尽力按当前反馈
+hold；INTERVENE 中 FA master 保持可回拖，slave 保持最后目标。实现不以
+reset/disable 作为切换或故障处理手段。
 
-    C4 --> C5[DualPiperSystem]
-    C4 --> C6[RealSenseRig]
-    C4 --> C7[DualPiperObservationSource]
+软件不能让已经丢失 CAN 的臂接收新 hold，也不能在机械臂或电机断电后保证位置。
+INTERVENE 中工控机或进程消失时，FA master 同样不能保证刚性保持。真机验收必须
+从机械支撑下的单臂、单对空载开始。
 
-    C --> C8[robot.enable]
-    C --> C9[robot.move_to_joint_positions resolved init joints]
-    C --> C10{execution_mode}
-    C10 -->|chunk_sync| C11[openpi_rollout.run_chunk_sync_rollout]
-    C10 -->|streaming| C12[openpi_rollout.run_temporal_smoothing_rollout]
+## 7. 相关实现
 
-    C11 --> C13[source.capture_snapshot]
-    C12 --> C13
-    C13 --> C14[MotusPiperClient.build_payload]
-    C14 --> C15[build_policy_frame T-shape image]
-    C14 --> C16[build_normalized_policy_state]
-    C16 --> C17[normalize by stat.json]
-    C17 --> C18[Motus websocket client]
-    C18 --> C19[MotusRemotePolicy]
-    C19 --> C20[normalized action chunk]
-
-    C20 --> C21[client denormalize actions]
-    C21 --> C22[MotusPiperClient.decode_action]
-    C22 --> C23{binary gripper transition?}
-    C23 -->|yes| C24[SlaiPiperClient.command_transition_step]
-    C23 -->|no| C25[SlaiPiperClient.command_decoded]
-
-    C24 --> C26[arm.command_joint_positions / command_end_pose]
-    C25 --> C26
-    C26 --> C27[piper_sdk JointCtrl or EndPoseCtrl + GripperCtrl]
-```
-
-
-## 5. DreamZero 真机链
-
-```mermaid
-flowchart TD
-    D[run_dreamzero_client.py] --> D1[load_dreamzero_policy_spec]
-    D --> D2[DreamZeroPiperClient]
-    D --> D3[get_server_metadata / resolve prompt]
-    D --> D4[make_dual_piper_runtime]
-
-    D4 --> D5[DualPiperSystem]
-    D4 --> D6[RealSenseRig]
-    D4 --> D7[DualPiperObservationSource]
-
-    D --> D8[robot.enable]
-    D --> D9[robot.move_to_joint_positions resolved init joints]
-    D --> D10{execution_mode}
-    D10 -->|chunk_sync| D11[rollout/execution.run_chunk_sync_rollout]
-    D10 -->|streaming| D12[rollout/execution.run_temporal_smoothing_rollout]
-
-    D11 --> D13[source.capture_snapshot]
-    D12 --> D13
-    D13 --> D14[DreamZeroPiperClient.build_payload]
-    D14 --> D15[build_full_piper_state]
-    D14 --> D16[three RGB images]
-    D16 --> D17[DreamZero websocket client]
-    D17 --> D18[DreamZero server]
-    D18 --> D19[action chunk]
-
-    D19 --> D20[SlaiPiperClient.decode_action]
-    D20 --> D21{binary gripper transition?}
-    D21 -->|yes| D22[SlaiPiperClient.command_transition_step]
-    D21 -->|no| D23[SlaiPiperClient.command_decoded]
-    D22 --> D24[arm.command_joint_positions / command_end_pose]
-    D23 --> D24
-    D24 --> D25[piper_sdk JointCtrl or EndPoseCtrl + GripperCtrl]
-```
-
-
-## 6. FastWAM 真机链
-
-```mermaid
-flowchart TD
-    F[run_fastwam_client.py] --> F1[load_fastwam_policy_spec]
-    F --> F2[FastWAMPiperClient]
-    F --> F3[HTTP /infer server metadata is empty]
-    F --> F4[make_dual_piper_runtime]
-
-    F4 --> F5[DualPiperSystem]
-    F4 --> F6[RealSenseRig]
-    F4 --> F7[DualPiperObservationSource]
-
-    F --> F8[robot.enable]
-    F --> F9[robot.move_to_joint_positions resolved init joints]
-    F --> F10{execution_mode}
-    F10 -->|chunk_sync| F11[rollout/execution.run_chunk_sync_rollout]
-    F10 -->|streaming| F12[rollout/execution.run_temporal_smoothing_rollout]
-
-    F11 --> F13[source.capture_snapshot]
-    F12 --> F13
-    F13 --> F14[FastWAMPiperClient.build_payload]
-    F14 --> F15[build_fastwam_proprio 32D all-state rot6d]
-    F14 --> F16[base64 PNG images cam_high / left wrist / right wrist]
-    F14 --> F17[instruction + action_horizon + optional denoising args]
-    F17 --> F18[FastWAMHTTPPolicyClient POST /infer]
-    F18 --> F19[FastWAM server]
-    F19 --> F20[action chunk 14D joints rad + gripper 0-1]
-
-    F20 --> F21[SlaiPiperClient.decode_action]
-    F21 --> F22{binary gripper transition?}
-    F22 -->|yes| F23[SlaiPiperClient.command_transition_step]
-    F22 -->|no| F24[SlaiPiperClient.command_decoded]
-    F23 --> F25[left/right arm.command_joint_positions]
-    F24 --> F25
-    F25 --> F26[piper_sdk JointCtrl + GripperCtrl]
-```
-
-FastWAM 的 server 端由 `baselines/fastwam/scripts/server.py` 管理模型加载和归一化。deploy client 发送当前帧三路 RGB、32D raw Piper proprio、`instruction`，并按响应中的 14D joint-radian + gripper 0-1 action chunk 控制真机。开启 `--record` 时会记录本地相机视频、逐帧 action/state/time 和 frame1，并在 finalize 后像 Motus/DreamZero 一样尝试拉取 server 缓存的 predicted video；FastWAM server 默认不生成 predicted video，只有以 `--save-video-pred` 启动时才进入 `infer_joint` 视频生成分支。推理始终发送三路当前帧图像作为观测。默认 `--state-gripper policy --action-gripper policy` 对齐训练侧 0-1 gripper 开度，并在硬件层与米制开口互转。
-
-所有推理入口都使用 `--state-gripper` / `--action-gripper` 显式选择 gripper 编码。旧 gripper 数据兼容写法是 `--state-gripper old --action-gripper old`；`--old_gripper` 已移除。X-VLA 默认 `meters/binary`，FastWAM 默认 `policy/policy`，其他入口默认 `policy/policy`。
-
-## 7. 共享硬件层
-
-```mermaid
-flowchart TD
-    S[DualPiperObservationSource.capture_snapshot] --> I[RealSenseRig.capture]
-    S --> J[DualPiperSystem.read_state]
-
-    J --> L[left SinglePiperArm.read_state]
-    J --> R[right SinglePiperArm.read_state]
-
-    L --> SDK1[C_PiperInterface.GetArmJointMsgs]
-    L --> SDK2[C_PiperInterface.GetArmGripperMsgs]
-    L --> SDK3[C_PiperInterface.GetArmEndPoseMsgs]
-    L --> SDK4[C_PiperInterface.GetArmStatus]
-
-    R --> SDK1
-    R --> SDK2
-    R --> SDK3
-    R --> SDK4
-
-    C[command_action] --> Q1[SinglePiperArm.command_joint_positions]
-    C --> Q2[SinglePiperArm.command_end_pose]
-
-    Q1 --> QC1[MotionCtrl_2]
-    Q1 --> QC2[JointCtrl]
-    Q1 --> QC3[GripperCtrl]
-
-    Q2 --> QC4[MotionCtrl_2]
-    Q2 --> QC5[EndPoseCtrl]
-    Q2 --> QC6[GripperCtrl]
-```
-
-## 8. 当前保留范围
-
-当前 `challenge_deploy/` 只围绕下面这些文件保留：
-
-- `run_openpi_client.py`
-- `run_xvla_client.py`
-- `run_openpi_sim_client.py`
-- `run_motus_client.py`
-- `run_dreamzero_client.py`
-- `run_fastwam_client.py`
-- `configs/dual_piper_example.yaml`
-- `docs/deploy_call_chain.md`
-- `rollout/buffer.py`
-- `hardware/config.py`
-- `hardware/constants.py`
-- `hardware/conversions.py`
-- `rollout/assets.py`
-- `clients/base.py`
-- `clients/motus.py`
-- `clients/dreamzero.py`
-- `clients/fastwam.py`
-- `clients/openpi.py`
-- `rollout/execution.py`
-- `clients/openpi_sim.py`
-- `clients/xvla.py`
-- `hardware/piper.py`
-- `hardware/realsense.py`
-- `rollout/recording.py`
-- `rollout/metrics.py`
-- `hardware/runtime.py`
-- `hardware/schemas.py`
+- 配置与 topology：`hardware/config.py`、`hardware/factory.py`、
+  `hardware/topology.py`
+- shared/isolated hardware：`hardware/piper.py`、`hardware/isolated.py`
+- semantic gateway：`hardware/linkage_gateway.py`
+- observation/cameras：`hardware/runtime.py`、`hardware/realsense.py`
+- authority/session：`rollout/authority.py`、`rollout/hardware_control.py`、
+  `rollout/coordinator.py`、`rollout/interactive.py`、`rollout/session.py`
+- rollout HDF5/events：`rollout/hdf5.py`、`rollout/events.py`
+- client common path：`clients/base.py`、`clients/websocket_client_policy.py`
+- static HDF5 teleop：`run_hdf5_teleop_collect.py`、`teleop/hdf5_teleop.py`

@@ -24,6 +24,7 @@ class HDF5TeleopSaveConfig:
     record_video: bool = False
     save_separate_videos: bool = False
     fps: float = 30.0
+    record_output_dir: Path | None = None
 
 
 class BaseDataWorker:
@@ -105,13 +106,15 @@ class HDF5TeleopDataWorker(BaseDataWorker):
         record_video_path = None
         sep_video_paths = []
         if self.config.record_video:
+            record_output_dir = self.config.record_output_dir or output_path.parent
+            record_output_dir.mkdir(parents=True, exist_ok=True)
             record_video_path, sep_video_paths = save_hdf5_teleop_record_video(
                 frames=item.frames,
-                output_dir=output_path.parent,
+                output_dir=record_output_dir,
                 fps=self.config.fps,
                 name_prefix=f"episode_{item.episode_index}",
                 action_from_state=self.config.action_from_state,
-                output_path=output_path.with_name(f"episode_{item.episode_index}_video.mp4"),
+                output_path=record_output_dir / f"episode_{item.episode_index}_video.mp4",
                 save_separate_videos=self.config.save_separate_videos,
             )
         return self.saved_result(
@@ -129,10 +132,12 @@ class HDF5TeleopDataWorker(BaseDataWorker):
         record_video_path = None
         sep_video_paths = []
         if self.config.record_video:
-            record_video_path = item.episode_path.with_name(f"episode_{item.episode_index}_video.mp4")
+            record_output_dir = self.config.record_output_dir or item.episode_path.parent
+            record_video_path = record_output_dir / f"episode_{item.episode_index}_video.mp4"
             if self.config.save_separate_videos:
                 sep_video_paths = [
-                    item.episode_path.with_name(f"episode_{item.episode_index}_{safe_filename_part(camera_name)}.mp4")
+                    record_output_dir
+                    / f"episode_{item.episode_index}_{safe_filename_part(camera_name)}.mp4"
                     for camera_name in self.config.camera_names
                 ]
         return {

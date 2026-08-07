@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from openpi.training import config as openpi_config
-from openpi_client import websocket_client_policy
+try:
+    from openpi.training import config as openpi_config
+except ModuleNotFoundError as error:
+    openpi_config = None
+    OPENPI_IMPORT_ERROR = error
+else:
+    OPENPI_IMPORT_ERROR = None
 
 from hardware.schemas import RobotSnapshot
 from . import slai_piper_policy
+from . import websocket_client_policy
 from .base import (
     ActionGripperEncoding,
     ControlMode,
@@ -14,6 +20,7 @@ from .base import (
     StateGripperEncoding,
     build_full_piper_state,
     image_to_rgb,
+    quiet_close_policy_transport_on_construction_error,
 )
 from .specs import SlaiPolicySpec, slai_policy_spec_summary
 
@@ -23,6 +30,10 @@ class PiperPolicySpec(SlaiPolicySpec):
 
 
 def load_piper_policy_spec(train_config_name: str) -> PiperPolicySpec:
+    if openpi_config is None:
+        raise RuntimeError(
+            "OpenPI train-config support requires the OpenPI source package in this environment"
+        ) from OPENPI_IMPORT_ERROR
     train_config = openpi_config.get_config(train_config_name)
     data_config = train_config.data
     missing = [name for name in ("state_space", "action_space", "image_space") if not hasattr(data_config, name)]
@@ -86,18 +97,22 @@ class OpenPiPiperClient(SlaiPiperClient):
     ) -> None:
         spec = load_piper_policy_spec(train_config_name)
         policy_client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
-        super().__init__(
-            spec=spec,
-            policy_client=policy_client,
-            control_mode=control_mode,
-            joint_speed_percent=joint_speed_percent,
-            ee_speed_percent=ee_speed_percent,
-            gripper_threshold=gripper_threshold,
-            gripper_lower=gripper_lower,
-            gripper_upper=gripper_upper,
-            state_gripper_encoding=state_gripper_encoding,
-            action_gripper_encoding=action_gripper_encoding,
-        )
+        try:
+            super().__init__(
+                spec=spec,
+                policy_client=policy_client,
+                control_mode=control_mode,
+                joint_speed_percent=joint_speed_percent,
+                ee_speed_percent=ee_speed_percent,
+                gripper_threshold=gripper_threshold,
+                gripper_lower=gripper_lower,
+                gripper_upper=gripper_upper,
+                state_gripper_encoding=state_gripper_encoding,
+                action_gripper_encoding=action_gripper_encoding,
+            )
+        except BaseException:
+            quiet_close_policy_transport_on_construction_error(policy_client)
+            raise
 
     def build_payload(self, snapshot: RobotSnapshot, prompt: str | None = None, **kwargs: Any) -> dict[str, Any]:
         del kwargs

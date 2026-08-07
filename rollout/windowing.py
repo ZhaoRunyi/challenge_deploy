@@ -5,12 +5,12 @@ import math
 import select
 import signal
 import sys
+import tkinter as tk
 import time
 from typing import Any, Mapping
 
 import cv2
 import numpy as np
-import tkinter as tk
 from PIL import Image, ImageTk
 
 from .recording import (

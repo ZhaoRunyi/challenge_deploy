@@ -17,11 +17,14 @@ from . import websocket_client_policy
 from .base import (
     ActionGripperEncoding,
     ControlMode,
+    PolicySessionCapability,
+    PolicyResponseFormatError,
     SlaiPiperClient,
     StateGripperEncoding,
     action_array_from_response,
     build_configured_piper_state as build_slai_configured_piper_state,
     image_to_rgb,
+    quiet_close_policy_transport_on_construction_error,
 )
 from .specs import space_summary
 
@@ -339,6 +342,8 @@ def build_policy_payload(
 
 
 class MotusPiperClient(SlaiPiperClient):
+    SESSION_CAPABILITY = PolicySessionCapability.SESSION_ID
+
     def __init__(
         self,
         config_path: str | Path,
@@ -364,21 +369,25 @@ class MotusPiperClient(SlaiPiperClient):
         self.num_inference_timesteps = num_inference_timesteps
         spec = load_motus_policy_spec(config_path)
         policy_client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
-        super().__init__(
-            spec=spec,
-            policy_client=policy_client,
-            control_mode=control_mode,
-            joint_speed_percent=joint_speed_percent,
-            ee_speed_percent=ee_speed_percent,
-            gripper_threshold=gripper_threshold,
-            gripper_lower=gripper_lower,
-            gripper_upper=gripper_upper,
-            state_gripper_encoding=state_gripper_encoding,
-            action_gripper_encoding=action_gripper_encoding,
-            gripper_effort=gripper_effort,
-            gripper_action_frames=gripper_action_frames,
-        )
-        self.validate_server_metadata()
+        try:
+            super().__init__(
+                spec=spec,
+                policy_client=policy_client,
+                control_mode=control_mode,
+                joint_speed_percent=joint_speed_percent,
+                ee_speed_percent=ee_speed_percent,
+                gripper_threshold=gripper_threshold,
+                gripper_lower=gripper_lower,
+                gripper_upper=gripper_upper,
+                state_gripper_encoding=state_gripper_encoding,
+                action_gripper_encoding=action_gripper_encoding,
+                gripper_effort=gripper_effort,
+                gripper_action_frames=gripper_action_frames,
+            )
+            self.validate_server_metadata()
+        except BaseException:
+            quiet_close_policy_transport_on_construction_error(policy_client)
+            raise
 
     @property
     def config_path(self) -> str:
@@ -428,6 +437,11 @@ class MotusPiperClient(SlaiPiperClient):
     ) -> dict[str, Any]:
         response = self.client.infer(self.build_payload(snapshot, prompt, session_id=session_id, t5_embeds=t5_embeds))
         actions = action_array_from_response(response, keys=("actions", "action"))
+        if actions.ndim not in (1, 2) or actions.shape[-1] != self.spec.action_dim:
+            raise PolicyResponseFormatError(
+                "Motus response action shape must be "
+                f"({self.spec.action_dim},) or (*, {self.spec.action_dim}), got {actions.shape}"
+            )
         response = dict(response)
         response["normalized_actions"] = actions
         response["actions"] = denormalize_actions(actions, self.spec.action_min, self.spec.action_max).astype(np.float64)

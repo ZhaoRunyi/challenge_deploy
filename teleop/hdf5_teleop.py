@@ -1,23 +1,28 @@
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import os
 import threading
 import time
 from typing import Any, Callable, Sequence
+from uuid import uuid4
 
 import cv2
 import h5py
 import imageio
 import matplotlib
+
 matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from hardware.constants import CAMERA_NAMES, PIPER_GRIPPER_FULL_OPEN_METERS
+from hardware.constants import PIPER_GRIPPER_FULL_OPEN_METERS
 from hardware.piper import SinglePiperArm
 from hardware.piper import DualPiperSystem
 from hardware.realsense import RealSenseRig
@@ -34,9 +39,9 @@ class TimestampedValue:
 @dataclass(slots=True)
 class HDF5TeleopCaptureFrame:
     timestamp_s: float
-    puppet_state: DualPiperState
+    slave_state: DualPiperState
     master_state: DualPiperState
-    puppet_pose_state: DualPiperState
+    slave_pose_state: DualPiperState
     images: dict[str, np.ndarray]
     depth_images: dict[str, np.ndarray]
     source_timestamps: dict[str, float]
@@ -60,6 +65,33 @@ class HDF5TeleopLoadedEpisode:
     images: dict[str, list[np.ndarray]]
     depth_images: dict[str, list[np.ndarray]]
     source_timestamps: dict[str, np.ndarray]
+    is_intervention: np.ndarray | None = None
+
+
+@contextmanager
+def atomic_hdf5_file(
+    path: Path,
+    *,
+    temporary_path: Path | None = None,
+    **kwargs: Any,
+):
+    """Write next to the destination, then publish without replacing a file."""
+    path = Path(path)
+    if temporary_path is None:
+        temporary_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    else:
+        temporary_path = Path(temporary_path)
+        if temporary_path == path:
+            raise ValueError("temporary_path must differ from the destination")
+        if temporary_path.parent != path.parent:
+            raise ValueError("temporary_path must be in the destination directory")
+    try:
+        with h5py.File(temporary_path, "x", **kwargs) as root:
+            yield root
+        os.link(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 
 class AsyncSampleQueue:
@@ -314,27 +346,33 @@ class HDF5TeleopCollectionSource:
         self,
         *,
         master_robot: DualPiperSystem,
-        puppet_robot: DualPiperSystem,
+        slave_robot: DualPiperSystem,
         cameras: RealSenseRig,
         arm_sample_hz: float = 200.0,
         queue_maxlen: int = 2000,
+        health_check: Callable[[], None] | None = None,
+        max_sample_age_s: float | None = None,
     ) -> None:
         self.master_robot = master_robot
-        self.puppet_robot = puppet_robot
+        self.slave_robot = slave_robot
         self.cameras = cameras
         self.arm_sample_hz = arm_sample_hz
+        self.health_check = health_check
+        if max_sample_age_s is not None and max_sample_age_s <= 0.0:
+            raise ValueError("max_sample_age_s must be positive when provided")
+        self.max_sample_age_s = max_sample_age_s
         self.camera_names = tuple(cameras.serials)
         self.color_queues = {camera_name: AsyncSampleQueue(maxlen=queue_maxlen) for camera_name in self.camera_names}
         self.depth_queues = {camera_name: AsyncSampleQueue(maxlen=queue_maxlen) for camera_name in self.camera_names}
         self.arm_joint_queues = {
             "master_left": AsyncSampleQueue(maxlen=queue_maxlen),
             "master_right": AsyncSampleQueue(maxlen=queue_maxlen),
-            "puppet_left": AsyncSampleQueue(maxlen=queue_maxlen),
-            "puppet_right": AsyncSampleQueue(maxlen=queue_maxlen),
+            "slave_left": AsyncSampleQueue(maxlen=queue_maxlen),
+            "slave_right": AsyncSampleQueue(maxlen=queue_maxlen),
         }
-        self.puppet_pose_queues = {
-            "puppet_left": AsyncSampleQueue(maxlen=queue_maxlen),
-            "puppet_right": AsyncSampleQueue(maxlen=queue_maxlen),
+        self.slave_pose_queues = {
+            "slave_left": AsyncSampleQueue(maxlen=queue_maxlen),
+            "slave_right": AsyncSampleQueue(maxlen=queue_maxlen),
         }
         self.stop_event = threading.Event()
         self.threads: list[threading.Thread] = []
@@ -345,6 +383,30 @@ class HDF5TeleopCollectionSource:
         self.selected_history: list[dict[str, float]] = []
         self.stationary_intervals: list[dict[str, float]] = []
         self.started = False
+        self.ready_once = False
+
+    def require_healthy(self) -> None:
+        if self.health_check is not None:
+            self.health_check()
+        if not self.ready_once or self.max_sample_age_s is None:
+            return
+        now_s = time.time()
+        camera_queues = dict(self.color_queues)
+        if self.cameras.enable_depth:
+            camera_queues.update(
+                {f"depth_{name}": queue for name, queue in self.depth_queues.items()}
+            )
+        stale = []
+        for name, sample_queue in camera_queues.items():
+            timestamp_s = sample_queue.latest_timestamp_s()
+            if (
+                timestamp_s is None
+                or timestamp_s <= 0.0
+                or not 0.0 <= now_s - timestamp_s <= self.max_sample_age_s
+            ):
+                stale.append(name)
+        if stale:
+            raise RuntimeError(f"teleop source has stale camera streams {stale}")
 
     def start(self) -> None:
         if self.started:
@@ -364,8 +426,8 @@ class HDF5TeleopCollectionSource:
         arm_specs: tuple[tuple[str, SinglePiperArm, bool, bool], ...] = (
             ("master_left", self.master_robot.left, False, True),
             ("master_right", self.master_robot.right, False, True),
-            ("puppet_left", self.puppet_robot.left, True, False),
-            ("puppet_right", self.puppet_robot.right, True, False),
+            ("slave_left", self.slave_robot.left, True, False),
+            ("slave_right", self.slave_robot.right, True, False),
         )
         for arm_name, arm, sample_pose, prefer_joint_ctrl in arm_specs:
             thread = threading.Thread(
@@ -403,6 +465,7 @@ class HDF5TeleopCollectionSource:
             self.stationary_intervals.append({"start_s": float(start_s), "end_s": float(end_s)})
 
     def latest_images(self) -> dict[str, np.ndarray] | None:
+        self.require_healthy()
         images: dict[str, np.ndarray] = {}
         for camera_name, queue in self.color_queues.items():
             sample = queue.latest()
@@ -438,13 +501,29 @@ class HDF5TeleopCollectionSource:
             loop_start_s = time.monotonic()
             try:
                 state = arm.read_state(prefer_joint_ctrl=prefer_joint_ctrl)
-                qpos_timestamp_s = time.time() if prefer_joint_ctrl else positive_timestamp(state.qpos_timestamp_s) or positive_timestamp(state.timestamp_s)
-                if qpos_timestamp_s is not None and qpos_timestamp_s > last_qpos_timestamp_s:
-                    self.append_sample(f"{arm_name}_joint", self.arm_joint_queues[arm_name], TimestampedValue(qpos_timestamp_s, state))
-                    last_qpos_timestamp_s = qpos_timestamp_s
+                if prefer_joint_ctrl:
+                    qpos_timestamp_s = (
+                        positive_timestamp(state.qpos_timestamp_s)
+                        or positive_timestamp(state.command_timestamp_s)
+                    )
+                    if qpos_timestamp_s is not None:
+                        self.append_sample(
+                            f"{arm_name}_joint",
+                            self.arm_joint_queues[arm_name],
+                            TimestampedValue(time.time(), state),
+                        )
+                        last_qpos_timestamp_s = qpos_timestamp_s
+                else:
+                    qpos_timestamp_s = (
+                        positive_timestamp(state.qpos_timestamp_s)
+                        or positive_timestamp(state.timestamp_s)
+                    )
+                    if qpos_timestamp_s is not None and qpos_timestamp_s > last_qpos_timestamp_s:
+                        self.append_sample(f"{arm_name}_joint", self.arm_joint_queues[arm_name], TimestampedValue(qpos_timestamp_s, state))
+                        last_qpos_timestamp_s = qpos_timestamp_s
                 pose_timestamp_s = positive_timestamp(state.end_pose_timestamp_s)
                 if sample_pose and pose_timestamp_s is not None and pose_timestamp_s > last_pose_timestamp_s:
-                    self.append_sample(f"{arm_name}_pose", self.puppet_pose_queues[arm_name], TimestampedValue(pose_timestamp_s, state))
+                    self.append_sample(f"{arm_name}_pose", self.slave_pose_queues[arm_name], TimestampedValue(pose_timestamp_s, state))
                     last_pose_timestamp_s = pose_timestamp_s
             except Exception as exc:
                 self.last_error = exc
@@ -455,38 +534,35 @@ class HDF5TeleopCollectionSource:
                     time.sleep(remaining_s)
 
     def aligned_frame_time(self) -> float | None:
-        image_timestamps = []
-        for camera_name in self.camera_names:
-            timestamp_s = self.color_queues[camera_name].latest_timestamp_s()
+        self.require_healthy()
+        required_queues: list[tuple[str, AsyncSampleQueue]] = [
+            (f"camera_{name}", queue)
+            for name, queue in self.color_queues.items()
+        ]
+        if self.cameras.enable_depth:
+            required_queues.extend(
+                (f"depth_{name}", queue)
+                for name, queue in self.depth_queues.items()
+            )
+        required_queues.extend(
+            (f"{name}_joint", queue)
+            for name, queue in self.arm_joint_queues.items()
+        )
+        required_queues.extend(
+            (f"{name}_pose", queue)
+            for name, queue in self.slave_pose_queues.items()
+        )
+        latest_timestamps = []
+        for name, queue in required_queues:
+            timestamp_s = queue.latest_timestamp_s()
             if timestamp_s is None:
-                self.last_sync_failure = f"missing camera_{camera_name}"
+                self.last_sync_failure = f"missing {name}"
                 return None
-            image_timestamps.append(timestamp_s)
-        if self.cameras.enable_depth:
-            for camera_name in self.camera_names:
-                timestamp_s = self.depth_queues[camera_name].latest_timestamp_s()
-                if timestamp_s is None:
-                    self.last_sync_failure = f"missing depth_{camera_name}"
-                    return None
-                image_timestamps.append(timestamp_s)
-        frame_time = min(image_timestamps)
-
-        for camera_name, queue in self.color_queues.items():
+            latest_timestamps.append(timestamp_s)
+        frame_time = min(latest_timestamps)
+        for name, queue in required_queues:
             if not queue.has_sample_at_or_after(frame_time):
-                self.last_sync_failure = f"camera_{camera_name} behind frame_time {frame_time:.6f}"
-                return None
-        if self.cameras.enable_depth:
-            for camera_name, queue in self.depth_queues.items():
-                if not queue.has_sample_at_or_after(frame_time):
-                    self.last_sync_failure = f"depth_{camera_name} behind frame_time {frame_time:.6f}"
-                    return None
-        for arm_name, queue in self.arm_joint_queues.items():
-            if not queue.has_sample_at_or_after(frame_time):
-                self.last_sync_failure = f"{arm_name}_joint behind frame_time {frame_time:.6f}"
-                return None
-        for arm_name, queue in self.puppet_pose_queues.items():
-            if not queue.has_sample_at_or_after(frame_time):
-                self.last_sync_failure = f"{arm_name}_pose behind frame_time {frame_time:.6f}"
+                self.last_sync_failure = f"{name} behind frame_time {frame_time:.6f}"
                 return None
         return frame_time
 
@@ -496,6 +572,7 @@ class HDF5TeleopCollectionSource:
             if self.last_error is not None:
                 pass
             if self.aligned_frame_time() is not None:
+                self.ready_once = True
                 return True
             time.sleep(0.02)
         return False
@@ -527,23 +604,23 @@ class HDF5TeleopCollectionSource:
             arm_samples[arm_name] = sample
 
         pose_samples: dict[str, TimestampedValue] = {}
-        for arm_name, queue in self.puppet_pose_queues.items():
+        for arm_name, queue in self.slave_pose_queues.items():
             sample = queue.pop_at_or_after(frame_time)
             if sample is None:
                 return None
             pose_samples[arm_name] = sample
 
-        puppet_state = DualPiperState(
-            left=arm_samples["puppet_left"].value,
-            right=arm_samples["puppet_right"].value,
+        slave_state = DualPiperState(
+            left=arm_samples["slave_left"].value,
+            right=arm_samples["slave_right"].value,
         )
         master_state = DualPiperState(
             left=arm_samples["master_left"].value,
             right=arm_samples["master_right"].value,
         )
-        puppet_pose_state = DualPiperState(
-            left=pose_samples["puppet_left"].value,
-            right=pose_samples["puppet_right"].value,
+        slave_pose_state = DualPiperState(
+            left=pose_samples["slave_left"].value,
+            right=pose_samples["slave_right"].value,
         )
         source_timestamps = {f"camera_{name}": sample.timestamp_s for name, sample in color_samples.items()}
         source_timestamps.update({f"camera_{name}_color_time": sample.timestamp_s for name, sample in color_samples.items()})
@@ -559,9 +636,9 @@ class HDF5TeleopCollectionSource:
 
         return HDF5TeleopCaptureFrame(
             timestamp_s=frame_time,
-            puppet_state=puppet_state,
+            slave_state=slave_state,
             master_state=master_state,
-            puppet_pose_state=puppet_pose_state,
+            slave_pose_state=slave_pose_state,
             images={name: sample.value.color_image for name, sample in color_samples.items()},
             depth_images={name: sample.value.depth_image for name, sample in depth_samples.items() if sample.value.depth_image is not None},
             source_timestamps=source_timestamps,
@@ -582,6 +659,7 @@ def collect_hdf5_teleop_episode(
     stationary_tolerance: float = 0.0005,
     runtime_window: Any | None = None,
     action_from_state: bool = False,
+    frame_sink: list[HDF5TeleopCaptureFrame] | None = None,
 ) -> list[HDF5TeleopCaptureFrame]:
     if max_timesteps is not None and max_timesteps < 1:
         raise ValueError("max_timesteps must be positive when set")
@@ -592,7 +670,7 @@ def collect_hdf5_teleop_episode(
         source.start()
     if not source.wait_until_ready(timeout_s=ready_timeout_s):
         detail = f": {source.last_error}" if source.last_error is not None else ""
-        raise RuntimeError(f"Timed out waiting for master/puppet/camera async queues{detail}")
+        raise RuntimeError(f"Timed out waiting for master/slave/camera async queues{detail}")
 
     if running_sentinel is not None:
         running_sentinel.parent.mkdir(parents=True, exist_ok=True)
@@ -602,7 +680,7 @@ def collect_hdf5_teleop_episode(
         print(f"{'*' * 20} Time (Seconds) Left {seconds_left} {'*' * 20}", flush=True)
         time.sleep(1.0)
 
-    frames: list[HDF5TeleopCaptureFrame] = []
+    frames = [] if frame_sink is None else frame_sink
     target_frame_count = None if max_timesteps is None else max_timesteps + 1
     last_master_state: DualPiperState | None = None
     skipped_stationary = 0
@@ -644,14 +722,14 @@ def collect_hdf5_teleop_episode(
             if runtime_window is not None:
                 observation_frame = frames[-2] if len(frames) >= 2 else frames[-1]
                 action_frame = frames[-1]
-                puppet_stable_poses = stable_eef_positions([observation_frame.puppet_pose_state, action_frame.puppet_pose_state])
+                slave_stable_poses = stable_eef_positions([observation_frame.slave_pose_state, action_frame.slave_pose_state])
                 master_stable_poses = stable_eef_positions([observation_frame.master_state, action_frame.master_state])
                 runtime_window.record(
                     images=observation_frame.images,
-                    state=dual_state_vector_32(observation_frame.puppet_state, puppet_stable_poses[0]),
+                    state=dual_state_vector_32(observation_frame.slave_state, slave_stable_poses[0]),
                     action=dual_state_vector_32(
-                        action_frame.puppet_state if action_from_state else action_frame.master_state,
-                        (puppet_stable_poses if action_from_state else master_stable_poses)[1],
+                        action_frame.slave_state if action_from_state else action_frame.master_state,
+                        (slave_stable_poses if action_from_state else master_stable_poses)[1],
                     ),
                     timestamp_s=observation_frame.timestamp_s,
                 )
@@ -682,10 +760,10 @@ def save_hdf5_teleop_episode(
     data_size = len(frames) - 1
     frame0_time = float(frames[0].timestamp_s)
     source_timestamp_names = tuple(sorted(frames[0].source_timestamps.keys()))
-    puppet_stable_poses = stable_eef_positions([frame.puppet_pose_state for frame in frames])
+    slave_stable_poses = stable_eef_positions([frame.slave_pose_state for frame in frames])
     master_stable_poses = stable_eef_positions([frame.master_state for frame in frames])
 
-    with h5py.File(episode_path, "w", rdcc_nbytes=1024**2 * 2) as root:
+    with atomic_hdf5_file(episode_path, rdcc_nbytes=1024**2 * 2) as root:
         root.attrs["sim"] = False
         root.attrs["compress"] = True
 
@@ -733,18 +811,18 @@ def save_hdf5_teleop_episode(
         for index in range(data_size):
             observation_frame = frames[index]
             action_frame = frames[index + 1]
-            qpos[index] = observation_frame.puppet_state.qpos
-            qpos_feedback[index] = dual_arm_array(observation_frame.puppet_state, "qpos_feedback")
-            qpos_command[index] = dual_arm_array(observation_frame.puppet_state, "qpos_command")
-            qvel[index] = observation_frame.puppet_state.qvel
-            effort[index] = observation_frame.puppet_state.effort
-            end_pose[index] = dual_arm_array(observation_frame.puppet_pose_state, "end_pose")
-            eef_quaternion[index] = dual_eef_quaternion(observation_frame.puppet_pose_state, observation_frame.puppet_state)
+            qpos[index] = observation_frame.slave_state.qpos
+            qpos_feedback[index] = dual_arm_array(observation_frame.slave_state, "qpos_feedback")
+            qpos_command[index] = dual_arm_array(observation_frame.slave_state, "qpos_command")
+            qvel[index] = observation_frame.slave_state.qvel
+            effort[index] = observation_frame.slave_state.effort
+            end_pose[index] = dual_arm_array(observation_frame.slave_pose_state, "end_pose")
+            eef_quaternion[index] = dual_eef_quaternion(observation_frame.slave_pose_state, observation_frame.slave_state)
             eef_left_time[index] = float(observation_frame.timestamp_s - frame0_time)
             eef_right_time[index] = float(observation_frame.timestamp_s - frame0_time)
-            state[index] = dual_state_vector_32(observation_frame.puppet_state, puppet_stable_poses[index])
-            action_state = action_frame.puppet_state if action_from_state else action_frame.master_state
-            action_poses = puppet_stable_poses if action_from_state else master_stable_poses
+            state[index] = dual_state_vector_32(observation_frame.slave_state, slave_stable_poses[index])
+            action_state = action_frame.slave_state if action_from_state else action_frame.master_state
+            action_poses = slave_stable_poses if action_from_state else master_stable_poses
             action[index] = dual_state_vector_32(action_state, action_poses[index + 1])
 
             for name in source_timestamp_names:
@@ -794,17 +872,17 @@ def save_hdf5_teleop_record_video(
         video_codec="libx264",
         video_output_params=("-preset", "veryfast", "-crf", "18"),
     )
-    puppet_stable_poses = stable_eef_positions([frame.puppet_pose_state for frame in frames])
+    slave_stable_poses = stable_eef_positions([frame.slave_pose_state for frame in frames])
     master_stable_poses = stable_eef_positions([frame.master_state for frame in frames])
     for index in range(len(frames) - 1):
         observation_frame = frames[index]
         action_frame = frames[index + 1]
         recorder.record(
             images=observation_frame.images,
-            state=dual_state_vector_32(observation_frame.puppet_state, puppet_stable_poses[index]),
+            state=dual_state_vector_32(observation_frame.slave_state, slave_stable_poses[index]),
             action=dual_state_vector_32(
-                action_frame.puppet_state if action_from_state else action_frame.master_state,
-                (puppet_stable_poses if action_from_state else master_stable_poses)[index + 1],
+                action_frame.slave_state if action_from_state else action_frame.master_state,
+                (slave_stable_poses if action_from_state else master_stable_poses)[index + 1],
             ),
             timestamp_s=observation_frame.timestamp_s,
         )
@@ -999,6 +1077,9 @@ def load_hdf5_teleop_episode(path: str | Path) -> HDF5TeleopLoadedEpisode:
         if "/observations/source_timestamps" in root:
             for name in root["/observations/source_timestamps"].keys():
                 source_timestamps[name] = root[f"/observations/source_timestamps/{name}"][()]
+        for name, values in tuple(source_timestamps.items()):
+            if name.startswith("puppet_"):
+                source_timestamps.setdefault(f"slave_{name[len('puppet_'):]}", values)
 
         return HDF5TeleopLoadedEpisode(
             path=path,
@@ -1017,6 +1098,7 @@ def load_hdf5_teleop_episode(path: str | Path) -> HDF5TeleopLoadedEpisode:
             images=images,
             depth_images=depth_images,
             source_timestamps=source_timestamps,
+            is_intervention=root["/is_intervention"][()] if "/is_intervention" in root else None,
         )
 
 

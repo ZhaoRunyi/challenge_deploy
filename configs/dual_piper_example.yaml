@@ -1,12 +1,24 @@
+# Four independent USB-to-CAN adapters: one physical bus per arm.
+#
+# HIL-reviewed 2026-08-02. The mapping is based on physical one-arm checks, not
+# can0..can3 enumeration. Both masters run S-V1.9-0; slaves run S-V1.8-9.
+can_topology: isolated
+
 robot:
-  left:
-    can_name: can0
-  right:
-    can_name: can1
   master_left:
-    can_name: can_left_mas
+    can_name: piper_ml
+    usb_serial: "002D001F4648571020303731"
   master_right:
-    can_name: can_right_mas
+    can_name: piper_mr
+    usb_serial: "001900344648570920303731"
+  slave_left:
+    can_name: piper_sl
+    usb_serial: "002F001D5547571120343930"
+    gripper_effort: 1000
+  slave_right:
+    can_name: piper_sr
+    usb_serial: "002D001B5547571120343930"
+    gripper_effort: 1000
 
 cameras:
   enabled: true
@@ -15,9 +27,9 @@ cameras:
   fps: 30
   warmup_frames: 30
   serials:
-    cam_high: "323422071854"
-    cam_right_wrist: "335522070790"
-    cam_left_wrist: "344322073012"
+    cam_high: "339322074476"
+    cam_right_wrist: "419522070720"
+    cam_left_wrist: "317222074371"
 
 policy:
   host: 127.0.0.1
@@ -29,14 +41,6 @@ policy:
   min_smooth_steps: 8
   buffer_max_chunks: 10
 
-runtime:
-  publish_rate: 30
-  max_publish_step: 10000
-  arm_steps_length: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.2]
-  right_gripper_offset: 0.003
-
 dataset:
-  dataset_dir: ./data
-  dataset_name: aloha_mobile_dummy
-  export_video: true
-  video_fps: 30
+  dataset_dir: ./artifacts/hdf5_data
+  dataset_name: dummy_task

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+import time
+from typing import Any, Literal, Mapping
 
 import cv2
 import numpy as np
@@ -15,7 +18,7 @@ from hardware.conversions import (
     opening_to_legacy_piper_raw_gripper,
     opening_to_normalized_gripper,
 )
-from hardware.schemas import PiperArmState, RobotSnapshot
+from hardware.schemas import DualPiperState, PiperArmState, RobotSnapshot
 from . import slai_piper_policy
 
 
@@ -24,6 +27,17 @@ StateGripperEncoding = Literal["policy", "meters", "old"]
 ActionGripperEncoding = Literal["policy", "meters", "binary", "old"]
 STATE_GRIPPER_ENCODINGS: tuple[StateGripperEncoding, ...] = ("policy", "meters", "old")
 ACTION_GRIPPER_ENCODINGS: tuple[ActionGripperEncoding, ...] = ("policy", "meters", "binary", "old")
+
+
+class PolicySessionCapability(str, Enum):
+    """How a concrete policy payload handles rollout session identity."""
+
+    SESSION_ID = "session_id"
+    STATELESS = "stateless"
+
+
+class PolicyResponseFormatError(ValueError):
+    """A deterministic model-response schema error that must not be retried."""
 
 
 @dataclass(frozen=True)
@@ -103,13 +117,18 @@ def hardware_gripper_to_model_raw(value: float, *, state_gripper_encoding: State
     return opening_to_normalized_gripper(value)
 
 
-def model_raw_gripper_to_hardware(value: float, *, action_gripper_encoding: ActionGripperEncoding = "policy") -> float:
+def model_raw_gripper_to_hardware(
+    value: float,
+    *,
+    action_gripper_encoding: ActionGripperEncoding = "policy",
+    full_open_value: float = PIPER_GRIPPER_FULL_OPEN_METERS,
+) -> float:
     if action_gripper_encoding == "old":
         return legacy_piper_raw_gripper_to_opening(value)
     if action_gripper_encoding == "meters":
         return max(0.0, float(value))
     if action_gripper_encoding == "binary":
-        return PIPER_GRIPPER_FULL_OPEN_METERS if float(value) >= 0.5 else 0.0
+        return full_open_value if float(value) >= 0.5 else 0.0
     return normalized_gripper_to_opening(value)
 
 
@@ -135,14 +154,33 @@ def action_gripper_for_piper(
     gripper_config: Any,
     *,
     action_gripper_encoding: ActionGripperEncoding = "policy",
+    full_open_value: float | None = None,
 ) -> float:
     value = float(value)
     action_gripper_encoding = validate_action_gripper_encoding(action_gripper_encoding)
+    resolved_full_open = (
+        PIPER_GRIPPER_FULL_OPEN_METERS
+        if full_open_value is None
+        else float(full_open_value)
+    )
     if action_gripper_encoding in {"meters", "binary", "old"}:
-        return model_raw_gripper_to_hardware(value, action_gripper_encoding=action_gripper_encoding)
+        return model_raw_gripper_to_hardware(
+            value,
+            action_gripper_encoding=action_gripper_encoding,
+            full_open_value=resolved_full_open,
+        )
     if gripper_config is not None and gripper_config.type == "01":
-        return gripper_config.full_width if value >= 0.5 else 0.0
-    return model_raw_gripper_to_hardware(value, action_gripper_encoding=action_gripper_encoding)
+        binary_full_open = (
+            gripper_config.full_width
+            if full_open_value is None
+            else resolved_full_open
+        )
+        return binary_full_open if value >= 0.5 else 0.0
+    return model_raw_gripper_to_hardware(
+        value,
+        action_gripper_encoding=action_gripper_encoding,
+        full_open_value=resolved_full_open,
+    )
 
 
 def bounded_gripper_for_piper(
@@ -234,11 +272,26 @@ def image_to_rgb(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
-def action_array_from_response(response: dict[str, Any], keys: tuple[str, ...] = ("action", "actions")) -> np.ndarray:
+def action_array_from_response(
+    response: Mapping[str, Any],
+    keys: tuple[str, ...] = ("action", "actions"),
+) -> np.ndarray:
+    if not isinstance(response, Mapping):
+        raise PolicyResponseFormatError(
+            "Model response must be a mapping containing an action array, "
+            f"got {type(response).__name__}"
+        )
     for key in keys:
         if key in response:
-            return np.asarray(response[key], dtype=np.float64)
-    raise KeyError(f"Policy response does not contain any action key {keys}: {sorted(response)}")
+            try:
+                return np.asarray(response[key], dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise PolicyResponseFormatError(
+                    f"Model response field {key!r} is not a numeric action array: {exc}"
+                ) from exc
+    raise PolicyResponseFormatError(
+        f"Model response does not contain any action key {keys}: {sorted(response)}"
+    )
 
 
 def used_action_names(spec: Any, control_mode: ControlMode) -> frozenset[str]:
@@ -260,7 +313,25 @@ def used_action_names(spec: Any, control_mode: ControlMode) -> frozenset[str]:
     return frozenset(used)
 
 
+def quiet_close_policy_transport_on_construction_error(
+    policy_client: Any,
+) -> None:
+    """Release a transport without replacing the constructor's root error."""
+
+    close = getattr(policy_client, "close", None)
+    if not callable(close):
+        close = getattr(policy_client, "close_inference_session", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except BaseException:
+        pass
+
+
 class SlaiPiperClient:
+    SESSION_CAPABILITY = PolicySessionCapability.STATELESS
+
     def __init__(
         self,
         *,
@@ -277,8 +348,6 @@ class SlaiPiperClient:
         gripper_effort: int | None = None,
         gripper_action_frames: int = 1,
     ) -> None:
-        if gripper_effort is not None and not 0 <= int(gripper_effort) <= 5000:
-            raise ValueError("gripper_effort must be in [0, 5000]")
         if gripper_action_frames <= 0:
             raise ValueError("gripper_action_frames must be positive")
         self.spec = spec
@@ -297,6 +366,7 @@ class SlaiPiperClient:
         self.last_commanded: DecodedPiperAction | None = None
         self.gripper_transition: tuple[DecodedPiperAction, DecodedPiperAction, int] | None = None
         self.previous_ee_rpy: dict[str, np.ndarray | None] = {"left": None, "right": None}
+        self._inference_timeout_s: float | None = None
         self.validate_control_mode()
 
     @property
@@ -327,6 +397,73 @@ class SlaiPiperClient:
     def set_default_session_id(self, session_id: str | None) -> None:
         self.default_session_id = session_id
 
+    @property
+    def policy_session_capability(self) -> PolicySessionCapability:
+        """Return the concrete client's explicit server-session contract."""
+
+        return self.SESSION_CAPABILITY
+
+    @property
+    def supports_policy_sessions(self) -> bool:
+        return self.policy_session_capability is PolicySessionCapability.SESSION_ID
+
+    def resync_after_authority_change(
+        self,
+        *,
+        session_id: str | None = None,
+        reset_policy: bool = True,
+    ) -> PolicySessionCapability:
+        """Drop command-side continuity whenever control authority changes.
+
+        The first subsequent command will seed binary-gripper interpolation from
+        fresh robot feedback.  EE angle unwrapping likewise restarts from the new
+        physical pose instead of an action issued before the role transaction.
+        Stateful servers receive a new session id when they explicitly support
+        one; other clients are accurately reported as stateless.
+        """
+
+        self.last_commanded = None
+        self.gripper_transition = None
+        self.previous_ee_rpy = {"left": None, "right": None}
+        capability = self.policy_session_capability
+        self.set_default_session_id(
+            session_id if capability is PolicySessionCapability.SESSION_ID else None
+        )
+        if reset_policy:
+            reset = getattr(self.client, "reset", None)
+            if callable(reset):
+                reset()
+        return capability
+
+    def fork_rollout_inference_session(self) -> "SlaiPiperClient":
+        """Create an independent transport lane after a hard request timeout.
+
+        A blocked websocket must never share its connection with a retry.  The
+        transport therefore owns the actual reconnection factory while this
+        base class makes a shallow inference-only client facade around it.
+        """
+
+        policy_client = self.client.new_inference_session()
+        forked = copy.copy(self)
+        forked.client = policy_client
+        forked.last_commanded = None
+        forked.gripper_transition = None
+        forked.previous_ee_rpy = {"left": None, "right": None}
+        return forked
+
+    def configure_inference_timeout(self, timeout_s: float) -> None:
+        if timeout_s <= 0.0:
+            raise ValueError("inference timeout must be positive")
+        self._inference_timeout_s = float(timeout_s)
+        configure = getattr(self.client, "set_inference_timeout", None)
+        if callable(configure):
+            configure(self._inference_timeout_s)
+
+    def close_inference_session(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
+
     def get_predicted_video(self, session_id: str) -> dict[str, Any]:
         return dict(self.client.infer({"_request": "get_predicted_video", "session_id": session_id}))
 
@@ -350,7 +487,13 @@ class SlaiPiperClient:
     def infer_actions(self, snapshot: RobotSnapshot, prompt: str | None = None, **kwargs: Any) -> np.ndarray:
         return action_array_from_response(self.infer(snapshot, prompt=prompt, **kwargs))
 
-    def decode_gripper_for_piper(self, value: float, arm_name: str) -> tuple[float, bool]:
+    def decode_gripper_for_piper(
+        self,
+        value: float,
+        arm_name: str,
+        *,
+        full_open_value: float | None = None,
+    ) -> tuple[float, bool]:
         arm_threshold = getattr(self, f"{arm_name}_gripper_threshold", None)
         arm_lower = getattr(self, f"{arm_name}_gripper_lower", None)
         arm_upper = getattr(self, f"{arm_name}_gripper_upper", None)
@@ -358,17 +501,29 @@ class SlaiPiperClient:
         lower = arm_lower if arm_lower is not None else self.gripper_lower
         upper = arm_upper if arm_upper is not None else self.gripper_upper
         gripper_config = self.spec.action_space.gripper
+        resolved_full_open = (
+            PIPER_GRIPPER_FULL_OPEN_METERS
+            if full_open_value is None
+            else float(full_open_value)
+        )
         raw_gripper = action_gripper_for_piper(
             value,
             gripper_config,
             action_gripper_encoding=self.action_gripper_encoding,
+            full_open_value=full_open_value,
         )
         bounded_binary = (
             threshold is not None
             or (upper is not None and raw_gripper > upper)
             or (lower is not None and raw_gripper < lower)
         )
-        gripper = bounded_gripper_for_piper(raw_gripper, threshold, lower, upper)
+        gripper = bounded_gripper_for_piper(
+            raw_gripper,
+            threshold,
+            lower,
+            upper,
+            full_open_value=resolved_full_open,
+        )
         binary_gripper = self.action_gripper_encoding == "binary" or bounded_binary or bool(
             gripper_config is not None
             and getattr(gripper_config, "type", None) == "01"
@@ -376,7 +531,12 @@ class SlaiPiperClient:
         )
         return gripper, binary_gripper
 
-    def decode_action(self, action: np.ndarray) -> DecodedPiperAction:
+    def decode_action(
+        self,
+        action: np.ndarray,
+        *,
+        gripper_full_openings: Mapping[str, float] | None = None,
+    ) -> DecodedPiperAction:
         action = np.asarray(action, dtype=np.float64)
         if action.ndim != 1:
             raise ValueError(f"Expected one action vector, got shape {action.shape}")
@@ -387,7 +547,16 @@ class SlaiPiperClient:
         fields = set(slai_piper_policy.fields_from_action_config(self.spec.action_space))
         decoded: dict[str, DecodedArmAction] = {}
         for arm in action_space["arms"]:
-            gripper, binary_gripper = self.decode_gripper_for_piper(float(action[slices[f"{arm}_gripper"]][0]), arm)
+            full_open_value = (
+                None
+                if gripper_full_openings is None
+                else float(gripper_full_openings[arm])
+            )
+            gripper, binary_gripper = self.decode_gripper_for_piper(
+                float(action[slices[f"{arm}_gripper"]][0]),
+                arm,
+                full_open_value=full_open_value,
+            )
             joint = None
             ee_pose = None
             if "joint" in fields:
@@ -399,6 +568,46 @@ class SlaiPiperClient:
         return DecodedPiperAction(arms=decoded, control_mode=self.control_mode)
 
     def command_decoded(self, robot: Any, decoded: DecodedPiperAction) -> None:
+        if decoded.control_mode == "joints":
+            command_bimanual = getattr(robot, "command_bimanual_joint_positions", None)
+            if callable(command_bimanual) and {"left", "right"}.issubset(decoded.arms):
+                left_joint = decoded.arms["left"].joint
+                right_joint = decoded.arms["right"].joint
+                if left_joint is None or right_joint is None:
+                    raise ValueError("Decoded bimanual joint action is missing a joint block")
+                command_bimanual(
+                    left_joint,
+                    right_joint,
+                    speed_percent=self.joint_speed_percent,
+                    gripper_effort=self.gripper_effort,
+                )
+                return
+
+        if decoded.control_mode == "ee_pose":
+            command_bimanual = getattr(robot, "command_bimanual_end_poses", None)
+            if callable(command_bimanual) and {"left", "right"}.issubset(decoded.arms):
+                poses: dict[str, np.ndarray] = {}
+                for arm_name in ("left", "right"):
+                    arm_pose = decoded.arms[arm_name].ee_pose
+                    if arm_pose is None:
+                        raise ValueError(
+                            f"Decoded bimanual EE action for {arm_name} has no ee_pose block"
+                        )
+                    pose = arm_pose.copy()
+                    pose[3:6] = stabilize_rpy(
+                        pose[3:6],
+                        self.previous_ee_rpy[arm_name],
+                    )
+                    self.previous_ee_rpy[arm_name] = pose[3:6].copy()
+                    poses[arm_name] = pose
+                command_bimanual(
+                    poses["left"],
+                    poses["right"],
+                    speed_percent=self.ee_speed_percent,
+                    gripper_effort=self.gripper_effort,
+                )
+                return
+
         for arm_name, arm_action in decoded.arms.items():
             arm = robot.left if arm_name == "left" else robot.right
             if decoded.control_mode == "joints":
@@ -421,8 +630,37 @@ class SlaiPiperClient:
                     gripper_effort=self.gripper_effort,
                 )
 
+    def validate_decoded_action_for_robot(
+        self,
+        robot: Any,
+        decoded: DecodedPiperAction,
+    ) -> None:
+        validator = getattr(robot, "validate_bimanual_targets", None)
+        if not callable(validator):
+            return
+        if decoded.control_mode == "joints":
+            left = decoded.arms["left"].joint
+            right = decoded.arms["right"].joint
+            joint_positions = True
+        else:
+            left = decoded.arms["left"].ee_pose
+            right = decoded.arms["right"].ee_pose
+            joint_positions = False
+        if left is None or right is None:
+            raise ValueError("decoded bimanual action is missing its command target")
+        validator(
+            left,
+            right,
+            joint_positions=joint_positions,
+        )
+
     def current_decoded_from_robot(self, robot: Any) -> DecodedPiperAction:
         state = robot.read_state()
+        if self.control_mode == "ee_pose":
+            self.previous_ee_rpy = {
+                "left": np.asarray(state.left.end_pose[3:6], dtype=np.float64).copy(),
+                "right": np.asarray(state.right.end_pose[3:6], dtype=np.float64).copy(),
+            }
         arms = {
             "left": DecodedArmAction(
                 joint=np.asarray(state.left.qpos, dtype=np.float64).copy() if self.control_mode == "joints" else None,
@@ -436,6 +674,90 @@ class SlaiPiperClient:
             ),
         }
         return DecodedPiperAction(arms=arms, control_mode=self.control_mode)
+
+    def action_state_after_command(
+        self,
+        robot: Any,
+        snapshot_before_command: RobotSnapshot,
+    ) -> DualPiperState:
+        """Return the canonical target that was actually submitted this step.
+
+        Joint commands are built from the exact validated targets because a
+        SocketCAN sender may not receive its own 0x155-0x157 frames and a shared
+        bus may cache the physical master's control family instead.
+        Cartesian commands have no equivalent joint target; their canonical
+        state keeps fresh slave joints and replaces EE pose/gripper with the
+        exact command-side values, including a binary-gripper ramp.
+        """
+
+        if self.control_mode == "joints":
+            target_builder = getattr(robot, "action_state_for_joint_targets", None)
+            if callable(target_builder):
+                if self.last_commanded is None:
+                    raise RuntimeError("no joint command is available for canonical action state")
+                left_target = self.last_commanded.arms["left"].joint
+                right_target = self.last_commanded.arms["right"].joint
+                if left_target is None or right_target is None:
+                    raise RuntimeError("last bimanual joint command is incomplete")
+                feedback = getattr(snapshot_before_command, "state", None)
+                if not isinstance(feedback, DualPiperState):
+                    feedback = robot.read_state(prefer_joint_ctrl=False)
+                return target_builder(left_target, right_target, feedback)
+            state = robot.read_state(prefer_joint_ctrl=True)
+            if not isinstance(state, DualPiperState):
+                raise TypeError("joint action_state_after_command expects DualPiperState")
+            return state
+        if self.last_commanded is None:
+            raise RuntimeError("no EE command is available for canonical action state")
+
+        fresh = getattr(snapshot_before_command, "state", None)
+        if not isinstance(fresh, DualPiperState):
+            fresh = robot.read_state(prefer_joint_ctrl=False)
+        if not isinstance(fresh, DualPiperState):
+            raise TypeError("EE action_state_after_command expects DualPiperState")
+        command_timestamp_s = time.time()
+
+        def commanded_pose(arm_name: str) -> np.ndarray:
+            arm_action = self.last_commanded.arms[arm_name]
+            if arm_action.ee_pose is None:
+                raise RuntimeError(f"last EE command for {arm_name} has no end pose")
+            pose = np.asarray(arm_action.ee_pose, dtype=np.float64).copy()
+            stabilized_rpy = self.previous_ee_rpy.get(arm_name)
+            if stabilized_rpy is not None:
+                pose[3:6] = np.asarray(stabilized_rpy, dtype=np.float64)
+            pose[6] = float(arm_action.gripper)
+            return pose
+
+        left_pose = commanded_pose("left")
+        right_pose = commanded_pose("right")
+        isolated_builder = getattr(robot, "action_state_for_end_pose_targets", None)
+        if callable(isolated_builder):
+            return isolated_builder(left_pose, right_pose, fresh)
+
+        def commanded_arm(
+            arm_name: str,
+            arm_state: PiperArmState,
+            pose: np.ndarray,
+        ) -> PiperArmState:
+            arm_action = self.last_commanded.arms[arm_name]
+            qpos = np.asarray(arm_state.qpos, dtype=np.float64).copy()
+            qpos[6] = float(arm_action.gripper)
+            qpos_command = np.asarray(arm_state.qpos_command, dtype=np.float64).copy()
+            qpos_command[6] = float(arm_action.gripper)
+            return replace(
+                arm_state,
+                qpos=qpos,
+                qpos_command=qpos_command,
+                end_pose=pose,
+                timestamp_s=max(float(arm_state.timestamp_s), command_timestamp_s),
+                end_pose_timestamp_s=command_timestamp_s,
+                command_timestamp_s=command_timestamp_s,
+            )
+
+        return DualPiperState(
+            left=commanded_arm("left", fresh.left, left_pose),
+            right=commanded_arm("right", fresh.right, right_pose),
+        )
 
     def command_transition_step(self, robot: Any, start: DecodedPiperAction, target: DecodedPiperAction, step: int) -> None:
         ratio = float(step) / float(self.gripper_action_frames)
@@ -468,12 +790,24 @@ class SlaiPiperClient:
         self.last_commanded = decoded
 
     def command_action(self, robot: Any, action: np.ndarray) -> None:
+        action = np.asarray(action, dtype=np.float64)
+        full_opening_getter = getattr(robot, "gripper_full_opening_m", None)
+        gripper_full_openings = None
+        if callable(full_opening_getter):
+            gripper_full_openings = {
+                side: float(full_opening_getter(side))
+                for side in ("left", "right")
+            }
+        decoded = self.decode_action(
+            action,
+            gripper_full_openings=gripper_full_openings,
+        )
+        self.validate_decoded_action_for_robot(robot, decoded)
         if self.gripper_transition is not None:
             start, target, step = self.gripper_transition
             self.command_transition_step(robot, start, target, step)
             self.gripper_transition = None if step >= self.gripper_action_frames else (start, target, step + 1)
             return
-        decoded = self.decode_action(action)
         if self.last_commanded is None:
             self.last_commanded = self.current_decoded_from_robot(robot)
         if (

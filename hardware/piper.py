@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import time
 from typing import Any, Iterable
 
 import numpy as np
-from piper_sdk import C_PiperInterface, LogLevel
+from piper_sdk import C_PiperForwardKinematics, C_PiperInterface, LogLevel
 
 from .constants import DEFAULT_ARM_STEP_LENGTH
 from .conversions import (
@@ -18,6 +18,7 @@ from .conversions import (
     wrap_radians_to_pi,
 )
 from .schemas import DualPiperState, PiperArmState
+from .topology import LinkageRole
 
 
 class MotionNotAllowedError(RuntimeError):
@@ -25,7 +26,7 @@ class MotionNotAllowedError(RuntimeError):
 
 
 DEFAULT_GRIPPER_EFFORT = 1000
-MAX_GRIPPER_EFFORT = 5000
+_FORWARD_KINEMATICS = C_PiperForwardKinematics()
 
 
 def motor_field(container: Any, index: int) -> Any:
@@ -53,9 +54,9 @@ def fk_links_to_end_pose(fk_links: Any, fallback_pose: np.ndarray, gripper_openi
     try:
         link_pose = np.asarray(fk_links[-1], dtype=np.float64)
     except Exception:
-        return fallback_pose.copy()
+        return np.asarray(fallback_pose, dtype=np.float64).copy()
     if link_pose.shape[0] < 6 or np.allclose(link_pose[:6], 0.0, atol=1e-9):
-        return fallback_pose.copy()
+        return np.asarray(fallback_pose, dtype=np.float64).copy()
     return np.array(
         [
             link_pose[0] / 1000.0,
@@ -70,13 +71,70 @@ def fk_links_to_end_pose(fk_links: Any, fallback_pose: np.ndarray, gripper_openi
     )
 
 
+def joint_target_to_end_pose(
+    qpos: Iterable[float],
+    fallback_pose: np.ndarray,
+) -> np.ndarray:
+    """Compute the canonical Piper end pose for an exact 7-D joint target."""
+
+    target = np.asarray(list(qpos), dtype=np.float64)
+    if target.shape != (7,) or not np.all(np.isfinite(target)):
+        raise ValueError("Piper FK requires one finite 7-D joint target")
+    links = _FORWARD_KINEMATICS.CalFK(target[:6].tolist())
+    end_pose = fk_links_to_end_pose(links, fallback_pose, float(target[6]))
+    if end_pose.shape != (7,):
+        raise ValueError("Piper FK fallback pose must contain seven values")
+    end_pose[6] = float(target[6])
+    return end_pose
+
+
+def build_dual_joint_target_action_state(
+    left_qpos: Iterable[float],
+    right_qpos: Iterable[float],
+    observation_state: DualPiperState,
+) -> DualPiperState:
+    """Build a canonical action state from the exact submitted joint targets.
+
+    This is deliberately independent of CAN command-message readback.  On a
+    shared master/slave bus the cached 0x155-0x157 family may describe the
+    physical master, while on isolated SocketCAN the sender may not receive its
+    own frames.  Both topologies therefore use the selected host target plus
+    fresh pre-command feedback for fields that are not commanded.
+    """
+
+    if not isinstance(observation_state, DualPiperState):
+        raise TypeError("joint action state requires DualPiperState feedback")
+    targets = {
+        "left": np.asarray(list(left_qpos), dtype=np.float64),
+        "right": np.asarray(list(right_qpos), dtype=np.float64),
+    }
+    command_timestamp_s = time.time()
+
+    def commanded_arm(side: str, state: PiperArmState) -> PiperArmState:
+        target = targets[side]
+        if target.shape != (7,) or not np.all(np.isfinite(target)):
+            raise ValueError(f"{side} joint action target must be finite 7-D")
+        return replace(
+            state,
+            qpos=target.copy(),
+            qpos_command=target.copy(),
+            end_pose=joint_target_to_end_pose(target, state.end_pose),
+            timestamp_s=max(float(state.timestamp_s), command_timestamp_s),
+            qpos_timestamp_s=command_timestamp_s,
+            end_pose_timestamp_s=command_timestamp_s,
+            command_timestamp_s=command_timestamp_s,
+        )
+
+    return DualPiperState(
+        left=commanded_arm("left", observation_state.left),
+        right=commanded_arm("right", observation_state.right),
+    )
+
+
 def gripper_effort_value(value: int | None) -> int:
     if value is None:
         return DEFAULT_GRIPPER_EFFORT
-    effort = int(value)
-    if not 0 <= effort <= MAX_GRIPPER_EFFORT:
-        raise ValueError(f"gripper_effort must be in [0, {MAX_GRIPPER_EFFORT}], got {effort}")
-    return effort
+    return int(value)
 
 
 def status_to_dict(status: Any) -> dict[str, Any]:
@@ -125,11 +183,13 @@ class SinglePiperArm:
         name: str,
         can_name: str,
         commands_enabled: bool = True,
+        calculate_fk_per_frame: bool = True,
         logger_level: LogLevel = LogLevel.WARNING,
     ) -> None:
         self.name = name
         self.can_name = can_name
         self.commands_enabled = commands_enabled
+        self.calculate_fk_per_frame = calculate_fk_per_frame
         self.interface = C_PiperInterface(
             can_name=can_name,
             logger_level=logger_level,
@@ -145,7 +205,10 @@ class SinglePiperArm:
             )
 
     def connect(self, *, read_only: bool = True) -> None:
-        self.interface.EnableFkCal()
+        if self.calculate_fk_per_frame:
+            self.interface.EnableFkCal()
+        else:
+            self.interface.DisableFkCal()
         self.interface.ConnectPort(can_init=False, piper_init=not read_only, start_thread=True)
         self.connected = True
 
@@ -156,11 +219,36 @@ class SinglePiperArm:
             finally:
                 self.connected = False
 
+    def abort_construction(self) -> None:
+        """Release SDK resources after an isolated factory fails mid-build.
+
+        ``disconnect()`` intentionally preserves the legacy connected-state
+        guard.  An SDK interface can nevertheless allocate receive resources
+        in its constructor, so isolated factories use this best-effort path
+        before the arm has reached ``connect()``.
+        """
+
+        try:
+            self.interface.DisconnectPort()
+        except Exception:
+            pass
+        finally:
+            self.connected = False
+
     def is_enabled(self) -> bool:
         low_spd = self.interface.GetArmLowSpdInfoMsgs()
         return all(
             bool_attr(motor_field(low_spd, idx).foc_status, "driver_enable_status")
             for idx in range(1, 7)
+        )
+
+    def has_complete_driver_feedback(self) -> bool:
+        """Return whether every low-speed motor cache has received a CAN frame."""
+
+        low_spd = self.interface.GetArmLowSpdInfoMsgs()
+        return all(
+            getattr(motor_field(low_spd, index), "can_id", 0) == 0x260 + index
+            for index in range(1, 7)
         )
 
     def enable(self, *, retries: int = 5, sleep_s: float = 0.5) -> bool:
@@ -176,6 +264,38 @@ class SinglePiperArm:
                 return True
         return self.is_enabled()
 
+    def send_enable_without_reset(self) -> None:
+        """Send only the SDK's all-motor enable command."""
+
+        self.require_motion_allowed("send reset-free motor enable")
+        self.interface.EnableArm(7)
+
+    def enable_without_reset(self, *, retries: int = 5, sleep_s: float = 0.5) -> bool:
+        """Enable motors without changing gripper or other persisted settings."""
+
+        self.require_motion_allowed("enable the arm without reset")
+        if self.is_enabled():
+            return True
+        try:
+            previous_timestamp = float(
+                getattr(self.interface.GetArmLowSpdInfoMsgs(), "time_stamp", 0.0)
+            )
+        except Exception:
+            previous_timestamp = 0.0
+        for _ in range(retries):
+            self.send_enable_without_reset()
+            if sleep_s:
+                time.sleep(sleep_s)
+            try:
+                driver = self.interface.GetArmLowSpdInfoMsgs()
+                timestamp = float(getattr(driver, "time_stamp", 0.0))
+                frame_family_ready = self.has_complete_driver_feedback()
+            except Exception:
+                continue
+            if timestamp > previous_timestamp and frame_family_ready and self.is_enabled():
+                return True
+        return False
+
     def disable(self) -> None:
         self.require_motion_allowed("disable the arm")
         self.interface.DisableArm(7)
@@ -189,13 +309,15 @@ class SinglePiperArm:
         self.require_motion_allowed("switch to Cartesian control mode")
         self.interface.MotionCtrl_2(0x01, 0x00, speed_percent, 0x00)
 
+    def configure_linkage_role(self, role: LinkageRole) -> None:
+        self.require_motion_allowed(f"configure the arm as linkage role {role.short_name}")
+        self.interface.MasterSlaveConfig(int(role), 0x00, 0x00, 0x00)
+
     def configure_as_master_input(self) -> None:
-        self.require_motion_allowed("configure the arm as a master input arm")
-        self.interface.MasterSlaveConfig(0xFA, 0x00, 0x00, 0x00)
+        self.configure_linkage_role(LinkageRole.TEACHING_INPUT)
 
     def configure_as_slave_output(self) -> None:
-        self.require_motion_allowed("configure the arm as a slave output arm")
-        self.interface.MasterSlaveConfig(0xFC, 0x00, 0x00, 0x00)
+        self.configure_linkage_role(LinkageRole.MOTION_OUTPUT)
 
     def enter_teach_mode(self) -> None:
         self.require_motion_allowed("enter teach mode")
@@ -211,6 +333,7 @@ class SinglePiperArm:
         *,
         speed_percent: int = 100,
         gripper_effort: int | None = None,
+        command_gripper: bool = True,
     ) -> None:
         self.require_motion_allowed("send joint commands")
         qpos_arr = np.asarray(list(qpos), dtype=np.float64)
@@ -218,8 +341,6 @@ class SinglePiperArm:
             raise ValueError(f"{self.name} expects 7 DoF input, got shape {qpos_arr.shape}")
 
         sdk_joints = joints_rad_to_sdk(qpos_arr[:6])
-        sdk_gripper = opening_to_sdk_gripper(qpos_arr[6])
-        effort = gripper_effort_value(gripper_effort)
         self.set_joint_mode(speed_percent=speed_percent)
         self.interface.JointCtrl(
             int(sdk_joints[0]),
@@ -229,7 +350,10 @@ class SinglePiperArm:
             int(sdk_joints[4]),
             int(sdk_joints[5]),
         )
-        self.interface.GripperCtrl(abs(int(sdk_gripper)), effort, 0x01, 0)
+        if command_gripper:
+            sdk_gripper = opening_to_sdk_gripper(qpos_arr[6])
+            effort = gripper_effort_value(gripper_effort)
+            self.interface.GripperCtrl(abs(int(sdk_gripper)), effort, 0x01, 0)
         self.set_joint_mode(speed_percent=speed_percent)
 
     def command_end_pose(
@@ -238,6 +362,7 @@ class SinglePiperArm:
         *,
         speed_percent: int = 50,
         gripper_effort: int | None = None,
+        command_gripper: bool = True,
     ) -> None:
         self.require_motion_allowed("send end-effector commands")
         pose_arr = np.asarray(list(pose), dtype=np.float64)
@@ -247,7 +372,6 @@ class SinglePiperArm:
         x, y, z, rx, ry, rz, gripper = pose_arr
         # Clients may keep unwrapped RPY for continuity; Piper SDK commands use the principal range.
         rx, ry, rz = wrap_radians_to_pi([rx, ry, rz])
-        effort = gripper_effort_value(gripper_effort)
         self.set_cartesian_mode(speed_percent=speed_percent)
         self.interface.EndPoseCtrl(
             int(round(x * 1_000_000.0)),
@@ -257,7 +381,14 @@ class SinglePiperArm:
             int(round(ry * 57_324.840764)),
             int(round(rz * 57_324.840764)),
         )
-        self.interface.GripperCtrl(abs(opening_to_sdk_gripper(gripper)), effort, 0x01, 0)
+        if command_gripper:
+            effort = gripper_effort_value(gripper_effort)
+            self.interface.GripperCtrl(
+                abs(opening_to_sdk_gripper(gripper)),
+                effort,
+                0x01,
+                0,
+            )
         self.set_cartesian_mode(speed_percent=speed_percent)
 
     def read_state(self, *, prefer_joint_ctrl: bool = False) -> PiperArmState:
@@ -336,7 +467,14 @@ class SinglePiperArm:
         end_pose = feedback_end_pose
         effective_end_pose_timestamp_s = end_pose_timestamp_s
         if use_command:
-            end_pose = fk_links_to_end_pose(self.interface.GetFK(mode="control"), feedback_end_pose, qpos[6])
+            if self.calculate_fk_per_frame:
+                end_pose = fk_links_to_end_pose(
+                    self.interface.GetFK(mode="control"),
+                    feedback_end_pose,
+                    qpos[6],
+                )
+            else:
+                end_pose = joint_target_to_end_pose(qpos, feedback_end_pose)
             effective_end_pose_timestamp_s = command_timestamp_s
 
         return PiperArmState(
@@ -365,6 +503,11 @@ class SinglePiperArm:
             effort_timestamp_s=gripper_feedback_timestamp_s,
             end_pose_timestamp_s=effective_end_pose_timestamp_s,
             command_timestamp_s=command_timestamp_s,
+            gripper_position_timestamp_s=(
+                gripper_command_timestamp_s
+                if use_command
+                else gripper_feedback_timestamp_s
+            ),
         )
 
     def move_to_joint_positions(
@@ -451,18 +594,52 @@ class DualPiperSystem:
         )
 
     def connect(self, *, read_only: bool = True) -> None:
-        self.left.connect(read_only=read_only)
-        self.right.connect(read_only=read_only)
+        try:
+            self.left.connect(read_only=read_only)
+            self.right.connect(read_only=read_only)
+        except BaseException:
+            self.abort_construction()
+            raise
 
     def disconnect(self) -> None:
-        self.left.disconnect()
-        self.right.disconnect()
+        first_error: BaseException | None = None
+        for arm in (self.left, self.right):
+            try:
+                arm.disconnect()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def abort_construction(self) -> None:
+        """Best-effort unwind used only when shared construction/connect fails."""
+
+        for arm in (self.right, self.left):
+            try:
+                arm.abort_construction()
+            except Exception:
+                pass
 
     def read_state(self, *, prefer_joint_ctrl: bool | None = None) -> DualPiperState:
         use_joint_ctrl = self.prefer_joint_ctrl if prefer_joint_ctrl is None else prefer_joint_ctrl
         left_state = self.left.read_state(prefer_joint_ctrl=use_joint_ctrl)
         right_state = self.right.read_state(prefer_joint_ctrl=use_joint_ctrl)
         return DualPiperState(left=left_state, right=right_state)
+
+    def action_state_for_joint_targets(
+        self,
+        left_qpos: Iterable[float],
+        right_qpos: Iterable[float],
+        observation_state: DualPiperState,
+    ) -> DualPiperState:
+        """Represent a rollout action without reading ambiguous shared CAN control frames."""
+
+        return build_dual_joint_target_action_state(
+            left_qpos,
+            right_qpos,
+            observation_state,
+        )
 
     def enable(self) -> bool:
         return self.left.enable() and self.right.enable()

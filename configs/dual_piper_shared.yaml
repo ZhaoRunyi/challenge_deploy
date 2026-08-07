@@ -1,0 +1,39 @@
+# Original deployment topology: one IPC USB-to-CAN adapter per side, with the
+# master and slave arms wired in parallel on that side's physical CAN bus.
+# Shared mode deliberately does not add adapter-serial, role, or frame gates.
+can_topology: shared
+
+robot:
+  master_left:
+    can_name: can0
+  master_right:
+    can_name: can1
+  slave_left:
+    can_name: can0
+  slave_right:
+    can_name: can1
+
+cameras:
+  enabled: true
+  width: 640
+  height: 480
+  fps: 30
+  warmup_frames: 30
+  serials:
+    cam_high: "323422071854"
+    cam_right_wrist: "335522070790"
+    cam_left_wrist: "344322073012"
+
+policy:
+  host: 127.0.0.1
+  port: 8000
+  prompt: fold the cloth
+  inference_rate: 3.0
+  chunk_size: 50
+  latency_k: 8
+  min_smooth_steps: 8
+  buffer_max_chunks: 10
+
+dataset:
+  dataset_dir: ./artifacts/hdf5_data
+  dataset_name: dummy_task

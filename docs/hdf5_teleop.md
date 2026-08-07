@@ -1,111 +1,135 @@
-# HDF5 teleop Integration Notes
+# HDF5 Teleop 与 Rollout 数据说明
 
-这个接入基于 `<source_archive>/data_collection.zip` 中两份核心代码：
+本项目有两条 HDF5 写入通路，它们复用同一套图像编码、Piper 状态转换和 reader，
+但采样语义不同：
 
-- 原始 ROS collector
-- `episode_vis.py`
+- 静态遥操：`run_hdf5_teleop_collect.py`，保留原 ROS collector 的一拍错位。
+- rollout：六个 `run_*_client.py` 的 `--save`，只记录稳定控制 tick。
 
-目标不是重写一份“差不多能跑”的 collector，而是保留原作者在数据语义和落盘格式上的关键设计，同时把设备层替换成当前项目的：
+两者都使用本项目原生的 `piper_sdk` 与 `pyrealsense2`，不依赖 ROS topic、message
+或 `PoseStamped`。
 
-- `piper_sdk`
-- `pyrealsense2`
+## 1. 静态遥操数据语义
 
-## 原实现里值得保留的设计
+### observation/action 一拍错位
 
-### 1. observation/action 一拍错位
+collector 先采一帧 `FIRST observation`。之后每一拍继续采：
 
-原脚本会先采一帧 `FIRST observation`，之后每一拍都继续采：
+- `observation_t` 来自 slave 臂和相机；
+- `action_t` 默认来自下一帧 master 臂状态。
 
-- `observation_t` 来自 puppet arm + cameras
-- `action_t` 实际保存的是下一拍的 master arm qpos
+写盘时 `action[i]` 与 `observation[i]` 具有相同 dataset index，但 action 来自
+`frame[i + 1]`。这是一项保留的行为克隆对齐语义，不适用于 rollout `--save`。
+`--action-from-state` 会改为使用下一帧 slave 状态，但仍保留一拍偏移。
 
-最终写盘时，`action[i]` 和 `observation[i]` 对齐，但 `action[i]` 来自 `frame[i + 1]` 的 master 状态。
+### HDF5 布局
 
-这不是 bug，而是很有意图的行为克隆对齐方式。当前接入保留这个语义。
+静态文件包含：
 
-### 2. HDF5 内联压缩图像
+- `/observations/qpos`、`qpos_feedback`、`qpos_command`、`qvel`、`effort`、
+  `end_pose`；
+- `/observations/eef_quaternion`、`eef_left_time`、`eef_right_time`；
+- 32D `/state` 与 `/action`；
+- 根级单 episode `/language_instruction`；
+- `/observations/source_timestamps/*`；
+- `/observations/images/*` 中的 JPEG bytes，以及启用 depth 时
+  `/observations/images_depth/*` 中的 PNG bytes，均为 HDF5 `vlen uint8`。
 
-原脚本不是把 RGB 图像直接存成 `(H, W, 3)` 数组，而是：
+32D state/action 每臂为
+`[joint6 rad, eef_pos3 m, eef_rot6d, gripper01]`。EEF 时间是相对 episode 首帧，
+不是系统绝对时间。`base_action` 仍为零向量，因为项目没有底盘里程计链路。
+静态文件不写 `/is_intervention`。
 
-- RGB：JPEG bytes
-- depth：PNG bytes
-- HDF5 dataset：`vlen uint8`
+### CAN 拓扑
 
-这样和 `episode_vis.py` 的读取方式闭环一致，也能显著减小单 episode 体积。当前接入保留这个格式。
+角色定义固定如下：master 是搭载示教器、由操作者拖动的臂；slave 是搭载夹爪、
+执行目标的臂。
 
-### 3. 同时保存 joint-space 和 EEF 派生空间
+`can_topology: shared` 保持现有真机通路：同侧 master/slave 共用 CAN，collector
+为同一 SDK 单例缓存创建 master-control 与 slave-feedback 两个只读逻辑视图，
+遥操动作仍由固件原生 FA→FC 完成。该分支不探测角色、不写 `0x470`、不增加
+USB serial gate，也不创建 host gateway。
 
-原脚本同时落盘：
+`can_topology: isolated` 构造四台独立物理臂，先校验四路 USB serial，再通过
+`hardware/factory.py`、`hardware/isolated.py` 完成 no-jump 对齐与角色
+事务，通过 `hardware/linkage_gateway.py` 将每侧 master 的完整、已校验控制帧组
+转发给对应 slave。项目不设置机械 qpos/qvel、关节/夹爪范围、初始差值、settle
+或镜像误差阈值；任一侧通信失败都在写 slave CAN 前 fault 两侧。其他健康检查失败也会
+停止 gateway，并让仍可达的 FC slave 尽力 hold；不会单侧继续采集。
 
-- `qpos / qvel / effort`
-- `eef_quaternion`
-- `eef_6d`
+### 异步时间对齐
 
-这样后续无论训练端用关节空间还是笛卡尔空间，都不需要再从原始 HDF5 反推。当前接入保留这两组字段。
+静态 collector 保留原 ROS 版本的 `deque + timestamp barrier`：
 
-### 4. episode 内时间轴是相对首帧
+- 每个 RealSense 相机一个线程，持续采集 color/depth 并按时间戳入队；
+- 每个 Piper arm 一个线程，读取 SDK 后台 CAN 缓存，只在对应时间戳前进时入队；
+- `frame_time` 取最新 camera/depth 时间戳中的最小值；
+- 每个队列丢弃 `< frame_time` 的样本，再取第一个 `>= frame_time` 的样本组成帧；
+- slave joint/pose 生成 observation，下一帧 master joint/pose 生成默认 action。
 
-原脚本把 `eef_left_time` / `eef_right_time` 写成：
+保存后在 HDF5 同目录生成：
 
-- `frame_time - frame_0_time`
+- `episode_*_alignment_plot<N>_frames<T>.json`
+- `episode_*_alignment_plot<N>_frames<T>.png`
 
-也就是 episode 内相对时间，而不是系统绝对时间。当前接入保留这一语义。
+它们记录入队时间戳、被选中时间戳、偏移统计和抽样可视化。
 
-### 5. 单 episode 级语言字段
+### 静态 collector 交互
 
-原脚本的 `language_instruction` 只在根级 dataset 写一次，而不是每帧重复。当前接入保留这个写法。
+静态采集要求 TTY：idle 按 `c` 开始、`q` 退出；active 按 `s` 停止，active
+期间的 `q` 不会直接退出；停止后按 `c` 保存并继续，或按 `d` 丢弃并继续。
+`episode_<idx>_running.txt` sentinel 被删除时也会提前停止当前 episode。
 
-### 6. 可删除 sentinel 终止录制
+默认 dataset 根目录为 `artifacts/hdf5_data`，默认 task 为 `dummy_task`。
 
-原脚本会创建：
+静态入口的 `--record/--recording` 会从保存的 episode 生成诊断视频，
+`--save-sep` 额外生成逐相机视频。默认情况下这些视频与对应 HDF5 位于同一
+episode 目录；`--record-dir` 可单独覆盖视频目录。HDF5 及 alignment JSON/PNG
+仍保留在 `dataset-dir/task-name` 下。
 
-- `episode_<idx>_running.txt`
+## 2. Rollout `--save` 数据语义
 
-只要这个文件被删掉，就提前停止录制。这是很实用的人工中断机制。当前接入保留这个机制。
+六个 rollout runner 都把成功提交的稳定 tick 交给
+`rollout/hdf5.py`：
 
-### 7. `episode_vis.py` 的三视角拼接方式
+- 只记录 `ROLLOUT_ACTIVE` 与 `INTERVENE_ACTIVE`；
+- 初始插值、角色切换、对齐、hold、pause 和 `ROLLOUT_REACQUIRE` 不进入训练序列；
+- 静止但成功提交的稳定 tick 仍记录；
+- `/state` 来自同 tick 的 fresh slave observation；
+- `/action` 是该 tick 实际选中并提交的 canonical 目标；
+- `/is_intervention[t]` 与同一条 action 对齐，ROLLOUT 为 `false`，INTERVENE
+  为 `true`。
 
-原可视化脚本使用：
+未启用 `--intervention` 的 rollout 文件仍包含 `/is_intervention`，其值全为
+`false`。静态 teleop 文件则完全没有该 dataset。rollout source timestamp 使用
+`slave_*` 命名；reader 会把历史文件中的 `puppet_*` 同时映射为 `slave_*`，不会
+重写旧文件。
 
-- `cam_high` 作为主视图
-- `cam_left_wrist` 与 `cam_right_wrist` 先纵向拼接，再缩小，再拼到主视图右边
+`--save` 与 `--record/--recording` 互相独立：前者生成训练 HDF5，后者生成诊断
+视频、动作/状态 NPZ、frame1 和相关指标。`--record-steps` 只限制诊断捕获；达到
+该值后控制和 HDF5 继续，episode 边界的 `x` 也不会扩展它。`--save` 要求配置中
+的全部相机持续可用。
 
-当前接入保留这个视频布局。
+正常停止后按 `c` 保存 HDF5、按 `d` 丢弃 HDF5；诊断产物不随 `d` 删除。
+可捕获的 Ctrl-C、CAN 或相机故障会尽力保留已完成稳定 tick 的 partial episode。
 
-## 新实现里的设备替换
+## 3. 原子写入与 writer 槽
 
-原实现依赖 ROS topic：
+HDF5 先写到目标目录中每个 writer 独有的 `.tmp`，完整关闭后无覆盖地原子发布
+目标文件。rollout 最多
+同时运行两个 `spawn` writer，不设置第三条等待队列：
 
-- `master_arm_*`
-- `puppet_arm_*`
-- `camera_*`
-- `PoseStamped`
+- 0 或 1 个 writer 活跃时，idle 可以按 `c` 开始新 episode；
+- 2 个 writer 活跃时，idle 的 `c` 无效；
+- idle 或退出等待期间可按 `k` 终止最老 writer，只清理其自己的 `.tmp` 并写失败记录；
+- idle 按 `q` 后会等待剩余 writer 完成。
 
-当前替换为本项目原生设备层：
+SIGKILL 或工控机突然断电仍可能丢失当前尚未提交的 episode。
 
-- master arms：`DualPiperSystem(read_only=True)` 读取 `robot.master_left/master_right`
-- puppet arms：`DualPiperSystem(read_only=True)` 读取 `robot.left/right`
-- cameras：`RealSenseRig`
-- EEF pose：直接来自 `PiperArmState.end_pose`
+## 4. 文件入口
 
-## 当前接入文件
-
-- 采集入口：`run_hdf5_teleop_collect.py`
-- 可视化入口：`run_hdf5_teleop_episode_vis.py`
-- 共享实现：`teleop/hdf5_teleop.py`
-
-## 当前异步对齐逻辑
-
-当前实现已经恢复原始 ROS collector 的 `deque + timestamp barrier` 语义，只是数据源从 ROS topic 换成了本地异步线程：
-
-- 每个 RealSense camera 一个线程，持续 `wait_for_frames()` 并把 color/depth 分别按时间戳写入队列。
-- 每个 Piper arm 一个线程，持续读取 `piper_sdk` 后台 CAN 线程缓存的状态，只在 SDK `time_stamp` 前进时入队。
-- `frame_time = min(latest camera/depth timestamps)`，和原始 `get_frame()` 一致。
-- 每个队列丢弃所有 `< frame_time` 的样本，然后取第一个 `>= frame_time` 的样本组成 frame。
-- puppet joint + pose 队列生成 32D `observations/qpos`：每臂 `[joint6 rad, eef_pos3 m, eef_rot6d, gripper01]`。
-- 下一帧 master joint + pose 队列生成同样 32D 的 `/action`。
-- puppet pose 队列还生成 `eef_quaternion/eef_6d`；这里没有 ROS `PoseStamped`，pose 来自 `piper_sdk` 的 end-pose feedback。
-- HDF5 额外写 `/observations/source_timestamps/*`，用于检查最终 frame 是由哪些异步源时间戳对齐出来的。
-- 采集结束会在 HDF5 旁生成 `*_alignment_every<N>_frames<T>.json/png`，记录全量入队时间戳、被选中时间戳和偏移统计。
-
-仍然保留的差异：`base_action` 固定为零向量，因为当前项目没有接入底盘里程计链路。
+- 静态采集：`run_hdf5_teleop_collect.py`
+- episode 可视化：`run_hdf5_teleop_episode_vis.py`
+- 静态共享实现：`teleop/hdf5_teleop.py`
+- rollout HDF5：`rollout/hdf5.py`
+- 多 episode/session：`rollout/interactive.py`、`rollout/session.py`

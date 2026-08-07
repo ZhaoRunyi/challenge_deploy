@@ -1,3 +1,17 @@
+"""OpenPI-compatible NumPy MessagePack wire codec.
+
+This module mirrors Physical Intelligence's ``openpi-client`` codec:
+
+* repository: https://github.com/Physical-Intelligence/openpi
+* audited commit: ``15a9616a00943ada6c20a0f158e3adb39df2ccac``
+* upstream path: ``packages/openpi-client/src/openpi_client/msgpack_numpy.py``
+
+The byte keys, dtype string, raw bytes, and shape representation below are wire
+protocol.  Keep them compatible with upstream; local timeout and connection
+lifecycle extensions belong in ``websocket_client_policy`` and must not change
+this encoding.
+"""
+
 from __future__ import annotations
 
 import functools

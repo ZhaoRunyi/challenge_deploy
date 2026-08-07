@@ -6,9 +6,23 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-from lerobot.common.datasets.video_utils import decode_video_frames
 import numpy as np
-import pandas as pd
+
+try:
+    from lerobot.common.datasets.video_utils import decode_video_frames
+except ModuleNotFoundError as error:
+    decode_video_frames = None
+    LEROBOT_IMPORT_ERROR = error
+else:
+    LEROBOT_IMPORT_ERROR = None
+
+try:
+    import pandas as pd
+except ModuleNotFoundError as error:
+    pd = None
+    PANDAS_IMPORT_ERROR = error
+else:
+    PANDAS_IMPORT_ERROR = None
 
 from .assets import (
     ARTIFACTS_ROOT,
@@ -230,6 +244,10 @@ def decode_video_frame_at_timestamp(
     video_key: str,
     timestamp_s: float,
 ) -> np.ndarray:
+    if decode_video_frames is None:
+        raise RuntimeError(
+            "LeRobot video asset extraction requires the optional lerobot package"
+        ) from LEROBOT_IMPORT_ERROR
     video_path = video_path_for_episode(dataset_dir, info, episode_index, video_key)
     frames = decode_video_frames(video_path, [float(timestamp_s)], tolerance_s=1e-4, backend=None)
     if len(frames) == 0:
@@ -287,6 +305,11 @@ def load_cam_high_background_image(
 
 
 def build_cam_high_first_frame_overlay(dataset_dir: Path, *, repo_id: str | None = None) -> np.ndarray:
+    if pd is None:
+        raise RuntimeError(
+            "LeRobot distribution assets require the optional pandas dependency"
+        ) from PANDAS_IMPORT_ERROR
+
     info = info_json(dataset_dir)
     indices = episode_indices(dataset_dir)
     if not indices:
@@ -473,5 +496,3 @@ def prepare_lerobot_assets(
             distribution_ready=False,
             skip_reason=f"failed to build train distribution image from {asset_info.dataset_dir}: {exc}",
         )
-
-

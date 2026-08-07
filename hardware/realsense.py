@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 import time
@@ -8,6 +9,7 @@ from typing import Any
 import cv2
 import numpy as np
 import pyrealsense2 as rs
+
 
 @dataclass(slots=True)
 class RealSenseDeviceInfo:
@@ -20,6 +22,8 @@ class RealSenseDeviceInfo:
 class RealSenseCapture:
     color_images: dict[str, np.ndarray]
     depth_images: dict[str, np.ndarray]
+    color_timestamps_s: dict[str, float]
+    depth_timestamps_s: dict[str, float]
 
 
 @dataclass(slots=True)
@@ -32,20 +36,15 @@ class RealSenseCameraCapture:
     depth_timestamp_s: float | None = None
 
 
-def require_realsense() -> Any:
-    return rs
-
-
 def list_realsense_devices() -> list[RealSenseDeviceInfo]:
-    rs_mod = require_realsense()
-    context = rs_mod.context()
+    context = rs.context()
     devices = []
     for device in context.query_devices():
         devices.append(
             RealSenseDeviceInfo(
-                name=device.get_info(rs_mod.camera_info.name),
-                serial=device.get_info(rs_mod.camera_info.serial_number),
-                physical_port=device.get_info(rs_mod.camera_info.physical_port),
+                name=device.get_info(rs.camera_info.name),
+                serial=device.get_info(rs.camera_info.serial_number),
+                physical_port=device.get_info(rs.camera_info.physical_port),
             )
         )
     return devices
@@ -53,10 +52,9 @@ def list_realsense_devices() -> list[RealSenseDeviceInfo]:
 
 def realsense_frame_timestamp_s(frame: Any, fallback_s: float) -> float:
     try:
-        rs_mod = require_realsense()
         timestamp_ms = float(frame.get_timestamp())
         timestamp_domain = frame.get_frame_timestamp_domain()
-        if timestamp_domain == rs_mod.timestamp_domain.system_time and timestamp_ms > 0.0:
+        if timestamp_domain == rs.timestamp_domain.system_time and timestamp_ms > 0.0:
             return timestamp_ms / 1000.0
     except Exception:
         pass
@@ -84,25 +82,41 @@ class RealSenseRig:
         self.enable_depth = enable_depth
         self.pipelines: dict[str, Any] = {}
         self.started = False
+        self.last_capture: RealSenseCapture | None = None
 
     def start(self) -> None:
-        rs_mod = require_realsense()
         if self.started:
             return
-        for camera_name, serial in self.serials.items():
-            pipeline = rs_mod.pipeline()
-            config = rs_mod.config()
-            config.enable_device(serial)
-            config.enable_stream(rs_mod.stream.color, self.width, self.height, rs_mod.format.bgr8, self.fps)
-            if self.enable_depth:
-                config.enable_stream(rs_mod.stream.depth, self.width, self.height, rs_mod.format.z16, self.fps)
-            pipeline.start(config)
-            self.pipelines[camera_name] = pipeline
+        try:
+            for camera_name, serial in self.serials.items():
+                pipeline = rs.pipeline()
+                config = rs.config()
+                config.enable_device(serial)
+                config.enable_stream(
+                    rs.stream.color,
+                    self.width,
+                    self.height,
+                    rs.format.bgr8,
+                    self.fps,
+                )
+                if self.enable_depth:
+                    config.enable_stream(
+                        rs.stream.depth,
+                        self.width,
+                        self.height,
+                        rs.format.z16,
+                        self.fps,
+                    )
+                pipeline.start(config)
+                self.pipelines[camera_name] = pipeline
 
-        for warmup_index in range(self.warmup_frames):
-            for pipeline in self.pipelines.values():
-                pipeline.wait_for_frames(timeout_ms=5000)
-        self.started = True
+            for _warmup_index in range(self.warmup_frames):
+                for pipeline in self.pipelines.values():
+                    pipeline.wait_for_frames(timeout_ms=5000)
+            self.started = True
+        except BaseException:
+            self.stop()
+            raise
 
     def stop(self) -> None:
         for pipeline in self.pipelines.values():
@@ -113,20 +127,66 @@ class RealSenseRig:
         self.pipelines.clear()
         self.started = False
 
-    def capture_frames(self, timeout_ms: int = 1000) -> RealSenseCapture:
+    def capture_frames(
+        self,
+        timeout_ms: int = 1000,
+        *,
+        parallel: bool = False,
+    ) -> RealSenseCapture:
         if not self.started:
             self.start()
 
+        camera_names = tuple(self.pipelines)
+        if parallel and len(camera_names) > 1:
+            with ThreadPoolExecutor(
+                max_workers=len(camera_names),
+                thread_name_prefix="realsense_capture",
+            ) as executor:
+                futures = {
+                    camera_name: executor.submit(
+                        self.capture_camera_frame,
+                        camera_name,
+                        timeout_ms=timeout_ms,
+                    )
+                    for camera_name in camera_names
+                }
+                captures = {
+                    camera_name: futures[camera_name].result()
+                    for camera_name in camera_names
+                }
+        else:
+            captures = {
+                camera_name: self.capture_camera_frame(
+                    camera_name,
+                    timeout_ms=timeout_ms,
+                )
+                for camera_name in camera_names
+            }
+
         color_images: dict[str, np.ndarray] = {}
         depth_images: dict[str, np.ndarray] = {}
-        for camera_name in self.pipelines:
-            capture = self.capture_camera_frame(camera_name, timeout_ms=timeout_ms)
+        color_timestamps_s: dict[str, float] = {}
+        depth_timestamps_s: dict[str, float] = {}
+        for camera_name, capture in captures.items():
             color_images[camera_name] = capture.color_image
+            color_timestamps_s[camera_name] = float(capture.timestamp_s)
             if self.enable_depth:
                 if capture.depth_image is None:
                     raise RuntimeError(f"No depth frame available from {camera_name}")
                 depth_images[camera_name] = capture.depth_image
-        return RealSenseCapture(color_images=color_images, depth_images=depth_images)
+                if capture.depth_timestamp_s is None:
+                    raise RuntimeError(
+                        f"No depth timestamp available from {camera_name}"
+                    )
+                depth_timestamps_s[camera_name] = float(capture.depth_timestamp_s)
+        capture = RealSenseCapture(
+            color_images=color_images,
+            depth_images=depth_images,
+            color_timestamps_s=color_timestamps_s,
+            depth_timestamps_s=depth_timestamps_s,
+        )
+        self.last_capture = capture
+        return capture
 
     def capture_camera_frame(self, camera_name: str, timeout_ms: int = 1000) -> RealSenseCameraCapture:
         if not self.started:

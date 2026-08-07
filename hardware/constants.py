@@ -12,12 +12,26 @@ DEFAULT_CAMERA_SERIALS: dict[str, str] = {
     "cam_right_wrist": "335522070790",
 }
 
+PIPER_ARM_IDS: tuple[str, str, str, str] = (
+    "master_left",
+    "master_right",
+    "slave_left",
+    "slave_right",
+)
+
+CAN_TOPOLOGIES: tuple[str, str] = ("shared", "isolated")
+
+# Stable interface names are installed only after a human has confirmed which
+# USB-to-CAN adapter belongs to which physical arm.  The repository deliberately
+# does not infer role assignment from the kernel's transient can0..can3 order.
 DEFAULT_CAN_NAMES: dict[str, str] = {
-    "left": "can0",
-    "right": "can1",
-    "master_left": "can_left_mas",
-    "master_right": "can_right_mas",
+    "master_left": "piper_ml",
+    "master_right": "piper_mr",
+    "slave_left": "piper_sl",
+    "slave_right": "piper_sr",
 }
+
+UNCONFIRMED_CAN_SERIAL = "REPLACE_WITH_CONFIRMED_ID_SERIAL_SHORT"
 
 DEFAULT_PROMPT = "fold the cloth"
 

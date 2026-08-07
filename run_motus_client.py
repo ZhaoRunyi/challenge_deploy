@@ -2,10 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
-import time
-
-import numpy as np
 
 from hardware.config import load_config
 from rollout.assets import prepare_client_assets
@@ -14,62 +10,41 @@ from clients.motus import (
     load_motus_policy_spec,
     spec_summary,
 )
-from rollout.execution import (
-    action_sequence,
-    resolve_chunk_size,
-    resolve_policy_steps,
-    resolve_record_steps,
-    run_chunk_sync_rollout,
-    save_rollout_metrics,
-    run_temporal_smoothing_rollout,
-)
-from rollout.recording import RolloutVideoRecorder, ExecutionRecordSink, save_frame1_image, save_recorded_actions, set_distribution_overlap
-from rollout.windowing import RuntimeExecutionWindow, preview_until_continue
+from rollout.dry_run import run_deferred_policy_dry_run_plan
+from rollout.runner import RolloutRuntimePlan, run_configured_rollout_runtime
 from rollout.support import (
+    add_gripper_bound_args,
     add_gripper_encoding_args,
+    add_standard_rollout_args,
+    add_websocket_policy_args,
     apply_arm_gripper_overrides,
     apply_runtime_overrides,
+    close_policy_transport,
     build_slai_recording_state,
-    decoded_action_summary,
-    ignore_recorder_signal_handlers,
-    install_recorder_signal_handlers,
-    make_dual_piper_runtime,
+    make_recording_state_builder,
+    make_rollout_argument_parser,
     make_slai_recording_schema,
     normalized_prompt,
-    print_rollout_chunk_summary,
-    record_name_prefix,
-    resolve_dual_piper_init_joints,
+    prepare_rollout_runtime,
+    print_resolved_prompt,
+    print_server_metadata,
+    validate_standard_rollout_args,
 )
-
-
-DEPLOY_ROOT = Path(__file__).resolve().parent
-
-
-def new_session_id() -> str:
-    return f"motus_{time.strftime('%Y%m%d_%H%M%S')}"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Motus SLAI Piper client: capture snapshots, infer chunks, and command Piper in a rollout."
-    )
+    parser = make_rollout_argument_parser("Motus SLAI Piper")
     parser.add_argument(
         "--train-config",
         required=True,
         help="Motus YAML config path, e.g. baselines/Motus/configs/piper_click_bell_0403_robotwin_like.yaml.",
     )
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--prompt", default=None)
-    parser.add_argument("--control-mode", choices=["joints", "ee_pose"], default="joints")
-    parser.add_argument("--api-key", default=None)
-    parser.add_argument("--joint-speed-percent", type=int, default=100)
-    parser.add_argument("--ee-speed-percent", type=int, default=100)
+    add_websocket_policy_args(parser, default_speed_percent=100)
     parser.add_argument(
         "--gripper-effort",
         type=int,
         default=None,
-        help="Piper SDK GripperCtrl effort in [0, 5000]. Defaults to the hardware layer value.",
+        help="Piper SDK GripperCtrl effort. Defaults to the hardware layer value.",
     )
     parser.add_argument(
         "--gripper-action-frames",
@@ -80,114 +55,50 @@ def build_parser() -> argparse.ArgumentParser:
             "across this many command frames while the other joints stay frozen."
         ),
     )
-    parser.add_argument(
-        "--gripper_threshold",
-        type=float,
-        default=None,
-        help="Optional executable-scale gripper threshold in meters. Values below threshold close the gripper, and values above threshold command full open.",
+    add_gripper_bound_args(
+        parser,
+        threshold_help=(
+            "Optional executable-scale gripper threshold in meters. Values below "
+            "threshold close the gripper, and values above it command full open."
+        ),
     )
-    for side in ("left", "right"):
-        typo_aliases = [f"--{side}_gripper_thrshold"] if side == "left" else []
-        parser.add_argument(
-            f"--{side}_gripper_threshold",
-            *typo_aliases,
-            dest=f"{side}_gripper_threshold",
-            type=float,
-            default=None,
-        )
-        parser.add_argument(f"--{side}_gripper_lower", type=float, default=None)
-        parser.add_argument(f"--{side}_gripper_upper", type=float, default=None)
-    parser.add_argument("--gripper_lower", type=float, default=None)
-    parser.add_argument("--gripper_upper", type=float, default=None)
     add_gripper_encoding_args(parser)
-    parser.add_argument(
-        "--rollout-steps",
-        type=int,
-        default=1000,
-        help="Number of action frames to command; 0 means run until Ctrl-C.",
-    )
-    parser.add_argument(
-        "--record-steps",
-        type=int,
-        default=None,
-        help="Total frames to record; default is --rollout-steps. Requires --record or --window when set.",
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=None,
-        help="Actions to execute from each policy chunk; default is train config action_horizon.",
-    )
-    parser.add_argument(
-        "--fps",
-        type=float,
-        default=10.0,
-        help="Action command frequency in Hz; 0 sends the chunk as fast as possible.",
-    )
-    parser.add_argument(
-        "--execution-mode",
-        choices=["streaming", "chunk_sync"],
-        default="chunk_sync",
-        help="streaming uses kai0-style async inference + temporal chunk-wise smoothing; chunk_sync preserves the older blocking loop.",
-    )
-    parser.add_argument("--inference-rate", type=float, default=None, help="Streaming policy request frequency in Hz; default from config.")
-    parser.add_argument("--latency-k", type=int, default=None, help="Max prefix actions to trim from a fresh chunk; default from config.")
-    parser.add_argument("--min-smooth-steps", type=int, default=None, help="Minimum old-tail length for overlap smoothing; default from config.")
-    parser.add_argument("--buffer-max-chunks", type=int, default=None, help="Action buffer chunk cap; default from config.")
     parser.add_argument("--num-inference-timesteps", type=int, default=None, help="Override Motus denoising steps for server inference.")
-    parser.add_argument("--metrics-json", default=None, help="Optional path to save rollout timing metrics as JSON.")
-    parser.add_argument("--record", action="store_true", help="Record cameras, actions, and states into one deploy video.")
-    parser.add_argument("--save-sep", action="store_true", help="Save one raw-camera video per recording camera; requires --record.")
-    parser.add_argument("--record-dir", default=str(DEPLOY_ROOT / "artifacts" / "motus_records"))
-    parser.add_argument("--config", default=str(DEPLOY_ROOT / "configs" / "dual_piper_example.yaml"))
-    parser.add_argument("--left-can", default=None)
-    parser.add_argument("--right-can", default=None)
-    parser.add_argument(
-        "--init-joints",
-        nargs=14,
-        type=float,
-        default=None,
-        help="Optional 14D dual-Piper initial qpos override: left 7 then right 7.",
-    )
-    parser.add_argument("--camera-high-serial", default=None)
-    parser.add_argument("--camera-left-serial", default=None)
-    parser.add_argument("--camera-right-serial", default=None)
-    parser.add_argument("--no-cameras", action="store_true")
-    parser.add_argument("--window", nargs="?", const=1, type=int, default=0)
-    parser.add_argument("--dist-overlap", action="store_true", help="Overlay train distribution on cam_high instead of stacking it above.")
-    parser.add_argument("--dry-run", action="store_true", help="Infer and decode the first action, but do not command Piper.")
-    parser.add_argument("--spec-only", action="store_true", help="Only print the train-config-derived spaces; no server or hardware.")
-    parser.add_argument("--ready-timeout", type=float, default=15.0)
+    add_standard_rollout_args(parser, record_directory_name="motus_records")
     return parser
 
 
 def run_once(args: argparse.Namespace) -> None:
-    set_distribution_overlap(args.dist_overlap)
-    if args.save_sep and not args.record:
-        raise ValueError("--save-sep requires --record")
-    if args.record_steps is not None and not (args.record or args.window):
-        raise ValueError("--record-steps requires --record or --window")
-    spec = load_motus_policy_spec(args.train_config)
-    print(json.dumps(spec_summary(spec), indent=2))
-    if args.spec_only:
-        return
+    validate_standard_rollout_args(args)
+    if not args.dry_run:
+        spec = load_motus_policy_spec(args.train_config)
+        policy_spec_summary = spec_summary(spec)
+        if args.spec_only:
+            print(json.dumps(policy_spec_summary, indent=2))
+            return
     cli_prompt = normalized_prompt(args.prompt)
-    if args.rollout_steps < 0:
-        raise ValueError("--rollout-steps must be non-negative")
-    record_steps = resolve_record_steps(args.rollout_steps, args.record_steps)
-    policy_steps = resolve_policy_steps(args.rollout_steps, record_steps)
-    if args.fps < 0.0:
-        raise ValueError("--fps must be non-negative")
-    if args.gripper_effort is not None and not 0 <= args.gripper_effort <= 5000:
-        raise ValueError("--gripper-effort must be in [0, 5000]")
     if args.gripper_action_frames <= 0:
         raise ValueError("--gripper-action-frames must be positive")
-    if args.gripper_threshold is not None and args.gripper_threshold < 0.0:
-        raise ValueError("--gripper_threshold must be non-negative")
-    if args.gripper_threshold is not None and (args.gripper_lower is not None or args.gripper_upper is not None):
-        raise ValueError("--gripper_threshold cannot be combined with --gripper_lower/--gripper_upper")
-    if args.inference_rate is not None and args.inference_rate < 0.0:
-        raise ValueError("--inference-rate must be non-negative")
+    if args.num_inference_timesteps is not None and args.num_inference_timesteps <= 0:
+        raise ValueError("--num-inference-timesteps must be positive")
+
+    runtime_config = apply_runtime_overrides(load_config(args.config), args)
+    if args.dry_run:
+        run_deferred_policy_dry_run_plan(
+            args=args,
+            runner_name="run_motus_client",
+            policy_transport_name="MotusPiperClient",
+            runtime_config=runtime_config,
+            configuration_kind="Motus deployment YAML and normalization stats",
+        )
+        return
+    initial_joints, runtime_event_callback = prepare_rollout_runtime(
+        args=args,
+        spec=spec,
+        runtime_config=runtime_config,
+        runner_name="run_motus_client",
+    )
+    print(json.dumps(policy_spec_summary, indent=2))
     client = MotusPiperClient(
         args.train_config,
         host=args.host,
@@ -205,301 +116,50 @@ def run_once(args: argparse.Namespace) -> None:
         state_gripper_encoding=args.state_gripper,
         action_gripper_encoding=args.action_gripper,
     )
-    apply_arm_gripper_overrides(client, args)
-    state_builder = lambda snapshot, policy_spec: build_slai_recording_state(
-        snapshot,
-        policy_spec,
-        state_gripper_encoding=args.state_gripper,
-    )
-    server_metadata = client.get_server_metadata()
-    print(json.dumps({"server_metadata": server_metadata}, indent=2), flush=True)
-
-    client_assets = prepare_client_assets(
-        client_kind="motus",
-        train_config_name=args.train_config,
-        cli_prompt=cli_prompt,
-        need_distribution=args.record or args.window,
-        spec=spec,
-        server_metadata=server_metadata,
-    )
-    resolved_prompt = client_assets.prompt
-    prompt_source = client_assets.prompt_source
-    if resolved_prompt is None:
-        raise RuntimeError(
-            "No prompt available. Provide --prompt, or ensure the remote Motus server was started with --default_prompt."
-        )
-    print(
-        json.dumps(
-            {
-                "prompt": {
-                    "value": resolved_prompt,
-                    "source": prompt_source,
-                }
-            },
-            indent=2,
-        ),
-        flush=True,
-    )
-
-    runtime_config = apply_runtime_overrides(load_config(args.config), args)
-    robot, cameras, source = make_dual_piper_runtime(
-        runtime_config,
-        commands_enabled=not args.dry_run,
-        name="motus_piper_client",
-    )
-    recording_schema = make_slai_recording_schema(spec, args.control_mode)
-    runtime_window = (
-        RuntimeExecutionWindow(schema=recording_schema, display_index=args.window)
-        if args.window
-        else None
-    )
-    saved_actions: list[np.ndarray] | None = [] if args.record else None
-    recorder = (
-        RolloutVideoRecorder(
-            output_dir=args.record_dir,
-            schema=recording_schema,
-            fps=args.fps,
-            name_prefix=record_name_prefix(args, server_metadata),
-            save_separate_videos=args.save_sep,
-        )
-        if args.record
-        else None
-    )
-    record_sink = (
-        ExecutionRecordSink(recorder=recorder, runtime_window=runtime_window)
-        if recorder is not None or runtime_window is not None
-        else None
-    )
-    install_recorder_signal_handlers(recorder)
-
-    first_obs_snapshot = None
-    frame1_path = None
-    distribution_image_path = client_assets.distribution_image_path
-    distribution_skip_reason = client_assets.skip_reason
-    session_id = new_session_id()
-    client.set_default_session_id(session_id)
-    metrics = None
-    robot.connect(read_only=args.dry_run)
     try:
-        if cameras is not None:
-            cameras.start()
-        if not source.wait_until_ready(timeout_s=args.ready_timeout):
-            raise RuntimeError("Timed out waiting for Piper/RealSense data")
+        apply_arm_gripper_overrides(client, args)
+        server_metadata = client.get_server_metadata()
+        print_server_metadata(server_metadata)
 
-        if args.dry_run:
-            snapshot = source.capture_snapshot()
-            first_obs_snapshot = snapshot
-            actions = action_sequence(client.infer_actions(snapshot, prompt=resolved_prompt))
-            if record_sink is not None:
-                record_sink.record(
-                    images=snapshot.images,
-                    action=actions[0],
-                    state=state_builder(snapshot, spec),
-                    timestamp_s=snapshot.timestamp_s,
-                )
-            if saved_actions is not None:
-                saved_actions.append(actions[0].copy())
-            if recorder is not None:
-                frame1_path = save_frame1_image(
-                    recorder,
-                    snapshot,
-                    distribution_image_path=distribution_image_path,
-                    preferred_names=("cam_high",) + tuple(spec.image_ids),
-                )
-                if frame1_path is not None:
-                    print(f"Frame1 image saved to {frame1_path}", flush=True)
-            if args.window:
-                preview_until_continue(source, distribution_image_path=distribution_image_path)
-            print(json.dumps(decoded_action_summary(client.decode_action(actions[0])), indent=2))
-            return
-
-        print('{"hardware_init": "enable_dual_piper"}', flush=True)
-        if not robot.enable():
-            print("Warning: Piper arm enable check did not report success; continuing anyway.", flush=True)
-
-        initial_joints = resolve_dual_piper_init_joints(args.init_joints)
-        print(json.dumps({"initial_pose": {"qpos": initial_joints.tolist()}}, indent=2), flush=True)
-        robot.move_to_joint_positions(
-            initial_joints,
-            speed_percent=args.joint_speed_percent,
-            gripper_effort=args.gripper_effort,
+        client_assets = prepare_client_assets(
+            client_kind="motus",
+            train_config_name=args.train_config,
+            cli_prompt=cli_prompt,
+            need_distribution=args.record or args.window,
+            spec=spec,
+            server_metadata=server_metadata,
         )
-        first_obs_snapshot = source.capture_snapshot()
-        if recorder is not None:
-            frame1_path = save_frame1_image(
-                recorder,
-                first_obs_snapshot,
-                distribution_image_path=distribution_image_path,
-                preferred_names=("cam_high",) + tuple(spec.image_ids),
+        resolved_prompt = client_assets.prompt
+        if resolved_prompt is None:
+            raise RuntimeError(
+                "No prompt available. Provide --prompt, or ensure the remote Motus server was started with --default_prompt."
             )
-            if frame1_path is not None:
-                print(f"Frame1 image saved to {frame1_path}", flush=True)
-        if args.window:
-            preview_until_continue(source, distribution_image_path=distribution_image_path)
-        chunk_size = resolve_chunk_size(spec, args.chunk_size)
-        inference_rate = (
-            float(args.inference_rate)
-            if args.inference_rate is not None
-            else float(runtime_config["policy"]["inference_rate"])
-        )
-        latency_k = (
-            int(args.latency_k)
-            if args.latency_k is not None
-            else int(runtime_config["policy"]["latency_k"])
-        )
-        min_smooth_steps = (
-            int(args.min_smooth_steps)
-            if args.min_smooth_steps is not None
-            else int(runtime_config["policy"]["min_smooth_steps"])
-        )
-        buffer_max_chunks = (
-            int(args.buffer_max_chunks)
-            if args.buffer_max_chunks is not None
-            else int(runtime_config["policy"]["buffer_max_chunks"])
-        )
-
-        print(
-            json.dumps(
-                {
-                    "rollout": {
-                        "execution_mode": args.execution_mode,
-                        "rollout_steps": args.rollout_steps,
-                        "record_steps": record_steps,
-                        "chunk_size": chunk_size,
-                        "fps": args.fps,
-                        "inference_rate": inference_rate if args.execution_mode == "streaming" else None,
-                        "latency_k": latency_k if args.execution_mode == "streaming" else None,
-                        "min_smooth_steps": min_smooth_steps if args.execution_mode == "streaming" else None,
-                        "buffer_max_chunks": buffer_max_chunks if args.execution_mode == "streaming" else None,
-                        "joint_speed_percent": args.joint_speed_percent,
-                        "ee_speed_percent": args.ee_speed_percent,
-                        "gripper_effort": args.gripper_effort,
-                        "gripper_action_frames": args.gripper_action_frames,
-                        "gripper_threshold": args.gripper_threshold,
-                        "gripper_lower": args.gripper_lower,
-                        "gripper_upper": args.gripper_upper,
-                        "state_gripper": args.state_gripper,
-                        "action_gripper": args.action_gripper,
-                    }
-                },
-                indent=2,
+        print_resolved_prompt(resolved_prompt, client_assets.prompt_source)
+        run_configured_rollout_runtime(
+            args=args,
+            client=client,
+            spec=spec,
+            runtime_config=runtime_config,
+            plan=RolloutRuntimePlan(
+                hardware_name="motus_piper_client",
+                prompt=resolved_prompt,
+                initial_joints=initial_joints,
+                recording_schema=make_slai_recording_schema(spec, args.control_mode),
+                state_builder=make_recording_state_builder(
+                    build_slai_recording_state,
+                    args.state_gripper,
+                ),
+                server_metadata=server_metadata,
+                runtime_event_callback=runtime_event_callback,
+                distribution_image_path=client_assets.distribution_image_path,
+                distribution_skip_reason=client_assets.skip_reason,
+                preferred_frame_names=("cam_high",) + tuple(spec.image_ids),
+                initial_gripper_effort=args.gripper_effort,
+                save_predicted_video=True,
             ),
-            flush=True,
         )
-
-        def log_chunk(chunk_index: int, action_count: int, executed_steps: int, first_action: np.ndarray) -> None:
-            print_rollout_chunk_summary(
-                client=client,
-                chunk_index=chunk_index,
-                action_count=action_count,
-                executed_steps=executed_steps,
-                rollout_steps=policy_steps,
-                first_action=first_action,
-            )
-
-        if args.execution_mode == "streaming":
-            metrics = run_temporal_smoothing_rollout(
-                client=client,
-                source=source,
-                robot=robot,
-                spec=spec,
-                prompt=resolved_prompt,
-                rollout_steps=args.rollout_steps,
-                record_steps=record_steps,
-                chunk_size=chunk_size,
-                fps=args.fps,
-                inference_rate=inference_rate,
-                latency_k=latency_k,
-                min_smooth_steps=min_smooth_steps,
-                buffer_max_chunks=buffer_max_chunks,
-                recorder=record_sink,
-                saved_actions=saved_actions,
-                log_chunk=log_chunk,
-                initial_snapshot=first_obs_snapshot,
-                state_builder=state_builder,
-            )
-        else:
-            metrics = run_chunk_sync_rollout(
-                client=client,
-                source=source,
-                robot=robot,
-                spec=spec,
-                prompt=resolved_prompt,
-                rollout_steps=args.rollout_steps,
-                record_steps=record_steps,
-                chunk_size=chunk_size,
-                fps=args.fps,
-                recorder=record_sink,
-                saved_actions=saved_actions,
-                log_chunk=log_chunk,
-                initial_snapshot=first_obs_snapshot,
-                state_builder=state_builder,
-            )
-        if metrics.interrupted:
-            print("Interrupted by user; stopping rollout.", flush=True)
-        metrics_summary, written_metric_paths = save_rollout_metrics(
-            metrics,
-            metrics_json_path=args.metrics_json,
-            run_dir=recorder.run_dir if recorder is not None else None,
-            record_stem=recorder.record_stem if recorder is not None else None,
-        )
-        print(json.dumps({"rollout_metrics": metrics_summary}, indent=2), flush=True)
-        for metrics_path in written_metric_paths:
-            print(f"Rollout metrics saved to {metrics_path}", flush=True)
-    except KeyboardInterrupt:
-        print("Interrupted by user; stopping rollout.", flush=True)
     finally:
-        ignore_recorder_signal_handlers(recorder)
-        if cameras is not None:
-            try:
-                cameras.stop()
-            except Exception as exc:
-                print(f"Failed to stop cameras cleanly: {exc}", flush=True)
-        try:
-            robot.disconnect()
-        except Exception as exc:
-            print(f"Failed to disconnect robot cleanly: {exc}", flush=True)
-        if recorder is not None:
-            try:
-                action_path = save_recorded_actions(recorder, saved_actions, recording_schema.action_names)
-                print(f"Actions saved to {action_path}", flush=True)
-            except Exception as exc:
-                print(f"Failed to save actions: {exc}", flush=True)
-            output_path = None
-            try:
-                output_path = recorder.finalize()
-            except Exception as exc:
-                print(f"Failed to finalize recording: {exc}", flush=True)
-            if output_path is not None:
-                print(f"Recording saved to {output_path}", flush=True)
-                for separate_video_path in recorder.separate_video_paths:
-                    print(f"Separate camera video saved to {separate_video_path}", flush=True)
-                try:
-                    predicted_video_path = client.save_predicted_video(
-                        session_id=session_id,
-                        output_dir=recorder.run_dir,
-                        file_stem=recorder.record_stem,
-                    )
-                    if predicted_video_path is not None:
-                        print(f"Predicted video saved to {predicted_video_path}", flush=True)
-                except Exception as exc:
-                    print(f"Failed to save predicted video: {exc}", flush=True)
-                try:
-                    if frame1_path is None:
-                        frame1_path = save_frame1_image(
-                            recorder,
-                            first_obs_snapshot,
-                            distribution_image_path=distribution_image_path,
-                            preferred_names=("cam_high",) + tuple(spec.image_ids),
-                        )
-                    if frame1_path is not None:
-                        print(f"Frame1 image saved to {frame1_path}", flush=True)
-                    elif distribution_skip_reason is not None:
-                        print(f"Skipped train-distribution frame1 image: {distribution_skip_reason}", flush=True)
-                except Exception as exc:
-                    print(f"Failed to save frame1 image: {exc}", flush=True)
-        if runtime_window is not None:
-            runtime_window.close()
+        close_policy_transport(client)
 
 
 def main() -> None:

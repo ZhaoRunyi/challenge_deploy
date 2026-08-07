@@ -16,11 +16,13 @@ from . import slai_piper_policy
 from .base import (
     ActionGripperEncoding,
     ControlMode,
+    PolicySessionCapability,
+    PolicyResponseFormatError,
     SlaiPiperClient,
     StateGripperEncoding,
-    action_array_from_response,
     build_full_piper_state as build_slai_full_piper_state,
     image_to_rgb,
+    quiet_close_policy_transport_on_construction_error,
 )
 from .specs import slai_policy_spec_summary
 
@@ -108,11 +110,35 @@ class FastWAMHTTPPolicyClient:
         self.url = f"http://{host}:{int(port)}{endpoint}"
         self.timeout_s = float(timeout_s)
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self._closed = False
 
     def get_server_metadata(self) -> dict[str, Any]:
         return {}
 
+    def new_inference_session(self) -> "FastWAMHTTPPolicyClient":
+        """Clone immutable endpoint settings with an independent HTTP opener."""
+
+        session = object.__new__(type(self))
+        session.url = self.url
+        session.timeout_s = self.timeout_s
+        session.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        session._closed = False
+        return session
+
+    def set_inference_timeout(self, timeout_s: float) -> None:
+        if timeout_s <= 0.0:
+            raise ValueError("inference timeout must be positive")
+        self.timeout_s = float(timeout_s)
+
+    def close(self) -> None:
+        # urllib doesn't expose an in-flight connection before ``open``
+        # returns.  Matching its socket timeout to the coordinator deadline
+        # bounds retirement; this flag prevents the lane from being reused.
+        self._closed = True
+
     def open_payload(self, payload: dict[str, Any], *, timeout_s: float | None = None) -> Any:
+        if self._closed:
+            raise RuntimeError("FastWAM inference session is closed")
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             self.url,
@@ -154,9 +180,16 @@ class FastWAMHTTPPolicyClient:
         except (urllib.error.URLError, OSError) as exc:
             raise RuntimeError(f"Failed to reach FastWAM server at {self.url}: {exc!r}") from exc
 
-        result = json.loads(body)
+        try:
+            result = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise PolicyResponseFormatError(
+                f"FastWAM server returned malformed JSON: {exc}"
+            ) from exc
         if not isinstance(result, dict):
-            raise RuntimeError(f"FastWAM server returned non-object JSON: {type(result).__name__}")
+            raise PolicyResponseFormatError(
+                f"FastWAM server returned non-object JSON: {type(result).__name__}"
+            )
         if "error" in result:
             raise RuntimeError(f"FastWAM server error: {result['error']}")
         video_b64 = result.get("predicted_video_b64")
@@ -285,6 +318,8 @@ def build_policy_payload(
 
 
 class FastWAMPiperClient(SlaiPiperClient):
+    SESSION_CAPABILITY = PolicySessionCapability.SESSION_ID
+
     def __init__(
         self,
         train_config_name: str = FASTWAM_DEFAULT_TRAIN_CONFIG,
@@ -320,20 +355,24 @@ class FastWAMPiperClient(SlaiPiperClient):
             endpoint=endpoint,
             timeout_s=request_timeout_s,
         )
-        super().__init__(
-            spec=spec,
-            policy_client=policy_client,
-            control_mode=control_mode,
-            joint_speed_percent=joint_speed_percent,
-            ee_speed_percent=ee_speed_percent,
-            gripper_threshold=gripper_threshold,
-            gripper_lower=gripper_lower,
-            gripper_upper=gripper_upper,
-            state_gripper_encoding=state_gripper_encoding,
-            action_gripper_encoding=action_gripper_encoding,
-            gripper_effort=gripper_effort,
-            gripper_action_frames=gripper_action_frames,
-        )
+        try:
+            super().__init__(
+                spec=spec,
+                policy_client=policy_client,
+                control_mode=control_mode,
+                joint_speed_percent=joint_speed_percent,
+                ee_speed_percent=ee_speed_percent,
+                gripper_threshold=gripper_threshold,
+                gripper_lower=gripper_lower,
+                gripper_upper=gripper_upper,
+                state_gripper_encoding=state_gripper_encoding,
+                action_gripper_encoding=action_gripper_encoding,
+                gripper_effort=gripper_effort,
+                gripper_action_frames=gripper_action_frames,
+            )
+        except BaseException:
+            quiet_close_policy_transport_on_construction_error(policy_client)
+            raise
 
     def build_payload(
         self,
@@ -359,10 +398,6 @@ class FastWAMPiperClient(SlaiPiperClient):
 
     def probe_server(self, *, timeout_s: float = 8.0) -> dict[str, Any]:
         return self.client.probe(timeout_s=timeout_s)
-
-    def infer_actions(self, snapshot: RobotSnapshot, prompt: str | None = None, **kwargs: Any) -> np.ndarray:
-        return np.asarray(action_array_from_response(self.infer(snapshot, prompt=prompt, **kwargs)), dtype=np.float64)
-
 
 def spec_summary(spec: FastWAMPolicySpec) -> dict[str, Any]:
     return slai_policy_spec_summary(

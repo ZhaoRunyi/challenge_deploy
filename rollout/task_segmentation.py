@@ -10,9 +10,18 @@ from typing import Any
 import cv2
 import numpy as np
 from PIL import Image
-from sam3.model.sam3_image_processor import Sam3Processor
-from sam3.model_builder import build_sam3_image_model
-import torch
+
+try:
+    import torch
+    from sam3.model.sam3_image_processor import Sam3Processor
+    from sam3.model_builder import build_sam3_image_model
+except ModuleNotFoundError as error:
+    torch = None
+    Sam3Processor = None
+    build_sam3_image_model = None
+    SAM3_IMPORT_ERROR = error
+else:
+    SAM3_IMPORT_ERROR = None
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -375,23 +384,6 @@ def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     return inter / max(union, 1.0)
 
 
-def _bbox_iou(box_a: tuple[float, float, float, float], box_b: tuple[float, float, float, float]) -> float:
-    ax1, ay1, ax2, ay2 = box_a
-    bx1, by1, bx2, by2 = box_b
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
-    inter = iw * ih
-    if inter <= 0.0:
-        return 0.0
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    return inter / max(area_a + area_b - inter, 1.0)
-
-
 def _pixel_box_from_normalized(
     box: tuple[float, float, float, float], width: int, height: int
 ) -> tuple[int, int, int, int]:
@@ -404,32 +396,6 @@ def _pixel_box_from_normalized(
     )
 
 
-def _cxcywh_from_xyxy(box: tuple[float, float, float, float]) -> list[float]:
-    x1, y1, x2, y2 = box
-    return [
-        0.5 * (x1 + x2),
-        0.5 * (y1 + y2),
-        x2 - x1,
-        y2 - y1,
-    ]
-
-
-def _alignment_score(
-    candidate_box: tuple[int, int, int, int], prompt_box: tuple[int, int, int, int]
-) -> float:
-    iou = _bbox_iou(candidate_box, prompt_box)
-    cx = 0.5 * (candidate_box[0] + candidate_box[2])
-    cy = 0.5 * (candidate_box[1] + candidate_box[3])
-    px = 0.5 * (prompt_box[0] + prompt_box[2])
-    py = 0.5 * (prompt_box[1] + prompt_box[3])
-    prompt_diag = max(
-        ((prompt_box[2] - prompt_box[0]) ** 2 + (prompt_box[3] - prompt_box[1]) ** 2) ** 0.5,
-        1.0,
-    )
-    dist_penalty = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5 / prompt_diag
-    return iou - 0.1 * dist_penalty
-
-
 def _foreground_from_background(image: np.ndarray, background: np.ndarray) -> np.ndarray:
     diff = cv2.absdiff(image, background)
     gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
@@ -439,30 +405,6 @@ def _foreground_from_background(image: np.ndarray, background: np.ndarray) -> np
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.dilate(mask, kernel, iterations=1)
     return mask > 0
-
-
-def _best_component(mask: np.ndarray, prompt_box: list[int]) -> np.ndarray:
-    binary = mask.astype(np.uint8)
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
-    if num_labels <= 2:
-        return mask
-    px = 0.5 * (prompt_box[0] + prompt_box[2])
-    py = 0.5 * (prompt_box[1] + prompt_box[3])
-    best_index = 0
-    best_score = -1e18
-    for idx in range(1, num_labels):
-        area = float(stats[idx, cv2.CC_STAT_AREA])
-        if area < 20.0:
-            continue
-        cx, cy = centroids[idx]
-        distance = float((cx - px) ** 2 + (cy - py) ** 2)
-        score = area - 0.01 * distance
-        if score > best_score:
-            best_score = score
-            best_index = idx
-    if best_index == 0:
-        return mask
-    return labels == best_index
 
 
 def _largest_component(mask: np.ndarray) -> np.ndarray:
@@ -492,12 +434,14 @@ def _box_mask(
     return mask, (x1, y1, x2, y2)
 
 
-def _prepare_pil_image(image: np.ndarray) -> Image.Image:
+def _prepare_pil_image(image: np.ndarray) -> Any:
     return Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
 
 
 def _clone_state(value: Any) -> Any:
-    if torch.is_tensor(value):
+    if type(value).__module__.startswith("torch") and callable(
+        getattr(value, "clone", None)
+    ):
         return value.clone()
     if isinstance(value, dict):
         return {key: _clone_state(item) for key, item in value.items()}
@@ -510,6 +454,11 @@ def _clone_state(value: Any) -> Any:
 
 class TaskSegmenter:
     def __init__(self) -> None:
+        if torch is None or Sam3Processor is None or build_sam3_image_model is None:
+            raise RuntimeError(
+                "SAM3 task segmentation requires optional torch, Pillow, and sam3 dependencies"
+            ) from SAM3_IMPORT_ERROR
+        self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         if not SAM31_MULTIPLEX_WEIGHTS.exists():
             raise FileNotFoundError(
@@ -525,7 +474,10 @@ class TaskSegmenter:
 
     def _autocast_context(self) -> Any:
         if self.device == "cuda":
-            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            return self.torch.autocast(
+                device_type="cuda",
+                dtype=self.torch.bfloat16,
+            )
         return nullcontext()
 
     def select_masks(self, image: np.ndarray, repo_id: str, background_image: np.ndarray | None = None) -> list[SelectedMask]:

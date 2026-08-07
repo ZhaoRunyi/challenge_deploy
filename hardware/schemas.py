@@ -30,6 +30,7 @@ class PiperArmState:
     effort_timestamp_s: float = 0.0
     end_pose_timestamp_s: float = 0.0
     command_timestamp_s: float = 0.0
+    gripper_position_timestamp_s: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +53,7 @@ class PiperArmState:
             "effort_timestamp_s": self.effort_timestamp_s,
             "end_pose_timestamp_s": self.end_pose_timestamp_s,
             "command_timestamp_s": self.command_timestamp_s,
+            "gripper_position_timestamp_s": self.gripper_position_timestamp_s,
         }
 
 
@@ -87,6 +89,7 @@ class RobotSnapshot:
     timestamp_s: float
     state: DualPiperState
     images: dict[str, np.ndarray] = field(default_factory=dict)
+    source_timestamps: dict[str, float] = field(default_factory=dict)
 
     def to_collector_observation(self) -> OrderedDict[str, Any]:
         ordered_images = {

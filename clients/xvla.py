@@ -6,16 +6,18 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from xvla_client import websocket_client_policy
 
 from . import slai_piper_policy
+from . import websocket_client_policy
 from .base import (
     ActionGripperEncoding,
     ControlMode,
     SlaiPiperClient,
     StateGripperEncoding,
+    action_array_from_response,
     build_full_piper_state as build_slai_full_piper_state,
     image_to_rgb,
+    quiet_close_policy_transport_on_construction_error,
 )
 from .specs import SlaiPolicySpec, slai_policy_spec_summary
 
@@ -212,18 +214,22 @@ class XVLAPiperClient(SlaiPiperClient):
     ) -> None:
         spec = load_piper_policy_spec(train_config_name)
         policy_client = websocket_client_policy.WebsocketClientPolicy(host, port, api_key=api_key)
-        super().__init__(
-            spec=spec,
-            policy_client=policy_client,
-            control_mode=control_mode,
-            joint_speed_percent=joint_speed_percent,
-            ee_speed_percent=ee_speed_percent,
-            gripper_threshold=gripper_threshold,
-            gripper_lower=gripper_lower,
-            gripper_upper=gripper_upper,
-            state_gripper_encoding=state_gripper_encoding,
-            action_gripper_encoding=action_gripper_encoding,
-        )
+        try:
+            super().__init__(
+                spec=spec,
+                policy_client=policy_client,
+                control_mode=control_mode,
+                joint_speed_percent=joint_speed_percent,
+                ee_speed_percent=ee_speed_percent,
+                gripper_threshold=gripper_threshold,
+                gripper_lower=gripper_lower,
+                gripper_upper=gripper_upper,
+                state_gripper_encoding=state_gripper_encoding,
+                action_gripper_encoding=action_gripper_encoding,
+            )
+        except BaseException:
+            quiet_close_policy_transport_on_construction_error(policy_client)
+            raise
 
     def build_payload(self, snapshot: Any, prompt: str | None = None, **kwargs: Any) -> dict[str, Any]:
         return build_policy_payload(
@@ -236,7 +242,10 @@ class XVLAPiperClient(SlaiPiperClient):
         )
 
     def infer_actions(self, snapshot: Any, prompt: str | None = None, **kwargs: Any) -> np.ndarray:
-        return np.asarray(self.infer(snapshot, prompt=prompt, **kwargs)["actions"], dtype=np.float64)
+        return action_array_from_response(
+            self.infer(snapshot, prompt=prompt, **kwargs),
+            keys=("actions", "action"),
+        )
 
 
 def spec_summary(spec: PiperPolicySpec) -> dict[str, Any]:
