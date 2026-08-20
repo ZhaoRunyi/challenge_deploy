@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import select
+import shutil
 import sys
 import termios
 import time
@@ -18,6 +19,7 @@ from hardware.linkage_gateway import GatewayFaultLatchedError, LinkageGatewayErr
 from hardware.piper import DualPiperSystem
 from hardware.realsense import RealSenseRig
 from hardware.runtime import DualPiperArmView
+from hardware.schemas import DualPiperState
 from hardware.topology import (
     ArmId,
     MASTER_ARM_IDS,
@@ -301,6 +303,7 @@ def make_isolated_collection_runtime(
     gateway = assembly.gateway
     max_state_age_s = float(robot.motion_watchdog_max_state_age_s)
     gateway_has_fresh_family = False
+    initial_master_state = None
 
     def require_isolated_teleop_health() -> None:
         nonlocal gateway_has_fresh_family
@@ -336,6 +339,7 @@ def make_isolated_collection_runtime(
             queue_maxlen=queue_maxlen,
             health_check=require_isolated_teleop_health,
             max_sample_age_s=max_state_age_s,
+            master_state_fallback=lambda: initial_master_state,
         )
     except BaseException as exc:
         append_event(
@@ -367,12 +371,18 @@ def make_isolated_collection_runtime(
     }
 
     def initialize_isolated_teleop() -> None:
+        nonlocal initial_master_state
         append_event("isolated_static_teleop_initialization_started")
         try:
             result = robot.initialize_static_teleop(
                 gateway,
                 gripper_efforts=slave_efforts,
             )
+            if result.physical_states is not None:
+                initial_master_state = DualPiperState(
+                    left=result.physical_states.slave_left,
+                    right=result.physical_states.slave_right,
+                )
         except RoleTransactionError as exc:
             append_role_transaction_audit(append_event, exc, status="failed")
             raise
@@ -606,6 +616,12 @@ def print_episode_decision_prompt() -> None:
     print("Episode stopped: press c to save and continue, or d to discard and continue.", flush=True)
 
 
+def discard_episode_directory(episode_path: Path) -> None:
+    episode_dir = Path(episode_path).parent
+    if episode_dir.name.startswith("episode_") and episode_dir.parent != episode_dir:
+        shutil.rmtree(episode_dir, ignore_errors=True)
+
+
 def validate_camera_name(camera_name: str) -> None:
     if not camera_name or not all(char.isalnum() or char == "_" for char in camera_name):
         raise ValueError(
@@ -812,6 +828,7 @@ def preserve_isolated_partial_episode(
             partial=True,
             captured_frames=frame_count,
         )
+        discard_episode_directory(partial_episode.episode_path)
         return partial_episode
 
     try:
@@ -945,8 +962,6 @@ def run_once(args: argparse.Namespace) -> None:
                 break
 
             episode_idx = next_manual_episode if next_manual_episode is not None else next_episode_index(dataset_root)
-            if next_manual_episode is not None:
-                next_manual_episode += 1
             episode_path = episode_base_path(dataset_root, episode_idx)
             active_episode.begin(
                 episode_idx,
@@ -1024,6 +1039,7 @@ def run_once(args: argparse.Namespace) -> None:
                     reason="insufficient_frames",
                     captured_frames=len(episode.frames),
                 )
+                discard_episode_directory(episode_path)
                 active_episode.clear()
                 continue
             refresh_idle_window()
@@ -1041,9 +1057,12 @@ def run_once(args: argparse.Namespace) -> None:
                     reason="operator_discard",
                     captured_frames=len(episode.frames),
                 )
+                discard_episode_directory(episode_path)
                 active_episode.clear()
                 continue
             queued_result = data_worker.submit(episode)
+            if next_manual_episode is not None:
+                next_manual_episode += 1
             active_episode.clear()
             print_json("hdf5_teleop_collection_queued", queued_result)
             audit_save_decision(

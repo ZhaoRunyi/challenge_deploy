@@ -8,6 +8,8 @@ checks below.
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
+import tempfile
 import time
 from types import SimpleNamespace
 import unittest
@@ -20,7 +22,7 @@ from hardware.conversions import joints_rad_to_sdk, opening_to_sdk_gripper
 from hardware.factory import HardwareAssembly
 from hardware.isolated import IsolatedFourArmSystem
 from hardware.linkage_gateway import LinkageGatewayError
-from hardware.schemas import PiperArmState
+from hardware.schemas import DualPiperState, PiperArmState
 from hardware.topology import (
     ALL_ARM_IDS,
     SLAVE_ARM_IDS,
@@ -424,6 +426,14 @@ class CollectDataRobotTest(unittest.TestCase):
 
         runtime.start_callbacks[0]()
         source_arguments["health_check"]()
+        master_fallback = source_arguments["master_state_fallback"]()
+        self.assertIsNotNone(master_fallback)
+        np.testing.assert_allclose(
+            master_fallback.qpos,
+            np.concatenate(
+                (arms[ArmId.SLAVE_LEFT].qpos, arms[ArmId.SLAVE_RIGHT].qpos)
+            ),
+        )
 
         self.assertEqual(
             {arm_id: arm.role for arm_id, arm in arms.items()},
@@ -525,24 +535,28 @@ class CollectDataRobotTest(unittest.TestCase):
             ]
             self.assertEqual(len(cleanup_events), 1, arm.arm_id.value)
 
-    def test_static_master_control_targets_do_not_block_source_readiness(
+    def test_static_master_fallback_does_not_block_source_readiness(
         self,
     ) -> None:
         events: list[tuple[str, ArmId, object]] = []
-        stale_command_timestamp_s = time.time() - 10.0
-        source = collector.HDF5TeleopCollectionSource(
-            master_robot=SimpleNamespace(
-                left=StaticCommandArm(
-                    ArmId.MASTER_LEFT,
-                    events,
-                    command_timestamp_s=stale_command_timestamp_s,
-                ),
-                right=StaticCommandArm(
-                    ArmId.MASTER_RIGHT,
-                    events,
-                    command_timestamp_s=stale_command_timestamp_s,
-                ),
+        master_robot = SimpleNamespace(
+            left=StaticCommandArm(
+                ArmId.MASTER_LEFT,
+                events,
+                command_timestamp_s=0.0,
             ),
+            right=StaticCommandArm(
+                ArmId.MASTER_RIGHT,
+                events,
+                command_timestamp_s=0.0,
+            ),
+        )
+        fallback = DualPiperState(
+            left=master_robot.left.read_state(prefer_joint_ctrl=True),
+            right=master_robot.right.read_state(prefer_joint_ctrl=True),
+        )
+        source = collector.HDF5TeleopCollectionSource(
+            master_robot=master_robot,
             slave_robot=SimpleNamespace(
                 left=FakeArm(ArmId.SLAVE_LEFT, events),
                 right=FakeArm(ArmId.SLAVE_RIGHT, events),
@@ -550,6 +564,7 @@ class CollectDataRobotTest(unittest.TestCase):
             cameras=FakeCameraRig(),
             arm_sample_hz=100.0,
             queue_maxlen=100,
+            master_state_fallback=lambda: fallback,
         )
 
         try:
@@ -558,6 +573,9 @@ class CollectDataRobotTest(unittest.TestCase):
                 source.wait_until_ready(timeout_s=1.0),
                 source.last_sync_failure,
             )
+            self.assertIsNotNone(source.get_frame())
+            time.sleep(0.05)
+            self.assertIsNotNone(source.get_frame())
         finally:
             source.stop()
 
@@ -566,6 +584,19 @@ class CollectDataRobotTest(unittest.TestCase):
         ].latest_timestamp_s()
         self.assertIsNotNone(latest_master_sample_s)
         self.assertGreater(latest_master_sample_s, time.time() - 1.0)
+
+    def test_next_episode_index_ignores_discarded_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "episode_0").mkdir()
+            (root / "episode_1").mkdir()
+            (root / "episode_1" / "episode_1.hdf5").write_bytes(b"")
+
+            self.assertEqual(collector.next_episode_index(root), 2)
+
+            (root / "episode_2").mkdir()
+
+            self.assertEqual(collector.next_episode_index(root), 2)
 
 
 if __name__ == "__main__":

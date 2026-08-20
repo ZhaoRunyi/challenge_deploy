@@ -213,7 +213,11 @@ def next_episode_index(dataset_root: str | Path) -> int:
     indices = []
     for path in root.glob("episode_*"):
         episode_index = path_episode_index(path)
-        if episode_index is not None and (path.is_dir() or path.suffix == ".hdf5"):
+        if episode_index is None:
+            continue
+        if path.is_dir():
+            path = path / f"episode_{episode_index}.hdf5"
+        if path.suffix == ".hdf5" and path.exists():
             indices.append(episode_index)
     return max(indices) + 1 if indices else 0
 
@@ -352,12 +356,14 @@ class HDF5TeleopCollectionSource:
         queue_maxlen: int = 2000,
         health_check: Callable[[], None] | None = None,
         max_sample_age_s: float | None = None,
+        master_state_fallback: Callable[[], DualPiperState | None] | None = None,
     ) -> None:
         self.master_robot = master_robot
         self.slave_robot = slave_robot
         self.cameras = cameras
         self.arm_sample_hz = arm_sample_hz
         self.health_check = health_check
+        self.master_state_fallback = master_state_fallback
         if max_sample_age_s is not None and max_sample_age_s <= 0.0:
             raise ValueError("max_sample_age_s must be positive when provided")
         self.max_sample_age_s = max_sample_age_s
@@ -506,6 +512,16 @@ class HDF5TeleopCollectionSource:
                         positive_timestamp(state.qpos_timestamp_s)
                         or positive_timestamp(state.command_timestamp_s)
                     )
+                    if qpos_timestamp_s is None and self.master_state_fallback is not None:
+                        fallback = self.master_state_fallback()
+                        if fallback is not None:
+                            fallback_state = (
+                                fallback.left
+                                if arm_name == "master_left"
+                                else fallback.right
+                            )
+                            state = fallback_state
+                            qpos_timestamp_s = time.time()
                     if qpos_timestamp_s is not None:
                         self.append_sample(
                             f"{arm_name}_joint",
@@ -669,7 +685,8 @@ def collect_hdf5_teleop_episode(
     if start_source:
         source.start()
     if not source.wait_until_ready(timeout_s=ready_timeout_s):
-        detail = f": {source.last_error}" if source.last_error is not None else ""
+        failure = source.last_error or source.last_sync_failure
+        detail = f": {failure}" if failure else ""
         raise RuntimeError(f"Timed out waiting for master/slave/camera async queues{detail}")
 
     if running_sentinel is not None:
