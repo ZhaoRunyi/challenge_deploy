@@ -88,6 +88,8 @@ class RolloutVideoRecorder:
         frame_jpeg_quality: int = 100,
         save_separate_videos: bool = False,
         separate_video_stem: str | None = None,
+        video_state_from_action: bool = False,
+        video_action_from_state: bool = False,
     ) -> None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         self.output_dir = Path(output_dir)
@@ -127,9 +129,18 @@ class RolloutVideoRecorder:
         self.video_codec = video_codec
         self.video_output_params = tuple(video_output_params)
         self.frame_jpeg_quality = int(frame_jpeg_quality)
+        self.video_state_from_action = bool(video_state_from_action)
+        self.video_action_from_state = bool(video_action_from_state)
         if self.save_separate_videos and not self.keep_frames_in_memory:
             for camera_name in self.schema.camera_names:
                 (self.frames_dir / safe_filename_part(camera_name)).mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def video_plot_kwargs(args: Any) -> dict[str, bool]:
+        return {
+            "video_state_from_action": bool(getattr(args, "video_state_from_action", False)),
+            "video_action_from_state": bool(getattr(args, "video_action_from_state", False)),
+        }
 
     def extra_image_path(self, suffix: str, extension: str = ".png") -> Path:
         clean_suffix = safe_filename_part(suffix)
@@ -341,6 +352,8 @@ class RolloutVideoRecorder:
             actions=actions,
             states=states,
             draw_curves=False,
+            video_state_from_action=self.video_state_from_action,
+            video_action_from_state=self.video_action_from_state,
         )
         final = draw_record_plot_canvas(
             width=width,
@@ -351,17 +364,20 @@ class RolloutVideoRecorder:
             actions=actions,
             states=states,
             draw_curves=True,
+            video_state_from_action=self.video_state_from_action,
+            video_action_from_state=self.video_action_from_state,
         )
         rects = plot_rects(width=width, height=height, count=len(names), cols=cols)
         return base, final, rects
+
 
 def save_recorded_actions(
     recorder: RolloutVideoRecorder,
     saved_actions: list[np.ndarray] | None,
     action_names: tuple[str, ...],
 ) -> Path:
-    del saved_actions, action_names
-    action_path = recorder.run_dir / f"{recorder.record_stem}_actions.npz"
+    del saved_actions
+    action_path = recorder.run_dir / f"{recorder.record_stem}_action_states.npz"
     if recorder.actions:
         actions = np.stack(recorder.actions, axis=0)
     else:
@@ -371,7 +387,14 @@ def save_recorded_actions(
     else:
         states = np.empty((0, len(recorder.schema.state_names)), dtype=np.float64)
     timestamps_s = np.asarray(recorder.timestamps, dtype=np.float64)
-    np.savez_compressed(action_path, actions=actions, states=states, timestamps_s=timestamps_s)
+    np.savez_compressed(
+        action_path,
+        actions=actions,
+        states=states,
+        timestamps_s=timestamps_s,
+        action_names=np.asarray(action_names, dtype=str),
+        state_names=np.asarray(recorder.schema.state_names, dtype=str),
+    )
     return action_path
 
 
@@ -545,6 +568,8 @@ def draw_record_plot_canvas(
     actions: np.ndarray,
     states: np.ndarray,
     draw_curves: bool,
+    video_state_from_action: bool = False,
+    video_action_from_state: bool = False,
 ) -> np.ndarray:
     canvas = np.full((height, width, 3), 248, dtype=np.uint8)
     rows = max(1, math.ceil(max(1, len(names)) / cols))
@@ -562,6 +587,12 @@ def draw_record_plot_canvas(
 
         action_values = series_for_name(actions, schema.action_names, name)
         state_values = series_for_name(states, schema.state_names, name)
+        replacement = series_for_name(states, schema.state_names, name) if video_action_from_state and action_values is not None else None
+        if replacement is not None:
+            action_values = replacement
+        replacement = series_for_name(actions, schema.action_names, name) if video_state_from_action and state_values is not None else None
+        if replacement is not None:
+            state_values = replacement
         value_blocks = []
         for values in (action_values, state_values):
             if values is None or not values.size:
@@ -590,7 +621,14 @@ def draw_record_plot_canvas(
             continue
 
         if state_values is not None:
-            draw_plot_segments(canvas, to_record_plot_segments(state_values, rect, y_min, y_max), STATE_COLOR)
+            state_segments = to_record_plot_segments(state_values, rect, y_min, y_max)
+            if (
+                action_values is not None
+                and action_values.shape == state_values.shape
+                and np.allclose(action_values, state_values, equal_nan=True)
+            ):
+                state_segments = [points + np.array([0, 1], dtype=np.int32) for points in state_segments]
+            draw_plot_segments(canvas, state_segments, STATE_COLOR)
         if action_values is not None:
             action_color = USED_ACTION_COLOR if name in schema.used_action_names else ACTION_COLOR
             draw_plot_segments(canvas, to_record_plot_segments(action_values, rect, y_min, y_max), action_color)

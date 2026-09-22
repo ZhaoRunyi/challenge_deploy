@@ -167,6 +167,7 @@ def main() -> None:
             fps=args.fps,
             name_prefix=record_name_prefix(args, server_metadata),
             save_separate_videos=args.save_sep,
+            **RolloutVideoRecorder.video_plot_kwargs(args),
         )
         if args.record
         else None
@@ -303,7 +304,7 @@ def main() -> None:
         if recorder is not None:
             try:
                 action_path = save_recorded_actions(recorder, saved_actions, recorder.schema.action_names)
-                print(f"Actions saved to {action_path}", flush=True)
+                print(f"Action/state saved to {action_path}", flush=True)
             except Exception as exc:
                 print(f"Failed to save actions: {exc}", flush=True)
             try:

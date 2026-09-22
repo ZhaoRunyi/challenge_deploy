@@ -44,6 +44,8 @@ def add_gripper_encoding_args(
         default=default_action,
         help="Action gripper encoding returned by the policy: policy, meters, binary, or old.",
     )
+    parser.add_argument("--video-state-from-action", action="store_true")
+    parser.add_argument("--video-action-from-state", action="store_true")
 
 
 def apply_arm_gripper_overrides(client: Any, args: argparse.Namespace) -> None:

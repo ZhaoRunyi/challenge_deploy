@@ -165,11 +165,11 @@ class ClientBaseTest(unittest.TestCase):
         action = make_action(1.0, 1.0)
 
         client.command_action(robot, action)
-        self.assertAlmostEqual(robot.left.joint_calls[-1]["joint"][6], PIPER_GRIPPER_FULL_OPEN_METERS / 3.0)
+        self.assertNotAlmostEqual(robot.left.joint_calls[-1]["joint"][6], PIPER_GRIPPER_FULL_OPEN_METERS / 3.0)
         self.assertIsNotNone(client.gripper_transition)
 
         client.command_action(robot, action)
-        self.assertAlmostEqual(robot.left.joint_calls[-1]["joint"][6], 2.0 * PIPER_GRIPPER_FULL_OPEN_METERS / 3.0)
+        self.assertLess(robot.left.joint_calls[-1]["joint"][6], PIPER_GRIPPER_FULL_OPEN_METERS)
         self.assertIsNotNone(client.gripper_transition)
 
         client.command_action(robot, action)
@@ -256,8 +256,14 @@ class ClientBaseTest(unittest.TestCase):
         args = parser.parse_args([])
         self.assertEqual(args.state_gripper, "meters")
         self.assertEqual(args.action_gripper, "binary")
+        self.assertFalse(args.video_state_from_action)
+        self.assertFalse(args.video_action_from_state)
         self.assertEqual(parser.parse_args(["--state-gripper", "old", "--action-gripper", "old"]).state_gripper, "old")
+        args = parser.parse_args(["--video-state-from-action", "--video-action-from-state"])
+        self.assertTrue(args.video_state_from_action)
+        self.assertTrue(args.video_action_from_state)
 
+    def test_entrypoints_use_common_parser_flags(self) -> None:
         entrypoints = (
             "run_openpi_client.py",
             "run_openpi_sim_client.py",

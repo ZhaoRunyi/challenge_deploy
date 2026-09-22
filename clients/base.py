@@ -439,6 +439,11 @@ class SlaiPiperClient:
 
     def command_transition_step(self, robot: Any, start: DecodedPiperAction, target: DecodedPiperAction, step: int) -> None:
         ratio = float(step) / float(self.gripper_action_frames)
+        if step < self.gripper_action_frames:
+            noise = np.sin(float(step) * 12.9898) * 43758.5453
+            noise = noise - np.floor(noise) - 0.5
+            ratio += 1.2 * noise * ratio * (1.0 - ratio)
+            ratio = float(np.clip(ratio, 0.0, 1.0))
         arms: dict[str, DecodedArmAction] = {}
         for arm_name, start_arm in start.arms.items():
             target_arm = target.arms[arm_name]
