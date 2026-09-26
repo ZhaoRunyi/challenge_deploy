@@ -1,23 +1,23 @@
 # Four independent USB-to-CAN adapters: one physical bus per arm.
 #
-# HIL-reviewed 2026-08-02. The mapping is based on physical one-arm checks, not
-# can0..can3 enumeration. Both masters run S-V1.9-0; slaves run S-V1.8-9.
+# Local 4-CAN mapping confirmed 2026-09-23 by physical one-arm checks, not
+# can0..can3 enumeration.
 can_topology: isolated
 
 robot:
   master_left:
     can_name: piper_ml
-    usb_serial: "002D001F4648571020303731"
+    usb_serial: "003C001E4148571320343133"
   master_right:
     can_name: piper_mr
-    usb_serial: "001900344648570920303731"
+    usb_serial: "002100284148570D20343133"
   slave_left:
     can_name: piper_sl
-    usb_serial: "002F001D5547571120343930"
+    usb_serial: "0041002A4148570C20343133"
     gripper_effort: 1000
   slave_right:
     can_name: piper_sr
-    usb_serial: "002D001B5547571120343930"
+    usb_serial: "002100235443571020393433"
     gripper_effort: 1000
 
 cameras:
@@ -27,9 +27,9 @@ cameras:
   fps: 30
   warmup_frames: 30
   serials:
-    cam_high: "339322074476"
-    cam_right_wrist: "419522070720"
-    cam_left_wrist: "317222074371"
+    cam_high: "344322073529"
+    cam_right_wrist: "335522070790"
+    cam_left_wrist: "344322073012"
 
 policy:
   host: 127.0.0.1
