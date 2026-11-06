@@ -1,0 +1,32 @@
+{
+  "family": "DICT_APRILTAG_36h11",
+  "marker_id": 0,
+  "size_m": 0.1,
+  "page_mm": [
+    210,
+    297
+  ],
+  "frame": "tag center; x right, y up, z out of page",
+  "corners_m": [
+    [
+      -0.05,
+      0.05,
+      0
+    ],
+    [
+      0.05,
+      0.05,
+      0
+    ],
+    [
+      0.05,
+      -0.05,
+      0
+    ],
+    [
+      -0.05,
+      -0.05,
+      0
+    ]
+  ]
+}

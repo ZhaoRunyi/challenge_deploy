@@ -20,6 +20,20 @@ dependencies = [
     "websockets",
 ]
 
+[project.optional-dependencies]
+calibration = [
+    "numpy==1.26.4",
+    "scipy==1.15.3",
+    "pillow==12.3.0",
+    "reportlab==5.1.0",
+    "PyYAML==6.0.3",
+    "piper_sdk==0.6.2",
+    "pyrealsense2==2.59.1.11053; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "pytest==9.2.0",
+    "pyarrow==19.0.1",
+    "huggingface_hub==0.36.0",
+]
+
 [project.scripts]
 challenge-deploy-openpi-client = "run_openpi_client:main"
 challenge-deploy-xvla-client = "run_xvla_client:main"
@@ -44,4 +58,4 @@ py-modules = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["clients*", "hardware*", "rollout*", "teleop*"]
+include = ["clients*", "hardware*", "rollout*", "teleop*", "calibration*"]

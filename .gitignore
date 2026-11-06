@@ -5,6 +5,41 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-artifacts/
+/artifacts/*
+!/artifacts/calibration/
+/artifacts/calibration/*
+!/artifacts/calibration/platform_1/
+/artifacts/calibration/platform_1/*
+!/artifacts/calibration/platform_1/README.md
+!/artifacts/calibration/platform_1/requirements.txt
+!/artifacts/calibration/platform_1/solve.py
+!/artifacts/calibration/platform_1/read_intrinsics.py
+!/artifacts/calibration/platform_1/manifest.json
+!/artifacts/calibration/platform_1/samples/
+!/artifacts/calibration/platform_1/intrinsics/
+!/artifacts/calibration/platform_1/results/
+!/artifacts/calibration/platform_1/reference/
+!/artifacts/calibration/platform_1/coarse_reference/
+!/artifacts/calibration/platform_1/board/
+!/artifacts/calibration/platform_1/hardware.yaml
+
+# Session-specific investigations; the portable solver is in platform_1.
+/calibration/diagnose_high_*.py
+/calibration/audit_high_samples.py
+/calibration/try_autorax_high.py
+/calibration/try_latest_repo_camera.py
+/calibration/compare_high_methods.py
+/calibration/refine_high_reprojection.py
+/calibration/manual_high_trials.py
+# Local rendering experiments are not part of the portable calibration tools.
+/calibration/render.py
+/calibration/docker_render.py
+/tests/calibration_render_smoke.py
+*.egg-info/
 
 .DS_Store
+.venv-calib/
+.venv/
+.venv-calibration/
+.calibration-env/
+.calibration310/

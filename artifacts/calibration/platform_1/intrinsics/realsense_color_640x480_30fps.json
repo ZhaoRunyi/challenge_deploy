@@ -1,0 +1,111 @@
+{
+  "read_at_utc": "2026-11-06T09:23:59.328705+00:00",
+  "source": "live RealSense SDK active profiles",
+  "cameras": {
+    "cam_high": {
+      "serial": "323422071854",
+      "device_name": "RealSense D435",
+      "firmware": "5.17.0.10",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "stream": "color",
+      "format": "bgr8",
+      "camera_matrix": [
+        [
+          606.315185546875,
+          0,
+          320.54931640625
+        ],
+        [
+          0,
+          606.1009521484375,
+          245.87710571289062
+        ],
+        [
+          0,
+          0,
+          1
+        ]
+      ],
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "distortion_model": "distortion.inverse_brown_conrady"
+    },
+    "cam_left_wrist": {
+      "serial": "344322073012",
+      "device_name": "RealSense D435",
+      "firmware": "5.17.0.10",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "stream": "color",
+      "format": "bgr8",
+      "camera_matrix": [
+        [
+          603.1170043945312,
+          0,
+          326.72747802734375
+        ],
+        [
+          0,
+          602.4186401367188,
+          251.93399047851562
+        ],
+        [
+          0,
+          0,
+          1
+        ]
+      ],
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "distortion_model": "distortion.inverse_brown_conrady"
+    },
+    "cam_right_wrist": {
+      "serial": "335522070790",
+      "device_name": "RealSense D435",
+      "firmware": "5.17.0.10",
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "stream": "color",
+      "format": "bgr8",
+      "camera_matrix": [
+        [
+          608.63427734375,
+          0,
+          320.2765197753906
+        ],
+        [
+          0,
+          608.5237426757812,
+          246.64247131347656
+        ],
+        [
+          0,
+          0,
+          1
+        ]
+      ],
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "distortion_model": "distortion.inverse_brown_conrady"
+    }
+  }
+}

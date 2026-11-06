@@ -1,0 +1,3 @@
+# Compatibility entrypoint: run pip from the repository root.
+# Deployment and calibration share one environment and pyproject dependency set.
+-e .[calibration]

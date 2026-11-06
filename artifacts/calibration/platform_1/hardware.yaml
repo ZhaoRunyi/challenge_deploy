@@ -1,0 +1,15 @@
+robot:
+  left:
+    can_name: piper_sl
+  right:
+    can_name: piper_sr
+cameras:
+  enabled: true
+  width: 640
+  height: 480
+  fps: 30
+  warmup_frames: 30
+  serials:
+    cam_high: "323422071854"
+    cam_left_wrist: "344322073012"
+    cam_right_wrist: "335522070790"
